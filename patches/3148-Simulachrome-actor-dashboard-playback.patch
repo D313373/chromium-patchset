@@ -1,0 +1,405 @@
+From 9ab883b820cec3ff5511f2449d594454ffc88383 Mon Sep 17 00:00:00 2001
+From: D313373 <d.1337.edu@gmail.com>
+Date: Tue, 13 Jan 2026 01:36:42 -0800
+Subject: [PATCH 3148/3149] Simulachrome: actor + dashboard playback
+
+---
+ chrome/browser/BUILD.gn                       |  4 +
+ .../apps/app_service/publishers/BUILD.gn      | 23 ++++-
+ chrome/browser/ui/BUILD.gn                    |  4 +
+ .../ui/browser_window/internal/BUILD.gn       |  4 +-
+ .../webui/chrome_web_ui_controller_factory.cc |  3 +
+ chrome/browser/web_applications/BUILD.gn      |  6 ++
+ .../web_applications/app_service/BUILD.gn     |  1 +
+ chrome/common/chrome_features.cc              | 22 +++++
+ chrome/common/chrome_features.h               | 19 ++++
+ chrome/renderer/actor/click_dispatcher.cc     | 95 ++++++++++++++++++-
+ chrome/renderer/actor/type_tool.cc            | 20 +++-
+ content/browser/BUILD.gn                      |  4 +
+ 12 files changed, 195 insertions(+), 10 deletions(-)
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 1bc112f86e95410a97c8600fa32c0b61e81f2722..6ce98be399e425c62db353b6fd6159be96b32e4d 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -19,6 +19,10 @@ import("//chrome/services/speech/buildflags/buildflags.gni")
+ import("//components/captive_portal/core/features.gni")
+ import("//components/compose/features.gni")
+ import("//components/enterprise/buildflags/buildflags.gni")
++
++if (is_chromeos) {
++  import("//chromeos/ash/components/assistant/assistant.gni")
++}
+ import("//components/lens/features.gni")
+ import("//components/offline_pages/buildflags/features.gni")
+ import("//components/optimization_guide/features.gni")
+diff --git a/chrome/browser/apps/app_service/publishers/BUILD.gn b/chrome/browser/apps/app_service/publishers/BUILD.gn
+index 3524e3a382a87860d4c989e23a370763b1f27b1f..b0f232ec33f29267b70be5d9f3eaecc238f3064c 100644
+--- a/chrome/browser/apps/app_service/publishers/BUILD.gn
++++ b/chrome/browser/apps/app_service/publishers/BUILD.gn
+@@ -6,13 +6,31 @@ import("//extensions/buildflags/buildflags.gni")
+ 
+ assert(!is_android)
+ 
++source_set("app_publisher") {
++  sources = [
++    "app_publisher.cc",
++    "app_publisher.h",
++  ]
++
++  configs += [ "//build/config/compiler:wexit_time_destructors" ]
++
++  deps = [
++    "//base",
++    "//chrome/browser:browser_public_dependencies",
++    "//chrome/browser/apps/app_service",
++    "//components/services/app_service/public/cpp",
++  ]
++
++  if (is_chromeos) {
++    deps += [ "//extensions:extensions_browser_resources" ]
++  }
++}
++
+ # Concrete implementation of Publisher interface.
+ # Importantly this must not be depended on by app_service.
+ # The the dependency must be injected at earlier stage on runtime.
+ source_set("publishers") {
+   sources = [
+-    "app_publisher.cc",
+-    "app_publisher.h",
+     "extension_apps.cc",
+     "extension_apps.h",
+     "extension_apps_base.cc",
+@@ -32,6 +50,7 @@ source_set("publishers") {
+   deps = [
+     "//base",
+     "//chrome/browser:browser_public_dependencies",
++    ":app_publisher",
+     "//chrome/browser/apps/app_service",
+     "//chrome/browser/apps/app_service/app_icon",
+     "//chrome/browser/extensions",
+diff --git a/chrome/browser/ui/BUILD.gn b/chrome/browser/ui/BUILD.gn
+index 6fa22a1e7ef1ef9d0ba72d3835f00ec6c9baf6c6..dbd434165a02d5c5773eb3666593ef888f7b4fa5 100644
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -13,6 +13,10 @@ import("//components/captive_portal/core/features.gni")
+ import("//components/compose/features.gni")
+ import("//components/enterprise/buildflags/buildflags.gni")
+ import("//components/lens/features.gni")
++
++if (is_chromeos) {
++  import("//chromeos/ash/components/assistant/assistant.gni")
++}
+ import("//components/metrics/structured/buildflags/buildflags.gni")
+ import("//components/offline_pages/buildflags/features.gni")
+ import("//content/browser/devtools/features.gni")
+diff --git a/chrome/browser/ui/browser_window/internal/BUILD.gn b/chrome/browser/ui/browser_window/internal/BUILD.gn
+index a88c4e6c1947ad5e813325837e80d438ae94ec3c..cf819a97a2ea9e5416935ac358f56d27293157fe 100644
+--- a/chrome/browser/ui/browser_window/internal/BUILD.gn
++++ b/chrome/browser/ui/browser_window/internal/BUILD.gn
+@@ -46,9 +46,9 @@ source_set("internal") {
+     deps += [
+       "//chrome/browser:global_features",
+       "//chrome/browser/actor/ui",
+-      "//chrome/browser/actor/ui/task_list_bubble:controller",
++      "//chrome/browser/actor/ui/task_list_bubble:controller_impl",
+       "//chrome/browser/autocomplete:aim_eligibility_service",
+-      "//chrome/browser/contextual_tasks:ui",
++      "//chrome/browser/contextual_tasks:ui_impl",
+       "//chrome/browser/devtools",
+       "//chrome/browser/extensions",
+       "//chrome/browser/lens/region_search",
+diff --git a/chrome/browser/ui/webui/chrome_web_ui_controller_factory.cc b/chrome/browser/ui/webui/chrome_web_ui_controller_factory.cc
+index 96f13925113dca4fef4f611f6efac0cb57372e4d..ca87cb5ef7d86372ae4b326acaf20e09cf5fc5c3 100644
+--- a/chrome/browser/ui/webui/chrome_web_ui_controller_factory.cc
++++ b/chrome/browser/ui/webui/chrome_web_ui_controller_factory.cc
+@@ -394,6 +394,9 @@ base::RefCountedMemory* ChromeWebUIControllerFactory::GetFaviconResourceBytes(
+     return CrashesUI::GetFaviconResourceBytes(scale_factor);
+   }
+ 
++  if (page_url.host() == chrome::kChromeUIDashboardHost) {
++    return nullptr;  // Dashboard doesn't have a custom favicon
++  }
+   if (page_url.host() == chrome::kChromeUIFlagsHost) {
+     return FlagsUI::GetFaviconResourceBytes(scale_factor);
+   }
+diff --git a/chrome/browser/web_applications/BUILD.gn b/chrome/browser/web_applications/BUILD.gn
+index 375567914000bdcb19a4a1b168efe26672663d17..40b23c6dac232de149315355f2c8fcc50fccbb1c 100644
+--- a/chrome/browser/web_applications/BUILD.gn
++++ b/chrome/browser/web_applications/BUILD.gn
+@@ -174,6 +174,12 @@ source_set("web_applications") {
+     "isolated_web_apps/update_manifest/update_manifest.h",
+     "isolated_web_apps/update_manifest/update_manifest_fetcher.cc",
+     "isolated_web_apps/update_manifest/update_manifest_fetcher.h",
++    "isolated_web_apps/window_management/isolated_web_apps_opened_tabs_counter_service.cc",
++    "isolated_web_apps/window_management/isolated_web_apps_opened_tabs_counter_service.h",
++    "isolated_web_apps/window_management/isolated_web_apps_opened_tabs_counter_service_delegate.cc",
++    "isolated_web_apps/window_management/isolated_web_apps_opened_tabs_counter_service_delegate.h",
++    "isolated_web_apps/window_management/isolated_web_apps_opened_tabs_counter_service_factory.cc",
++    "isolated_web_apps/window_management/isolated_web_apps_opened_tabs_counter_service_factory.h",
+     "isolated_web_apps/window_management/window_management_content_setting_observer.cc",
+     "isolated_web_apps/window_management/window_management_content_setting_observer.h",
+     "jobs/get_progressive_web_app_size_job.cc",
+diff --git a/chrome/browser/web_applications/app_service/BUILD.gn b/chrome/browser/web_applications/app_service/BUILD.gn
+index bb03263fddc96b6c9e646033a1885f444fb3aa5f..c60a74a217d4a7c2116170430cf4168abfd2d2d6 100644
+--- a/chrome/browser/web_applications/app_service/BUILD.gn
++++ b/chrome/browser/web_applications/app_service/BUILD.gn
+@@ -26,6 +26,7 @@ source_set("app_service") {
+   deps = [
+     "//base",
+     "//chrome/browser/apps/app_service",
++    "//chrome/browser/apps/app_service/publishers:app_publisher",
+     "//chrome/browser/apps/app_service/app_icon",
+     "//chrome/browser/content_settings:content_settings_factory",
+     "//chrome/browser/profiles:profile",
+diff --git a/chrome/common/chrome_features.cc b/chrome/common/chrome_features.cc
+index 41adc489e21deb96296a1a97a4e0710ad9dd193b..56b418adea9d612705445483fb7e0f2b53f8de0a 100644
+--- a/chrome/common/chrome_features.cc
++++ b/chrome/common/chrome_features.cc
+@@ -473,6 +473,28 @@ const base::FeatureParam<base::TimeDelta> kGlicActorMoveBeforeClickDelay{
+     &kGlicActorMoveBeforeClick, "glic-actor-move-before-click-delay",
+     base::Milliseconds(5)};
+ 
++BASE_FEATURE(kGlicActorHumanizedClick, base::FEATURE_DISABLED_BY_DEFAULT);
++
++const base::FeatureParam<int> kGlicActorHumanizedClickMoveStepsMin{
++    &kGlicActorHumanizedClick, "glic-actor-humanized-click-move-steps-min", 7};
++const base::FeatureParam<int> kGlicActorHumanizedClickMoveStepsMax{
++    &kGlicActorHumanizedClick, "glic-actor-humanized-click-move-steps-max", 13};
++const base::FeatureParam<int> kGlicActorHumanizedClickPathJitterPx{
++    &kGlicActorHumanizedClick, "glic-actor-humanized-click-path-jitter-px", 2};
++const base::FeatureParam<int> kGlicActorHumanizedClickStartOffsetPx{
++    &kGlicActorHumanizedClick, "glic-actor-humanized-click-start-offset-px",
++    80};
++const base::FeatureParam<int> kGlicActorHumanizedClickMicroMoves{
++    &kGlicActorHumanizedClick, "glic-actor-humanized-click-micro-moves", 2};
++const base::FeatureParam<int> kGlicActorHumanizedClickMicroRadiusPx{
++    &kGlicActorHumanizedClick, "glic-actor-humanized-click-micro-radius-px",
++    4};
++const base::FeatureParam<base::TimeDelta>
++    kGlicActorHumanizedClickMoveToDownDelay{
++        &kGlicActorHumanizedClick,
++        "glic-actor-humanized-click-move-to-down-delay",
++        base::Milliseconds(8)};
++
+ // Controls whether the Glic's act-on-web capability is checked for managed
+ // trial clients.
+ BASE_FEATURE(kGlicActOnWebCapabilityForManagedTrials,
+diff --git a/chrome/common/chrome_features.h b/chrome/common/chrome_features.h
+index a7b0c353d50a99a96f853a6d7ac1990447c07d8f..dd1559f6fba44deb8ba3cca48bc5962d835a166b 100644
+--- a/chrome/common/chrome_features.h
++++ b/chrome/common/chrome_features.h
+@@ -352,6 +352,25 @@ BASE_DECLARE_FEATURE(kGlicActorMoveBeforeClick);
+ COMPONENT_EXPORT(CHROME_FEATURES)
+ extern const base::FeatureParam<base::TimeDelta> kGlicActorMoveBeforeClickDelay;
+ 
++COMPONENT_EXPORT(CHROME_FEATURES)
++BASE_DECLARE_FEATURE(kGlicActorHumanizedClick);
++
++COMPONENT_EXPORT(CHROME_FEATURES)
++extern const base::FeatureParam<int> kGlicActorHumanizedClickMoveStepsMin;
++COMPONENT_EXPORT(CHROME_FEATURES)
++extern const base::FeatureParam<int> kGlicActorHumanizedClickMoveStepsMax;
++COMPONENT_EXPORT(CHROME_FEATURES)
++extern const base::FeatureParam<int> kGlicActorHumanizedClickPathJitterPx;
++COMPONENT_EXPORT(CHROME_FEATURES)
++extern const base::FeatureParam<int> kGlicActorHumanizedClickStartOffsetPx;
++COMPONENT_EXPORT(CHROME_FEATURES)
++extern const base::FeatureParam<int> kGlicActorHumanizedClickMicroMoves;
++COMPONENT_EXPORT(CHROME_FEATURES)
++extern const base::FeatureParam<int> kGlicActorHumanizedClickMicroRadiusPx;
++COMPONENT_EXPORT(CHROME_FEATURES)
++extern const base::FeatureParam<base::TimeDelta>
++    kGlicActorHumanizedClickMoveToDownDelay;
++
+ COMPONENT_EXPORT(CHROME_FEATURES)
+ BASE_DECLARE_FEATURE(kGlicActOnWebCapabilityForManagedTrials);
+ 
+diff --git a/chrome/renderer/actor/click_dispatcher.cc b/chrome/renderer/actor/click_dispatcher.cc
+index c0637b7f31f5d06e4ebd03834400059333e9ab6f..89d7d6c790c5b5d6f718fc23635aff7714481aaa 100644
+--- a/chrome/renderer/actor/click_dispatcher.cc
++++ b/chrome/renderer/actor/click_dispatcher.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/renderer/actor/click_dispatcher.h"
+ 
++#include <algorithm>
++#include <cmath>
+ #include <utility>
+ 
+ #include "base/check.h"
+@@ -13,6 +15,7 @@
+ #include "base/location.h"
+ #include "base/memory/raw_ref.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/rand_util.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/task_runner.h"
+ #include "base/time/time.h"
+@@ -26,6 +29,7 @@
+ #include "third_party/blink/public/common/input/web_mouse_event.h"
+ #include "third_party/blink/public/platform/web_input_event_result.h"
+ #include "third_party/blink/public/web/web_widget.h"
++#include "ui/gfx/geometry/point_f.h"
+ #include "ui/events/base_event_utils.h"
+ #include "ui/latency/latency_info.h"
+ 
+@@ -36,6 +40,33 @@ using ::blink::WebLocalFrame;
+ using ::blink::WebMouseEvent;
+ using ::blink::WebWidget;
+ 
++namespace {
++
++double EaseInOut(double t) {
++  if (t <= 0.0)
++    return 0.0;
++  if (t >= 1.0)
++    return 1.0;
++  return (t < 0.5) ? (2.0 * t * t)
++                   : (1.0 - std::pow(-2.0 * t + 2.0, 2.0) / 2.0);
++}
++
++gfx::PointF JitteredPoint(const gfx::PointF& p, int jitter_px) {
++  if (jitter_px <= 0)
++    return p;
++  const float jx = static_cast<float>(base::RandDouble() * 2.0 * jitter_px -
++                                      jitter_px);
++  const float jy = static_cast<float>(base::RandDouble() * 2.0 * jitter_px -
++                                      jitter_px);
++  return gfx::PointF(p.x() + jx, p.y() + jy);
++}
++
++gfx::PointF ClampToNonNegative(const gfx::PointF& p) {
++  return gfx::PointF(std::max(0.0f, p.x()), std::max(0.0f, p.y()));
++}
++
++}  // namespace
++
+ ClickDispatcher::ClickDispatcher(
+     WebMouseEvent::Button button,
+     int count,
+@@ -45,7 +76,69 @@ ClickDispatcher::ClickDispatcher(
+     : target_(target), tool_(tool), on_complete_(std::move(on_complete)) {
+   WebWidget* widget = target.GetWidget(*tool_);
+   CHECK(widget);
+-  if (base::FeatureList::IsEnabled(features::kGlicActorMoveBeforeClick)) {
++
++  if (base::FeatureList::IsEnabled(features::kGlicActorHumanizedClick)) {
++    const int steps_min = features::kGlicActorHumanizedClickMoveStepsMin.Get();
++    const int steps_max = features::kGlicActorHumanizedClickMoveStepsMax.Get();
++    const int jitter_px = features::kGlicActorHumanizedClickPathJitterPx.Get();
++    const int start_offset =
++        features::kGlicActorHumanizedClickStartOffsetPx.Get();
++    const int micro_moves = features::kGlicActorHumanizedClickMicroMoves.Get();
++    const int micro_radius =
++        features::kGlicActorHumanizedClickMicroRadiusPx.Get();
++
++    const int steps = std::max(
++        1, base::RandInt(std::min(steps_min, steps_max),
++                         std::max(steps_min, steps_max)));
++    const gfx::PointF end = ClampToNonNegative(target.widget_point);
++    gfx::PointF start = end;
++    if (start_offset > 0) {
++      start = gfx::PointF(
++          end.x() + static_cast<float>(base::RandInt(-start_offset, start_offset)),
++          end.y() + static_cast<float>(base::RandInt(-start_offset, start_offset)));
++      start = ClampToNonNegative(start);
++    }
++
++    for (int i = 1; i <= steps; ++i) {
++      const double t = static_cast<double>(i) / steps;
++      const double et = EaseInOut(t);
++      gfx::PointF p(static_cast<float>(start.x() + (end.x() - start.x()) * et),
++                    static_cast<float>(start.y() + (end.y() - start.y()) * et));
++      p = ClampToNonNegative(JitteredPoint(p, jitter_px));
++      WebMouseEvent mouse_move(WebInputEvent::Type::kMouseMove,
++                               WebInputEvent::kNoModifiers,
++                               ui::EventTimeForNow());
++      mouse_move.button = WebMouseEvent::Button::kNoButton;
++      mouse_move.SetPositionInWidget(p);
++      widget->HandleInputEvent(
++          blink::WebCoalescedInputEvent(mouse_move, ui::LatencyInfo()));
++    }
++
++    for (int i = 0; i < std::max(0, micro_moves); ++i) {
++      gfx::PointF p = end;
++      if (micro_radius > 0) {
++        p = gfx::PointF(
++            end.x() + static_cast<float>(base::RandInt(-micro_radius, micro_radius)),
++            end.y() + static_cast<float>(base::RandInt(-micro_radius, micro_radius)));
++      }
++      p = ClampToNonNegative(p);
++      WebMouseEvent mouse_move(WebInputEvent::Type::kMouseMove,
++                               WebInputEvent::kNoModifiers,
++                               ui::EventTimeForNow());
++      mouse_move.button = WebMouseEvent::Button::kNoButton;
++      mouse_move.SetPositionInWidget(p);
++      widget->HandleInputEvent(
++          blink::WebCoalescedInputEvent(mouse_move, ui::LatencyInfo()));
++    }
++
++    base::TimeDelta delay =
++        features::kGlicActorHumanizedClickMoveToDownDelay.Get();
++    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&ClickDispatcher::DoMouseDown,
++                       weak_ptr_factory_.GetWeakPtr(), button, count, target),
++        delay);
++  } else if (base::FeatureList::IsEnabled(features::kGlicActorMoveBeforeClick)) {
+     WebMouseEvent mouse_move(WebInputEvent::Type::kMouseMove,
+                              WebInputEvent::kNoModifiers,
+                              ui::EventTimeForNow());
+diff --git a/chrome/renderer/actor/type_tool.cc b/chrome/renderer/actor/type_tool.cc
+index e5d783a39737d81c078023819ed751bd64c4bfa0..6cbf4c0c03d1ea8f7fe3bd286f12f7893b794bdb 100644
+--- a/chrome/renderer/actor/type_tool.cc
++++ b/chrome/renderer/actor/type_tool.cc
+@@ -549,7 +549,10 @@ void TypeTool::OnFocusingClickComplete(ToolFinishedCallback callback,
+     journal_->Log(
+         task_id_, "TypeTool::Execute::FocusElementEditable",
+         JournalDetailsBuilder().Add("focus", focused_element).Build());
+-    PrepareTargetForMode(*focused_frame, action_->mode);
++    if (!(action_->text.empty() &&
++          action_->mode != mojom::TypeAction::Mode::kDeleteExisting)) {
++      PrepareTargetForMode(*focused_frame, action_->mode);
++    }
+   } else {
+     if (focused_element) {
+       journal_->Log(
+@@ -573,10 +576,17 @@ void TypeTool::OnFocusingClickComplete(ToolFinishedCallback callback,
+   // Empty text is used to simulate clearing the existing text with Backspace.
+   if (action_->text.empty()) {
+     can_simulate_typing = true;
+-    key_sequence_.reserve(action_->follow_by_enter ? 2 : 1);
+-    key_sequence_.push_back(GetBackspaceKeyParams());
+-    if (action_->follow_by_enter) {
+-      key_sequence_.push_back(GetEnterKeyParams());
++    if (action_->mode == mojom::TypeAction::Mode::kDeleteExisting) {
++      key_sequence_.reserve(action_->follow_by_enter ? 2 : 1);
++      key_sequence_.push_back(GetBackspaceKeyParams());
++      if (action_->follow_by_enter) {
++        key_sequence_.push_back(GetEnterKeyParams());
++      }
++    } else {
++      key_sequence_.reserve(action_->follow_by_enter ? 1 : 0);
++      if (action_->follow_by_enter) {
++        key_sequence_.push_back(GetEnterKeyParams());
++      }
+     }
+   } else {
+     // Reserve two space per letter in text in case of composition keys.
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+index e1a23a7d1090390e2ab418b62cf4d820e25ebc2d..0e54246108697119528cfc12e3cd12f9e101aad5 100644
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -12,6 +12,10 @@ import("//build/config/ui.gni")
+ import("//components/viz/common/debugger/viz_debugger.gni")
+ import("//content/browser/devtools/features.gni")
+ import("//content/common/features.gni")
++
++if (is_chromeos) {
++  import("//chromeos/ash/components/assistant/assistant.gni")
++}
+ import("//content/public/common/features.gni")
+ import("//content/public/common/zygote/features.gni")
+ import("//device/bluetooth/emulation/buildflags.gni")
