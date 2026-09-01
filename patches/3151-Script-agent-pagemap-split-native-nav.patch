@@ -1,0 +1,2327 @@
+From b3005469a5d1a3c2da9b43e3a7e0d40fab577175 Mon Sep 17 00:00:00 2001
+From: D313373 <d.1337.edu@gmail.com>
+Date: Tue, 1 Sep 2026 01:58:22 -0700
+Subject: [PATCH] Split script vs agent page-map pipelines and restore native
+ directory navigation.
+
+Script runs use locator-only resolution with optional PageMapExtractor fallback (non-greedy, timed out), while agent runs keep APC with interactive-only dedupe capped at 64 nodes. Native execution activates the tab at run start and uses forceActivation for directory clicks and type focus; CDP paths are unchanged. Directory navigate prefers trusted click, then referrer LoadURL, then direct load.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ .../dashboard/agent/command_dispatcher.js     |  11 +-
+ .../dashboard/headless_executor_bridge.py     | 435 ++++++++++++++++++
+ chrome/browser/ui/webui/dashboard/BUILD.gn    |   7 +
+ .../ui/webui/dashboard/actions/action_base.cc |   5 +
+ .../ui/webui/dashboard/actions/action_base.h  |   7 +
+ .../webui/dashboard/actions/action_factory.cc |  38 +-
+ .../webui/dashboard/actions/action_factory.h  |   5 +
+ .../webui/dashboard/actions/listen_action.cc  | 198 +++++++-
+ .../ui/webui/dashboard/actions/loop_action.cc |   7 +-
+ .../dashboard/actions/navigate_action.cc      | 215 +++++----
+ .../webui/dashboard/actions/navigate_action.h |  11 +-
+ .../dashboard/actions/scrape_table_action.cc  |   9 +-
+ .../ui/webui/dashboard/actions/type_action.cc |   8 +-
+ .../dashboard_ui_message_handler_agent.cc     |  57 ++-
+ .../webui/dashboard/execution_run_context.cc  |  28 ++
+ .../webui/dashboard/execution_run_context.h   |  31 ++
+ .../webui/dashboard/native_run_activation.cc  |  42 ++
+ .../webui/dashboard/native_run_activation.h   |  14 +
+ .../ui/webui/dashboard/page_map_extractor.cc  |  65 ++-
+ .../ui/webui/dashboard/page_map_extractor.h   |  12 +
+ .../dashboard/script_execution_service.cc     |  14 +
+ .../dashboard/script_execution_service.h      |   2 +
+ .../ui/webui/dashboard/script_executor.cc     |  79 ++++
+ .../ui/webui/dashboard/script_executor.h      |   4 +
+ .../webui/dashboard/unified_page_context.cc   | 131 +++++-
+ tools/simulachrome/run_native_welcome_test.py |  61 +++
+ 26 files changed, 1372 insertions(+), 124 deletions(-)
+ create mode 100644 chrome/browser/resources/dashboard/headless_executor_bridge.py
+ create mode 100644 chrome/browser/ui/webui/dashboard/execution_run_context.cc
+ create mode 100644 chrome/browser/ui/webui/dashboard/execution_run_context.h
+ create mode 100644 chrome/browser/ui/webui/dashboard/native_run_activation.cc
+ create mode 100644 chrome/browser/ui/webui/dashboard/native_run_activation.h
+ create mode 100644 tools/simulachrome/run_native_welcome_test.py
+
+diff --git a/chrome/browser/resources/dashboard/agent/command_dispatcher.js b/chrome/browser/resources/dashboard/agent/command_dispatcher.js
+index 80c4a7417dd55..94f50035b33c4 100644
+--- a/chrome/browser/resources/dashboard/agent/command_dispatcher.js
++++ b/chrome/browser/resources/dashboard/agent/command_dispatcher.js
+@@ -985,10 +985,15 @@ export function createDashboardCommandDispatcher({
+               .catch((e) => cb({ok: false, error: String(e && e.message ? e.message : e)}));
+           return;
+         }
+-        case 'run_timeline':
+-          console.log('[AI] Sending command: dashboardAgentRunTimeline', command.payload);
+-          chromeSend('dashboardAgentRunTimeline', [cbToken, command.payload]);
++        case 'run_timeline': {
++          const timelinePayload =
++              (command.payload && typeof command.payload === 'object')
++                  ? {...command.payload, is_agent_mode: true}
++                  : {is_agent_mode: true};
++          console.log('[AI] Sending command: dashboardAgentRunTimeline', timelinePayload);
++          chromeSend('dashboardAgentRunTimeline', [cbToken, timelinePayload]);
+           break;
++        }
+         case 'call_action': {
+           const payload = (command.payload && typeof command.payload === 'object')
+             ? command.payload
+diff --git a/chrome/browser/resources/dashboard/headless_executor_bridge.py b/chrome/browser/resources/dashboard/headless_executor_bridge.py
+new file mode 100644
+index 0000000000000..d496eda9b7266
+--- /dev/null
++++ b/chrome/browser/resources/dashboard/headless_executor_bridge.py
+@@ -0,0 +1,435 @@
++#!/usr/bin/env python3
++"""Bridge isolated headless Chromium to native ScriptExecutionService.
++
++The headless browser process loads chrome://dashboard and exposes the same C++
++ScriptExecutionService as the headed instance. This module connects over CDP and
++invokes dashboardAgentRunTimeline / dashboardAgentRefreshPageMap instead of the
++legacy Python CDP DOM shim.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import socket
++import struct
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++from typing import Any, Dict, List, Optional
++
++DEFAULT_CDP_PORT = 9222
++DEFAULT_DASHBOARD_URL = "chrome://dashboard"
++
++
++def use_native_executor() -> bool:
++  raw = str(os.environ.get("SIMULACHROME_HEADLESS_USE_NATIVE_EXECUTOR", "1")
++            or "1").strip().lower()
++  return raw not in ("0", "false", "no", "off", "legacy")
++
++
++class WebSocketCDP:
++  """Minimal stdlib CDP websocket client."""
++
++  def __init__(self, ws_url: str, timeout: float = 30.0):
++    self._sock: Optional[socket.socket] = None
++    self._timeout = timeout
++    self._next_id = 1
++    self._connect(ws_url)
++
++  def _connect(self, ws_url: str) -> None:
++    parts = urllib.parse.urlparse(ws_url)
++    host = parts.hostname or "127.0.0.1"
++    port = parts.port or 80
++    path = parts.path or "/"
++    if parts.query:
++      path += "?" + parts.query
++
++    sock = socket.create_connection((host, port), timeout=self._timeout)
++    sock.settimeout(self._timeout)
++    key = os.urandom(16)
++    key_b64 = __import__("base64").b64encode(key).decode("ascii")
++    req = (
++        f"GET {path} HTTP/1.1\r\n"
++        f"Host: {host}:{port}\r\n"
++        "Upgrade: websocket\r\n"
++        "Connection: Upgrade\r\n"
++        f"Sec-WebSocket-Key: {key_b64}\r\n"
++        "Sec-WebSocket-Version: 13\r\n"
++        "\r\n"
++    ).encode("utf-8")
++    sock.sendall(req)
++    data = bytearray()
++    while b"\r\n\r\n" not in data:
++      chunk = sock.recv(4096)
++      if not chunk:
++        break
++      data.extend(chunk)
++    if b" 101 " not in data.splitlines()[0]:
++      raise RuntimeError(f"WebSocket handshake failed: {bytes(data)[:200]!r}")
++    self._sock = sock
++
++  def close(self) -> None:
++    if self._sock is not None:
++      try:
++        self._sock.close()
++      except OSError:
++        pass
++      self._sock = None
++
++  def _read_exact(self, n: int) -> bytes:
++    if self._sock is None:
++      raise RuntimeError("WebSocket closed")
++    out = bytearray()
++    while len(out) < n:
++      chunk = self._sock.recv(n - len(out))
++      if not chunk:
++        raise RuntimeError("WebSocket closed while reading")
++      out.extend(chunk)
++    return bytes(out)
++
++  def _send_text(self, text: str) -> None:
++    if self._sock is None:
++      raise RuntimeError("WebSocket closed")
++    payload = text.encode("utf-8")
++    header = bytearray([0x81])
++    length = len(payload)
++    if length < 126:
++      header.append(0x80 | length)
++    elif length <= 0xFFFF:
++      header.append(0x80 | 126)
++      header.extend(struct.pack("!H", length))
++    else:
++      header.append(0x80 | 127)
++      header.extend(struct.pack("!Q", length))
++    mask = os.urandom(4)
++    header.extend(mask)
++    masked = bytearray(payload)
++    for i in range(length):
++      masked[i] ^= mask[i % 4]
++    self._sock.sendall(bytes(header) + bytes(masked))
++
++  def _recv_frame(self) -> bytes:
++    b1, b2 = self._read_exact(2)
++    opcode = b1 & 0x0F
++    masked = (b2 & 0x80) != 0
++    length = b2 & 0x7F
++    if length == 126:
++      length = struct.unpack("!H", self._read_exact(2))[0]
++    elif length == 127:
++      length = struct.unpack("!Q", self._read_exact(8))[0]
++    if masked:
++      mask = self._read_exact(4)
++    else:
++      mask = b""
++    payload = bytearray(self._read_exact(length))
++    if masked:
++      for i in range(length):
++        payload[i] ^= mask[i % 4]
++    if opcode == 0x8:
++      raise RuntimeError("WebSocket closed")
++    if opcode == 0x9:
++      return self._recv_frame()
++    if opcode != 0x1:
++      return self._recv_frame()
++    return bytes(payload)
++
++  def call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
++    msg_id = self._next_id
++    self._next_id += 1
++    self._send_text(json.dumps({
++        "id": msg_id,
++        "method": method,
++        "params": params or {},
++    }))
++    while True:
++      raw = self._recv_frame().decode("utf-8", errors="replace")
++      payload = json.loads(raw)
++      if payload.get("id") != msg_id:
++        continue
++      if "error" in payload:
++        raise RuntimeError(
++            f"CDP {method} failed: {json.dumps(payload['error'], ensure_ascii=True)}")
++      return payload.get("result") or {}
++
++
++def _http_json(port: int, path: str, method: str = "GET") -> Any:
++  url = f"http://127.0.0.1:{port}{path}"
++  req = urllib.request.Request(url, method=method)
++  with urllib.request.urlopen(req, timeout=10.0) as resp:
++    return json.loads(resp.read().decode("utf-8"))
++
++
++def _wait_for_devtools(port: int, timeout_sec: float) -> None:
++  deadline = time.time() + max(1.0, timeout_sec)
++  last_error: Optional[Exception] = None
++  while time.time() < deadline:
++    try:
++      version = _http_json(port, "/json/version")
++      if version.get("webSocketDebuggerUrl"):
++        return
++    except Exception as exc:
++      last_error = exc
++    time.sleep(0.25)
++  raise RuntimeError(f"DevTools port {port} not ready: {last_error}")
++
++
++def _browser_ws_url(port: int) -> str:
++  version = _http_json(port, "/json/version")
++  ws = str(version.get("webSocketDebuggerUrl") or "")
++  if not ws:
++    raise RuntimeError("Missing browser webSocketDebuggerUrl")
++  return ws
++
++
++def _list_targets(port: int) -> List[Dict[str, Any]]:
++  targets = _http_json(port, "/json/list")
++  return targets if isinstance(targets, list) else []
++
++
++def _find_target(port: int, url_prefix: str) -> Optional[str]:
++  for target in _list_targets(port):
++    url = str(target.get("url") or "")
++    if url.startswith(url_prefix):
++      return str(target.get("id") or "")
++  return None
++
++
++def _target_ws_url(port: int, target_id: str, timeout_sec: float = 15.0) -> str:
++  deadline = time.time() + max(1.0, timeout_sec)
++  while time.time() < deadline:
++    for target in _list_targets(port):
++      if target.get("id") == target_id and target.get("webSocketDebuggerUrl"):
++        return str(target["webSocketDebuggerUrl"])
++    time.sleep(0.1)
++  raise RuntimeError(f"Target websocket not ready for {target_id}")
++
++
++def _create_target(port: int, url: str) -> str:
++  browser = WebSocketCDP(_browser_ws_url(port), timeout=15.0)
++  try:
++    result = browser.call("Target.createTarget", {"url": url})
++  finally:
++    browser.close()
++  target_id = str(result.get("targetId") or "")
++  if not target_id:
++    raise RuntimeError("Target.createTarget returned empty targetId")
++  return target_id
++
++
++def _activate_target(port: int, target_id: str) -> None:
++  browser = WebSocketCDP(_browser_ws_url(port), timeout=15.0)
++  try:
++    browser.call("Target.activateTarget", {"targetId": target_id})
++  finally:
++    browser.close()
++
++
++def _ensure_dashboard_target(port: int,
++                             dashboard_url: str = DEFAULT_DASHBOARD_URL) -> str:
++  existing = _find_target(port, dashboard_url)
++  if existing:
++    return existing
++  return _create_target(port, dashboard_url)
++
++
++def _runtime_eval(ws: WebSocketCDP, expression: str, timeout_sec: float = 60.0) -> Any:
++  deadline = time.time() + max(1.0, timeout_sec)
++  last_error: Optional[Exception] = None
++  while time.time() < deadline:
++    try:
++      result = ws.call("Runtime.evaluate", {
++          "expression": expression,
++          "returnByValue": True,
++          "awaitPromise": True,
++      })
++      if isinstance(result, dict) and result.get("exceptionDetails"):
++        details = json.dumps(result.get("exceptionDetails"), ensure_ascii=True)
++        raise RuntimeError(f"Runtime.evaluate exception: {details[:400]}")
++      return (result.get("result") or {}).get("value")
++    except Exception as exc:
++      last_error = exc
++      msg = str(exc).lower()
++      if "context" in msg or "provisional" in msg or "socket closed" in msg:
++        time.sleep(0.25)
++        continue
++      raise
++  raise RuntimeError(f"Runtime.evaluate timed out: {last_error}")
++
++
++def _wait_for_dashboard_handler(ws: WebSocketCDP, timeout_sec: float = 45.0) -> None:
++  expr = (
++      "Boolean(window.chrome && typeof window.chrome.send === 'function')")
++  deadline = time.time() + max(1.0, timeout_sec)
++  while time.time() < deadline:
++    try:
++      if _runtime_eval(ws, expr, timeout_sec=3.0):
++        return
++    except Exception:
++      pass
++    time.sleep(0.25)
++  raise RuntimeError("Timed out waiting for chrome.send on dashboard tab")
++
++
++def _resolve_active_session_tab_id(ws: WebSocketCDP,
++                                   timeout_sec: float = 15.0) -> int:
++  result = _dashboard_send(
++      ws,
++      "dashboardAgentGetActivePageInfo",
++      {},
++      timeout_sec=timeout_sec,
++  )
++  if not isinstance(result, dict):
++    raise RuntimeError("dashboardAgentGetActivePageInfo returned invalid response")
++  tab_id = result.get("tab_id", result.get("tabId"))
++  if tab_id is None:
++    raise RuntimeError(
++        "dashboardAgentGetActivePageInfo missing tab_id "
++        f"(url={result.get('url')!r})")
++  return int(tab_id)
++
++
++def _dashboard_send(ws: WebSocketCDP,
++                    message: str,
++                    payload: Any,
++                    timeout_sec: float = 120.0) -> Any:
++  timeout_ms = int(max(1000, timeout_sec * 1000))
++  expr = f"""
++(async () => {{
++  const message = {json.dumps(message)};
++  const payload = {json.dumps(payload)};
++  const cb = '__sim_bridge_' + Date.now() + '_' + Math.random().toString(36).slice(2);
++  return await new Promise((resolve, reject) => {{
++    window[cb] = (result) => {{
++      try {{ delete window[cb]; }} catch (_) {{}}
++      if (Array.isArray(result) && result.length === 1) {{
++        resolve(result[0]);
++        return;
++      }}
++      resolve(result);
++    }};
++    if (!window.chrome || typeof window.chrome.send !== 'function') {{
++      reject(new Error('chrome.send unavailable'));
++      return;
++    }}
++    if (payload === null || payload === undefined) {{
++      window.chrome.send(message, [cb]);
++    }} else {{
++      window.chrome.send(message, [cb, payload]);
++    }}
++    setTimeout(() => reject(new Error('dashboard message timeout: ' + message)), {timeout_ms});
++  }});
++}})()
++"""
++  return _runtime_eval(ws, expr, timeout_sec=timeout_sec + 5.0)
++
++
++class HeadlessExecutorBridge:
++  """CDP client that drives ScriptExecutionService inside headless Chromium."""
++
++  def __init__(self,
++               cdp_port: int = DEFAULT_CDP_PORT,
++               dashboard_url: str = DEFAULT_DASHBOARD_URL):
++    self.cdp_port = cdp_port
++    self.dashboard_url = dashboard_url
++    self._dashboard_target_id: Optional[str] = None
++    self._dashboard_ws: Optional[WebSocketCDP] = None
++
++  def connect(self, startup_timeout_sec: float = 60.0) -> None:
++    _wait_for_devtools(self.cdp_port, startup_timeout_sec)
++    self._dashboard_target_id = _ensure_dashboard_target(
++        self.cdp_port, self.dashboard_url)
++    ws_url = _target_ws_url(self.cdp_port, self._dashboard_target_id)
++    self._dashboard_ws = WebSocketCDP(ws_url, timeout=60.0)
++    _wait_for_dashboard_handler(self._dashboard_ws)
++    _dashboard_send(self._dashboard_ws, "dashboardInitialize", None, timeout_sec=30.0)
++
++  def close(self) -> None:
++    if self._dashboard_ws is not None:
++      self._dashboard_ws.close()
++      self._dashboard_ws = None
++
++  def create_work_target(self, url: str) -> str:
++    return _create_target(self.cdp_port, url or "about:blank")
++
++  def activate_target(self, target_id: str) -> None:
++    _activate_target(self.cdp_port, target_id)
++
++  def run_timeline(self,
++                   actions: List[Dict[str, Any]],
++                   *,
++                   work_target_id: Optional[str] = None,
++                   work_tab_id: Optional[int] = None,
++                   wait_for_completion: bool = True,
++                   force_cdp_execution: Optional[bool] = None,
++                   force_native_execution: Optional[bool] = None,
++                   timeout_sec: float = 600.0) -> Dict[str, Any]:
++    if not self._dashboard_ws:
++      raise RuntimeError("HeadlessExecutorBridge is not connected")
++    tab_id = work_tab_id
++    if work_target_id:
++      self.activate_target(work_target_id)
++      time.sleep(0.15)
++      if tab_id is None:
++        tab_id = _resolve_active_session_tab_id(self._dashboard_ws)
++    payload: Dict[str, Any] = {
++        "timeline": actions,
++        "wait_for_completion": wait_for_completion,
++        "is_agent_mode": False,
++    }
++    if tab_id is not None:
++      payload["tab_id"] = tab_id
++    if force_cdp_execution is not None:
++      payload["force_cdp_execution"] = force_cdp_execution
++    if force_native_execution is not None:
++      payload["force_native_execution"] = force_native_execution
++    if self._dashboard_ws is not None:
++      socket_timeout = max(60.0, timeout_sec + 30.0)
++      self._dashboard_ws._timeout = socket_timeout
++      if self._dashboard_ws._sock is not None:
++        self._dashboard_ws._sock.settimeout(socket_timeout)
++    result = _dashboard_send(
++        self._dashboard_ws,
++        "dashboardAgentRunTimeline",
++        payload,
++        timeout_sec=timeout_sec,
++    )
++    if not isinstance(result, dict):
++      return {"ok": False, "error": "invalid dashboard response"}
++    return result
++
++  def refresh_page_map(self, timeout_sec: float = 45.0) -> Dict[str, Any]:
++    if not self._dashboard_ws:
++      raise RuntimeError("HeadlessExecutorBridge is not connected")
++    result = _dashboard_send(
++        self._dashboard_ws,
++        "dashboardAgentRefreshPageMap",
++        {},
++        timeout_sec=timeout_sec,
++    )
++    return result if isinstance(result, dict) else {"ok": False, "error": "invalid response"}
++
++
++def run_actions_on_headless(actions: List[Dict[str, Any]],
++                            *,
++                            cdp_port: int = DEFAULT_CDP_PORT,
++                            work_target_id: Optional[str] = None,
++                            work_tab_id: Optional[int] = None,
++                            work_url: Optional[str] = None,
++                            wait_for_completion: bool = True) -> Dict[str, Any]:
++  """Run Simulachrome timeline actions via native ScriptExecutionService."""
++  bridge = HeadlessExecutorBridge(cdp_port=cdp_port)
++  try:
++    bridge.connect()
++    target_id = work_target_id
++    if not target_id and work_url:
++      target_id = bridge.create_work_target(work_url)
++    return bridge.run_timeline(
++        actions,
++        work_target_id=target_id,
++        work_tab_id=work_tab_id,
++        wait_for_completion=wait_for_completion,
++    )
++  finally:
++    bridge.close()
+diff --git a/chrome/browser/ui/webui/dashboard/BUILD.gn b/chrome/browser/ui/webui/dashboard/BUILD.gn
+index 463b7578b59ee..59f2e1829105b 100644
+--- a/chrome/browser/ui/webui/dashboard/BUILD.gn
++++ b/chrome/browser/ui/webui/dashboard/BUILD.gn
+@@ -39,6 +39,10 @@ static_library("dashboard") {
+     "recording_suppression.h",
+ 
+     # Script Execution
++    "execution_run_context.cc",
++    "execution_run_context.h",
++    "native_run_activation.cc",
++    "native_run_activation.h",
+     "script_executor.cc",
+     "script_executor.h",
+     "script_context.cc",
+@@ -55,6 +59,8 @@ static_library("dashboard") {
+     "scheduler_service.h",
+     "listener_manager.cc",
+     "listener_manager.h",
++    "listener_watch_controller.cc",
++    "listener_watch_controller.h",
+ 
+     # Canonical schema + persistence
+     "script_schema.cc",
+@@ -189,6 +195,7 @@ static_library("dashboard") {
+     "//services/network/public/cpp",
+     "//services/network/public/mojom",
+     "//third_party/blink/public/common",
++    "//third_party/blink/public/mojom:mojom_platform",
+     "//ui/gfx/codec",
+     "//ui/gfx/geometry",
+     "//ui/webui",
+diff --git a/chrome/browser/ui/webui/dashboard/actions/action_base.cc b/chrome/browser/ui/webui/dashboard/actions/action_base.cc
+index 18509b00e98b6..80db4d1344199 100644
+--- a/chrome/browser/ui/webui/dashboard/actions/action_base.cc
++++ b/chrome/browser/ui/webui/dashboard/actions/action_base.cc
+@@ -47,5 +47,10 @@ void Action::SetSerializedAction(const std::string& action,
+   serialized_params_ = std::move(params);
+ }
+ 
++void Action::SetExecutionRunContext(bool agent_mode, bool force_native_execution) {
++  execution_agent_mode_ = agent_mode;
++  execution_force_native_ = force_native_execution;
++}
++
+ }  // namespace actions
+ }  // namespace dashboard
+diff --git a/chrome/browser/ui/webui/dashboard/actions/action_base.h b/chrome/browser/ui/webui/dashboard/actions/action_base.h
+index 03507e5d44ea2..f751697f9fb19 100644
+--- a/chrome/browser/ui/webui/dashboard/actions/action_base.h
++++ b/chrome/browser/ui/webui/dashboard/actions/action_base.h
+@@ -42,6 +42,11 @@ class Action {
+   std::string GetExecutionPathLabel() const;
+   void SetExecutionPathLabel(const std::string& label);
+   void SetProgressCallback(ProgressCallback callback);
++  void SetExecutionRunContext(bool agent_mode, bool force_native_execution);
++
++ protected:
++  bool IsAgentModeRun() const { return execution_agent_mode_; }
++  bool IsForceNativeRun() const { return execution_force_native_; }
+ 
+  protected:
+   void EmitProgressDetail(const std::string& detail) const;
+@@ -52,6 +57,8 @@ class Action {
+   base::Value::Dict serialized_params_;
+   std::string execution_path_label_;
+   ProgressCallback progress_callback_;
++  bool execution_agent_mode_ = false;
++  bool execution_force_native_ = false;
+ };
+ 
+ }  // namespace actions
+diff --git a/chrome/browser/ui/webui/dashboard/actions/action_factory.cc b/chrome/browser/ui/webui/dashboard/actions/action_factory.cc
+index 748f3639f2d88..f3e8a94652796 100644
+--- a/chrome/browser/ui/webui/dashboard/actions/action_factory.cc
++++ b/chrome/browser/ui/webui/dashboard/actions/action_factory.cc
+@@ -32,6 +32,18 @@
+ namespace dashboard {
+ namespace actions {
+ 
++namespace {
++
++void ApplyRunContextToAction(Action* action,
++                             bool is_agent_mode,
++                             bool force_native_execution) {
++  if (action) {
++    action->SetExecutionRunContext(is_agent_mode, force_native_execution);
++  }
++}
++
++}  // namespace
++
+ ActionFactory::ActionFactory(Profile* profile) : profile_(profile) {}
+ ActionFactory::~ActionFactory() = default;
+ 
+@@ -209,7 +221,10 @@ std::unique_ptr<Action> ActionFactory::CreateAction(
+   std::unique_ptr<Action> action;
+   if (IsExecutionRoutableKind(kind)) {
+     dashboard::ActionExecutionRouting routing;
+-    if (force_cdp_execution_) {
++    if (force_native_execution_) {
++      routing.primary = dashboard::ActionExecutionPath::kNative;
++      routing.fallback = dashboard::ActionExecutionPath::kUnset;
++    } else if (force_cdp_execution_) {
+       routing.primary = dashboard::ActionExecutionPath::kCdp;
+       routing.fallback = dashboard::ActionExecutionPath::kUnset;
+     } else {
+@@ -225,6 +240,10 @@ std::unique_ptr<Action> ActionFactory::CreateAction(
+     }
+ 
+     if (primary_action && fallback_action) {
++      ApplyRunContextToAction(primary_action.get(), is_agent_mode_,
++                              force_native_execution_);
++      ApplyRunContextToAction(fallback_action.get(), is_agent_mode_,
++                              force_native_execution_);
+       action = std::make_unique<ExecutionFailoverAction>(
+           profile_, kind, std::move(primary_action), routing.primary,
+           std::move(fallback_action), routing.fallback);
+@@ -241,6 +260,8 @@ std::unique_ptr<Action> ActionFactory::CreateAction(
+                    << "'";
+         return nullptr;
+       }
++      ApplyRunContextToAction(action.get(), is_agent_mode_,
++                              force_native_execution_);
+       return action;
+     }
+   }
+@@ -278,11 +299,26 @@ std::unique_ptr<Action> ActionFactory::CreateAction(
+   }
+ 
+   LOG(INFO) << "[ActionFactory] Created action kind='" << kind << "'";
++  ApplyRunContextToAction(action.get(), is_agent_mode_, force_native_execution_);
+   return action;
+ }
+ 
+ void ActionFactory::SetForceCdpExecution(bool force) {
+   force_cdp_execution_ = force;
++  if (force) {
++    force_native_execution_ = false;
++  }
++}
++
++void ActionFactory::SetForceNativeExecution(bool force) {
++  force_native_execution_ = force;
++  if (force) {
++    force_cdp_execution_ = false;
++  }
++}
++
++void ActionFactory::SetAgentMode(bool agent_mode) {
++  is_agent_mode_ = agent_mode;
+ }
+ 
+ std::vector<std::unique_ptr<Action>> ActionFactory::CreateActionSequence(
+diff --git a/chrome/browser/ui/webui/dashboard/actions/action_factory.h b/chrome/browser/ui/webui/dashboard/actions/action_factory.h
+index 43bd168fbd6fb..2755e8e67a9d5 100644
+--- a/chrome/browser/ui/webui/dashboard/actions/action_factory.h
++++ b/chrome/browser/ui/webui/dashboard/actions/action_factory.h
+@@ -31,10 +31,15 @@ class ActionFactory {
+ 
+   // When enabled, execution-routable actions are forced onto the CDP path.
+   void SetForceCdpExecution(bool force);
++  // When enabled, execution-routable actions are forced onto the native path.
++  void SetForceNativeExecution(bool force);
++  void SetAgentMode(bool agent_mode);
+ 
+  private:
+   raw_ptr<Profile> profile_;
+   bool force_cdp_execution_ = false;
++  bool force_native_execution_ = false;
++  bool is_agent_mode_ = false;
+ };
+ 
+ }  // namespace actions
+diff --git a/chrome/browser/ui/webui/dashboard/actions/listen_action.cc b/chrome/browser/ui/webui/dashboard/actions/listen_action.cc
+index 386c98f9d6238..36a6ad659878e 100644
+--- a/chrome/browser/ui/webui/dashboard/actions/listen_action.cc
++++ b/chrome/browser/ui/webui/dashboard/actions/listen_action.cc
+@@ -1,5 +1,7 @@
+ #include "chrome/browser/ui/webui/dashboard/actions/listen_action.h"
+ 
++#include <algorithm>
++
+ #include "base/json/json_writer.h"
+ #include "base/logging.h"
+ #include "base/strings/string_number_conversions.h"
+@@ -10,6 +12,8 @@
+ #include "chrome/browser/ui/webui/dashboard/actions/action_metadata_promotion.h"
+ #include "chrome/browser/ui/webui/dashboard/actions/native_page_map_matcher.h"
+ #include "chrome/browser/ui/webui/dashboard/debug_config.h"
++#include "chrome/browser/ui/webui/dashboard/execution_run_context.h"
++#include "chrome/browser/ui/webui/dashboard/listener_watch_controller.h"
+ #include "chrome/browser/ui/webui/dashboard/unified_page_context.h"
+ #include "content/public/browser/web_contents.h"
+ #include "third_party/re2/src/re2/re2.h"
+@@ -47,6 +51,13 @@ std::string NormalizeMatchText(std::string text) {
+   return base::CollapseWhitespaceASCII(std::move(text), true);
+ }
+ 
++bool ConditionSupportsLocatorFallback(const std::string& condition) {
++  const std::string lowered = base::ToLowerASCII(condition);
++  return lowered == "visible" || lowered == "hidden" ||
++         lowered == "becomes_visible" || lowered == "becomes_hidden" ||
++         lowered == "element_exists" || lowered == "exists";
++}
++
+ bool ContainsCaseInsensitive(std::string_view haystack, std::string_view needle) {
+   return base::ToLowerASCII(haystack).find(base::ToLowerASCII(needle)) !=
+          std::string::npos;
+@@ -1165,6 +1176,8 @@ bool ListenAction::SetParams(const base::Value::Dict& params) {
+ void ListenAction::Execute(content::WebContents* web_contents, Callback callback) {
+   callback_ = std::move(callback);
+   web_contents_ = web_contents;
++  resolver_page_map_fallback_attempted_ = false;
++  resolver_page_map_extractor_.reset();
+   native_baseline_initialized_ = false;
+   native_prev_visible_ = false;
+   native_baseline_child_count_ = 0;
+@@ -1246,9 +1259,36 @@ void ListenAction::StartNativeListen(content::WebContents* web_contents) {
+     Finish(false, "No web contents");
+     return;
+   }
++  listener_watch_registration_id_ = dashboard::ListenerWatchController::Register(
++      web_contents,
++      base::BindRepeating(&ListenAction::OnListenerWatchTriggered,
++                          weak_ptr_factory_.GetWeakPtr()));
++  listener_watch_active_ = listener_watch_registration_id_ != 0;
+   PollNativeListenerState();
+ }
+ 
++void ListenAction::OnListenerWatchTriggered() {
++  if (callback_.is_null() || !web_contents_) {
++    return;
++  }
++  PollNativeListenerState();
++}
++
++void ListenAction::ScheduleNextNativePoll() {
++  if (callback_.is_null()) {
++    return;
++  }
++  const int interval_ms =
++      listener_watch_active_
++          ? std::max(sample_interval_ms_ * 8, 2000)
++          : sample_interval_ms_;
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(&ListenAction::PollNativeListenerState,
++                     weak_ptr_factory_.GetWeakPtr()),
++      base::Milliseconds(interval_ms));
++}
++
+ void ListenAction::PollNativeListenerState() {
+   if (callback_.is_null()) {
+     return;
+@@ -1262,6 +1302,14 @@ void ListenAction::PollNativeListenerState() {
+     Finish(false, "Listen timed out");
+     return;
+   }
++  if (!dashboard::ExecutionRunContext::Get().ShouldUseUnifiedPageMap()) {
++    if (ConditionSupportsLocatorFallback(condition_)) {
++      StartResolverLocatorFallback("page_map_disabled_in_script_mode");
++    } else {
++      StartResolverPageMapFallback("page_map_disabled_in_script_mode");
++    }
++    return;
++  }
+   dashboard::FetchUnifiedPageMapSnapshot(
+       web_contents_,
+       base::BindOnce(&ListenAction::OnNativePageMapCaptured,
+@@ -1275,6 +1323,21 @@ void ListenAction::OnNativePageMapCaptured(dashboard::UnifiedPageMapResult resul
+   }
+   ++poll_count_;
+   if (!result.ok) {
++    if (resolver_page_map_extractor_ || resolver_locator_fallback_active_) {
++      return;
++    }
++    if (!resolver_page_map_fallback_attempted_ && web_contents_) {
++      if (ConditionSupportsLocatorFallback(condition_)) {
++        StartResolverLocatorFallback(
++            result.error.empty() ? "Native listen page snapshot failed"
++                                 : result.error);
++      } else {
++        StartResolverPageMapFallback(
++            result.error.empty() ? "Native listen page snapshot failed"
++                                 : result.error);
++      }
++      return;
++    }
+     Finish(false, result.error.empty() ? "Native listen page snapshot failed"
+                                        : result.error);
+     return;
+@@ -1507,22 +1570,149 @@ void ListenAction::OnNativePageMapCaptured(dashboard::UnifiedPageMapResult resul
+     return;
+   }
+ 
+-  base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
+-      FROM_HERE,
+-      base::BindOnce(&ListenAction::PollNativeListenerState,
++  ScheduleNextNativePoll();
++}
++
++void ListenAction::StartResolverPageMapFallback(const std::string& reason) {
++  if (!web_contents_ || resolver_page_map_fallback_attempted_) {
++    Finish(false, reason);
++    return;
++  }
++  resolver_page_map_fallback_attempted_ = true;
++  resolver_page_map_extractor_ =
++      std::make_unique<dashboard::PageMapExtractor>();
++  LOG(INFO) << "[ListenAction] Unified page-map unavailable (" << reason
++            << "), trying resolver page-map fallback";
++  resolver_page_map_extractor_->Run(
++      web_contents_,
++      base::BindOnce(&ListenAction::OnResolverPageMapFallbackReady,
+                      weak_ptr_factory_.GetWeakPtr()),
+-      base::Milliseconds(sample_interval_ms_));
++      /*greedy=*/false,
++      /*is_agent_mode=*/false,
++      /*timeout_ms=*/4000);
+ }
+ 
++void ListenAction::StartResolverLocatorFallback(const std::string& reason) {
++  if (!web_contents_ || resolver_locator_fallback_active_) {
++    Finish(false, reason);
++    return;
++  }
++  resolver_locator_fallback_active_ = true;
++  LOG(INFO) << "[ListenAction] Trying resolver locator fallback (" << reason
++            << ")";
++  int remaining_ms = timeout_ms_ > 0
++                         ? timeout_ms_ - (base::TimeTicks::Now() - start_time_)
++                               .InMilliseconds()
++                         : 2000;
++  remaining_ms = std::max(remaining_ms, 0);
++  const int resolve_timeout_ms = std::clamp(remaining_ms, 250, 5000);
++  resolver_locator_fallback_ =
++      std::make_unique<dashboard::LocatorResolver>(web_contents_);
++  resolver_locator_fallback_->ResolveUniqueAsync(
++      locators_, dashboard::SearchScope::kAll, resolve_timeout_ms,
++      base::BindOnce(&ListenAction::OnResolverLocatorFallbackReady,
++                     weak_ptr_factory_.GetWeakPtr()));
++}
+ 
++void ListenAction::OnResolverLocatorFallbackReady(
++    bool success,
++    const dashboard::ResolvedElement& element,
++    const std::string& error) {
++  resolver_locator_fallback_.reset();
++  resolver_locator_fallback_active_ = false;
++  if (callback_.is_null()) {
++    return;
++  }
++  if (!error.empty() && !success && dashboard::IsVerboseLoggingEnabled()) {
++    LOG(INFO) << "[ListenAction] Resolver locator fallback miss error="
++              << TruncateForLog(error, 240);
++  }
+ 
++  const std::string condition = base::ToLowerASCII(condition_);
++  const bool exists = success;
++  const bool visible = success && element.visible;
+ 
++  if (!native_baseline_initialized_) {
++    native_baseline_initialized_ = true;
++    native_prev_visible_ = visible;
++    native_baseline_child_count_ = 0;
++  }
++
++  bool satisfied = false;
++  if (condition == "visible") {
++    satisfied = visible;
++  } else if (condition == "hidden") {
++    satisfied = success && !visible;
++  } else if (condition == "becomes_visible") {
++    satisfied = !native_prev_visible_ && visible;
++  } else if (condition == "becomes_hidden") {
++    satisfied = native_prev_visible_ && success && !visible;
++  } else if (condition == "element_exists" || condition == "exists") {
++    satisfied = exists;
++  } else {
++    Finish(false, "Unsupported native listen condition: " + condition_);
++    return;
++  }
++
++  native_prev_visible_ = visible;
++
++  if (satisfied) {
++    base::Value::Dict match;
++    match.Set("ok", true);
++    match.Set("satisfied", true);
++    match.Set("exists", exists);
++    match.Set("visible", visible);
++    if (web_contents_) {
++      match.Set("pageUrl", web_contents_->GetLastCommittedURL().spec());
++    }
++    if (!element.text.empty()) {
++      match.Set("text", element.text);
++    }
++    if (!element.role.empty()) {
++      match.Set("role", element.role);
++    }
++    if (!element.accessibility_name.empty()) {
++      match.Set("accessibilityName", element.accessibility_name);
++    }
++    std::string payload;
++    base::JSONWriter::Write(match, &payload);
++    Finish(true, payload);
++    return;
++  }
++
++  ScheduleNextNativePoll();
++}
++
++void ListenAction::OnResolverPageMapFallbackReady(
++    base::Value::Dict resolver_page_map) {
++  resolver_page_map_extractor_.reset();
++  if (callback_.is_null()) {
++    return;
++  }
++  if (resolver_page_map.empty()) {
++    Finish(false, "Resolver page-map fallback was empty");
++    return;
++  }
++  dashboard::UnifiedPageMapResult result;
++  result.ok = true;
++  result.page_map = std::move(resolver_page_map);
++  OnNativePageMapCaptured(std::move(result));
++}
+ 
+ void ListenAction::Finish(bool success, const std::string& message) {
+   if (dashboard::IsVerboseLoggingEnabled()) {
+     LOG(INFO) << "[ListenAction] Finish success=" << (success ? 1 : 0)
+               << " message=" << TruncateForLog(message, 1400);
+   }
++  resolver_locator_fallback_.reset();
++  resolver_locator_fallback_active_ = false;
++  resolver_page_map_extractor_.reset();
++  if (web_contents_ && listener_watch_registration_id_ != 0) {
++    dashboard::ListenerWatchController::Unregister(web_contents_,
++                                                   listener_watch_registration_id_);
++    listener_watch_registration_id_ = 0;
++    listener_watch_active_ = false;
++  }
+   web_contents_ = nullptr;
+   if (!callback_) {
+     return;
+diff --git a/chrome/browser/ui/webui/dashboard/actions/loop_action.cc b/chrome/browser/ui/webui/dashboard/actions/loop_action.cc
+index 7cc1988805e12..69aee99fabe55 100644
+--- a/chrome/browser/ui/webui/dashboard/actions/loop_action.cc
++++ b/chrome/browser/ui/webui/dashboard/actions/loop_action.cc
+@@ -19,6 +19,7 @@
+ #include "chrome/browser/ui/webui/dashboard/actions/native_page_map_matcher.h"
+ #include "chrome/browser/ui/webui/dashboard/dashboard_automation_controller.h"
+ #include "chrome/browser/ui/webui/dashboard/debug_config.h"
++#include "chrome/browser/ui/webui/dashboard/execution_run_context.h"
+ #include "chrome/browser/ui/webui/dashboard/page_map_extractor.h"
+ #include "chrome/browser/ui/webui/dashboard/unified_page_context.h"
+ #include "content/public/browser/navigation_handle.h"
+@@ -346,6 +347,10 @@ void LoopAction::CollectForEachTargets() {
+     Complete(false, "No web contents");
+     return;
+   }
++  if (!dashboard::ExecutionRunContext::Get().ShouldUseUnifiedPageMap()) {
++    StartResolverPageMapFallback("page_map_disabled_in_script_mode");
++    return;
++  }
+   dashboard::FetchUnifiedPageMapSnapshot(
+       web_contents_,
+       base::BindOnce(&LoopAction::OnForEachTargetsCollected,
+@@ -367,7 +372,7 @@ void LoopAction::StartResolverPageMapFallback(const std::string& reason) {
+       web_contents_,
+       base::BindOnce(&LoopAction::OnResolverPageMapFallbackReady,
+                      weak_factory_.GetWeakPtr(), reason),
+-      /*greedy=*/true, /*is_agent_mode=*/false, /*timeout_ms=*/2500);
++      /*greedy=*/false, /*is_agent_mode=*/false, /*timeout_ms=*/2500);
+ }
+ 
+ void LoopAction::OnResolverPageMapFallbackReady(const std::string& reason,
+diff --git a/chrome/browser/ui/webui/dashboard/actions/navigate_action.cc b/chrome/browser/ui/webui/dashboard/actions/navigate_action.cc
+index 6d3444f163dd7..255418703b20b 100644
+--- a/chrome/browser/ui/webui/dashboard/actions/navigate_action.cc
++++ b/chrome/browser/ui/webui/dashboard/actions/navigate_action.cc
+@@ -4,6 +4,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/rand_util.h"
+@@ -11,7 +12,7 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
+-#include "chrome/browser/ui/webui/dashboard/actions/action_factory.h"
++#include "chrome/browser/ui/webui/dashboard/actions/click_action.h"
+ #include "components/url_formatter/url_fixer.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_handle.h"
+@@ -34,15 +35,9 @@ constexpr char kDirectoryPageUrl[] =
+     "https://flourishing-peony-4590a5.netlify.app/directory.html";
+ constexpr char kFallbackDirectoryLinkId[] = "navigate-link";
+ constexpr base::TimeDelta kNavigationTimeout = base::Seconds(120);
+-constexpr int kMinDirectoryHopDelayMs = 700;
+-constexpr int kMaxDirectoryHopDelayMs = 2600;
++constexpr base::TimeDelta kDirectoryPostLoadDelay = base::Seconds(5);
+ constexpr base::TimeDelta kPostClickVerificationDelay = base::Seconds(3);
+ 
+-base::TimeDelta BuildRandomDirectoryHopDelay() {
+-  return base::Milliseconds(
+-      base::RandInt(kMinDirectoryHopDelayMs, kMaxDirectoryHopDelayMs));
+-}
+-
+ GURL BuildDirectoryUrl(const GURL& target, const std::string& link_id) {
+   GURL url =
+       net::AppendQueryParameter(GURL(kDirectoryPageUrl), "url", target.spec());
+@@ -109,22 +104,6 @@ bool RedirectChainContainsEquivalent(const std::vector<GURL>& chain,
+   return false;
+ }
+ 
+-base::Value::Dict BuildDirectoryLinkClickParams(const std::string& link_id) {
+-  base::Value::Dict click_params;
+-  base::Value::List locators;
+-  base::Value::Dict locator;
+-  locator.Set("type", "ID");
+-  locator.Set("value", link_id);
+-  locators.Append(std::move(locator));
+-  click_params.Set("locators", std::move(locators));
+-  click_params.Set("waitTimeout", 7000);
+-  click_params.Set("humanOffset", false);
+-  click_params.Set("preferCenterPoint", true);
+-  click_params.Set("allowHrefNavigationFallback", false);
+-  click_params.Set("click_count", 1);
+-  return click_params;
+-}
+-
+ GURL BuildRandomReferrer(const GURL& target, const std::string& override) {
+   if (!override.empty()) {
+     const GURL override_url(override);
+@@ -154,6 +133,25 @@ GURL BuildRandomReferrer(const GURL& target, const std::string& override) {
+   }
+ }
+ 
++base::Value::Dict BuildDirectoryLinkClickParams(const std::string& link_id,
++                                                bool force_activation) {
++  base::Value::Dict click_params;
++  base::Value::List locators;
++  base::Value::Dict locator;
++  locator.Set("type", "ID");
++  locator.Set("value", link_id);
++  locators.Append(std::move(locator));
++  click_params.Set("locators", std::move(locators));
++  click_params.Set("waitTimeout", 7000);
++  click_params.Set("humanOffset", false);
++  click_params.Set("preferCenterPoint", true);
++  click_params.Set("allowHrefNavigationFallback", false);
++  click_params.Set("forceActivation", force_activation);
++  click_params.Set("click_count", 1);
++  click_params.Set("clickCount", 1);
++  return click_params;
++}
++
+ }  // namespace
+ 
+ NavigateAction::NavigateAction(Profile* profile) : Action(profile) {}
+@@ -165,8 +163,6 @@ bool NavigateAction::SetParams(const base::Value::Dict& params) {
+     return false;
+   }
+ 
+-  // Accept omnibox-like inputs such as "google.com" by fixing up into a proper
+-  // URL. The rest of NavigateAction assumes an absolute URL.
+   const std::string raw = *url;
+   const GURL fixed =
+       url_formatter::FixupURL(raw, /*desired_tld=*/std::string());
+@@ -175,7 +171,6 @@ bool NavigateAction::SetParams(const base::Value::Dict& params) {
+   }
+   url_ = fixed.spec();
+ 
+-  // Optional: allow disabling spoofing or overriding referrer
+   if (auto spoof = params.FindBool("spoofReferrer")) {
+     spoof_referrer_ = *spoof;
+   }
+@@ -186,7 +181,6 @@ bool NavigateAction::SetParams(const base::Value::Dict& params) {
+       link_id && !link_id->empty()) {
+     link_id_ = *link_id;
+   }
+-  // Enable timeline serialization for Navigate
+   base::Value::Dict p = params.Clone();
+   p.Set("url", url_);
+   SetSerializedAction("navigate", std::move(p));
+@@ -214,7 +208,6 @@ class NavigateAction::NavigationWaiter : public content::WebContentsObserver {
+     if (!navigation->HasCommitted()) {
+       return;
+     }
+-    // Allow redirects (common for scheme/host normalization, e.g. google.com).
+     const GURL committed = navigation->GetURL();
+     if (committed != target_url_) {
+       const bool found_in_redirect_chain =
+@@ -222,7 +215,6 @@ class NavigateAction::NavigationWaiter : public content::WebContentsObserver {
+                                           target_url_);
+       bool accept_relaxed_directory_match = false;
+       if (owner_ && owner_->phase_ == Phase::kDirectory) {
+-        // Tolerate harmless query-string rewrites on the interstitial URL.
+         if (SameOriginAndPath(committed, owner_->directory_url_) ||
+             RedirectChainContainsEquivalent(navigation->GetRedirectChain(),
+                                             owner_->directory_url_)) {
+@@ -297,7 +289,10 @@ void NavigateAction::Execute(content::WebContents* web_contents,
+   navigation_waiter_.reset();
+   directory_click_action_.reset();
+   direct_fallback_attempted_ = false;
++  directory_trusted_click_attempted_ = false;
++  directory_referrer_navigation_attempted_ = false;
+   direct_fallback_reason_.clear();
++  last_directory_click_detail_.clear();
+   pending_callback_ = std::move(callback);
+   navigation_timeout_.Start(FROM_HERE, kNavigationTimeout,
+                             base::BindOnce(&NavigateAction::OnNavigationTimeout,
+@@ -334,71 +329,63 @@ void NavigateAction::ClickDirectoryLinkToTarget() {
+ 
+   phase_ = Phase::kTargetAfterClick;
+   last_directory_click_detail_.clear();
++  directory_trusted_click_attempted_ = true;
+   navigation_waiter_ =
+       std::make_unique<NavigationWaiter>(web_contents_, target_url_, this);
+   navigation_timeout_.Start(FROM_HERE, kNavigationTimeout,
+                             base::BindOnce(&NavigateAction::OnNavigationTimeout,
+                                            weak_factory_.GetWeakPtr()));
+-  base::Value::Dict click_params = BuildDirectoryLinkClickParams(link_id_);
+-  base::Value::Dict action_data;
+-  action_data.Set("action", "click");
+-  action_data.Set("params", std::move(click_params));
+-  dashboard::actions::ActionFactory factory(profile_);
+-  directory_click_action_ = factory.CreateAction(action_data);
+-  if (!directory_click_action_) {
+-    OnNavigationFinished(false, "Failed to configure directory click action");
++
++  directory_click_action_ = std::make_unique<ClickAction>(profile_);
++  base::Value::Dict click_params =
++      BuildDirectoryLinkClickParams(link_id_, IsForceNativeRun());
++  if (!directory_click_action_->SetParams(click_params)) {
++    LOG(WARNING) << "[Action] Navigate directory click params rejected; "
++                    "falling back to referrer navigation";
++    NavigateFromDirectoryWithReferrer();
+     return;
+   }
+ 
+-  LOG(INFO) << "[Action] Navigate::Execute phase=click-link(trusted) id="
+-            << link_id_ << " directory=" << directory_url_.spec();
++  LOG(INFO) << "[Action] Navigate::Execute phase=directory-trusted-click "
++            << "link_id=" << link_id_
++            << " force_activation=" << (IsForceNativeRun() ? 1 : 0);
+   directory_click_action_->Execute(
+       web_contents_,
+       base::BindOnce(&NavigateAction::OnDirectoryLinkClickFinished,
+                      weak_factory_.GetWeakPtr()));
+ }
+ 
+-void NavigateAction::OnDirectoryLinkClickFinished(bool success,
+-                                                  const std::string& error) {
+-  if (!pending_callback_) {
++void NavigateAction::NavigateFromDirectoryWithReferrer() {
++  if (!web_contents_) {
++    OnNavigationFinished(false, "WebContents lost");
+     return;
+   }
+-  last_directory_click_detail_ = error;
+-  LOG(WARNING) << "[Action] Navigate directory click result success="
+-               << (success ? 1 : 0) << " detail=" << error;
+-  if (!success) {
+-    LOG(WARNING) << "[Action] Navigate directory click failed; error=" << error;
+-    StartDirectTargetNavigationFallback(error.empty() ? "Directory click failed"
+-                                                      : error);
++
++  if (!web_contents_->GetPrimaryMainFrame()) {
++    OnNavigationFinished(false, "Directory page frame missing");
+     return;
+   }
+-  // Click injection completed; require the target navigation to commit shortly
+-  // afterward so primary click failures stay visible during debugging.
+-  post_click_fallback_timer_.Start(
+-      FROM_HERE, kPostClickVerificationDelay,
+-      base::BindOnce(
+-          [](base::WeakPtr<NavigateAction> self) {
+-            if (!self || !self->pending_callback_ ||
+-                self->phase_ != Phase::kTargetAfterClick || !self->web_contents_) {
+-              return;
+-            }
+-            if (self->web_contents_->GetLastCommittedURL() == self->target_url_) {
+-              return;
+-            }
+-            const std::string current =
+-                self->web_contents_->GetLastCommittedURL().spec();
+-            const std::string detail =
+-                self->last_directory_click_detail_.empty()
+-                    ? std::string()
+-                    : " | " + self->last_directory_click_detail_;
+-            LOG(WARNING) << "[Action] Navigate native directory click produced "
+-                            "no navigation commit. current="
+-                         << current << " target=" << self->target_url_.spec();
+-            self->StartDirectTargetNavigationFallback(
+-                "Native directory click produced no navigation commit" +
+-                    detail);
+-          },
+-          weak_factory_.GetWeakPtr()));
++
++  post_click_fallback_timer_.Stop();
++  directory_click_action_.reset();
++  phase_ = Phase::kTargetAfterClick;
++  directory_referrer_navigation_attempted_ = true;
++  navigation_waiter_ =
++      std::make_unique<NavigationWaiter>(web_contents_, target_url_, this);
++  navigation_timeout_.Start(FROM_HERE, kNavigationTimeout,
++                            base::BindOnce(&NavigateAction::OnNavigationTimeout,
++                                           weak_factory_.GetWeakPtr()));
++
++  content::NavigationController::LoadURLParams load_params(target_url_);
++  load_params.referrer = content::Referrer(
++      directory_url_,
++      network::mojom::ReferrerPolicy::kStrictOriginWhenCrossOrigin);
++  load_params.transition_type = ui::PAGE_TRANSITION_LINK;
++
++  LOG(INFO) << "[Action] Navigate::Execute phase=directory-referrer-navigation "
++            << "target=" << target_url_.spec()
++            << " referrer=" << directory_url_.spec();
++  web_contents_->GetController().LoadURLWithParams(load_params);
+ }
+ 
+ void NavigateAction::StartDirectTargetNavigationFallback(
+@@ -412,9 +399,10 @@ void NavigateAction::StartDirectTargetNavigationFallback(
+     return;
+   }
+ 
++  post_click_fallback_timer_.Stop();
++  directory_click_action_.reset();
+   direct_fallback_attempted_ = true;
+   direct_fallback_reason_ = reason;
+-  post_click_fallback_timer_.Stop();
+   phase_ = Phase::kTargetAfterClick;
+   navigation_waiter_ =
+       std::make_unique<NavigationWaiter>(web_contents_, target_url_, this);
+@@ -434,11 +422,48 @@ void NavigateAction::StartDirectTargetNavigationFallback(
+   web_contents_->GetController().LoadURLWithParams(load_params);
+ }
+ 
++void NavigateAction::OnDirectoryLinkClickFinished(bool success,
++                                                  const std::string& error) {
++  if (!pending_callback_) {
++    return;
++  }
++  last_directory_click_detail_ = error;
++  LOG(INFO) << "[Action] Navigate directory click result success="
++            << (success ? 1 : 0) << " detail=" << error;
++  if (!success) {
++    LOG(WARNING) << "[Action] Navigate directory click failed; trying referrer "
++                    "navigation fallback";
++    NavigateFromDirectoryWithReferrer();
++    return;
++  }
++
++  post_click_fallback_timer_.Start(
++      FROM_HERE, kPostClickVerificationDelay,
++      base::BindOnce(
++          [](base::WeakPtr<NavigateAction> self) {
++            if (!self || !self->pending_callback_ ||
++                self->phase_ != Phase::kTargetAfterClick || !self->web_contents_) {
++              return;
++            }
++            if (self->web_contents_->GetLastCommittedURL() == self->target_url_) {
++              return;
++            }
++            const std::string current =
++                self->web_contents_->GetLastCommittedURL().spec();
++            LOG(WARNING) << "[Action] Navigate native directory click produced "
++                            "no navigation commit. current="
++                         << current << " target=" << self->target_url_.spec()
++                         << " trying referrer navigation fallback";
++            self->NavigateFromDirectoryWithReferrer();
++          },
++          weak_factory_.GetWeakPtr()));
++}
++
+ void NavigateAction::OnNavigationFinished(bool success,
+                                           const std::string& error) {
+   if (success && phase_ == Phase::kDirectory) {
+     navigation_waiter_.reset();
+-    const base::TimeDelta hop_delay = BuildRandomDirectoryHopDelay();
++    const base::TimeDelta hop_delay = kDirectoryPostLoadDelay;
+     LOG(INFO) << "[Action] Navigate directory committed. hop delay_ms="
+               << hop_delay.InMilliseconds();
+     base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
+@@ -452,22 +477,48 @@ void NavigateAction::OnNavigationFinished(bool success,
+   navigation_waiter_.reset();
+   directory_click_action_.reset();
+   post_click_fallback_timer_.Stop();
++  const bool used_direct_fallback = direct_fallback_attempted_;
++  const bool used_directory_referrer = directory_referrer_navigation_attempted_;
++  const bool used_trusted_click = directory_trusted_click_attempted_;
++  const std::string fallback_reason = direct_fallback_reason_;
++  direct_fallback_attempted_ = false;
++  directory_referrer_navigation_attempted_ = false;
++  directory_trusted_click_attempted_ = false;
++  direct_fallback_reason_.clear();
+   navigation_timeout_.Stop();
+   auto cb = std::move(pending_callback_);
+   if (cb) {
+-    if (success && direct_fallback_attempted_) {
++    if (success && used_direct_fallback) {
+       std::string message = "path=direct_fallback_after_directory_click";
+-      if (!direct_fallback_reason_.empty()) {
+-        message += " reason=" + direct_fallback_reason_;
++      if (!fallback_reason.empty()) {
++        message += " reason=" + fallback_reason;
+       }
+       std::move(cb).Run(true, message);
+       return;
+     }
++    if (success && used_directory_referrer) {
++      std::move(cb).Run(true, "path=native_directory_referrer_navigation");
++      return;
++    }
++    if (success && used_trusted_click) {
++      std::move(cb).Run(true, "path=native_directory_trusted_click");
++      return;
++    }
+     std::move(cb).Run(success, success ? std::string() : error);
+   }
+ }
+ 
+ void NavigateAction::OnNavigationTimeout() {
++  if (directory_trusted_click_attempted_ && !directory_referrer_navigation_attempted_ &&
++      !direct_fallback_attempted_) {
++    NavigateFromDirectoryWithReferrer();
++    return;
++  }
++  if (directory_referrer_navigation_attempted_ && !direct_fallback_attempted_) {
++    StartDirectTargetNavigationFallback(
++        "Directory referrer navigation timed out");
++    return;
++  }
+   OnNavigationFinished(false, "Navigation timed out");
+ }
+ 
+diff --git a/chrome/browser/ui/webui/dashboard/actions/navigate_action.h b/chrome/browser/ui/webui/dashboard/actions/navigate_action.h
+index 4a1bd10ea861d..f164548b42447 100644
+--- a/chrome/browser/ui/webui/dashboard/actions/navigate_action.h
++++ b/chrome/browser/ui/webui/dashboard/actions/navigate_action.h
+@@ -16,6 +16,8 @@ namespace content {
+ class WebContents;
+ }
+ 
++class ClickAction;
++
+ namespace dashboard {
+ namespace actions {
+ 
+@@ -37,8 +39,9 @@ class NavigateAction : public Action {
+   class NavigationWaiter;
+ 
+   void ClickDirectoryLinkToTarget();
+-  void OnDirectoryLinkClickFinished(bool success, const std::string& error);
++  void NavigateFromDirectoryWithReferrer();
+   void StartDirectTargetNavigationFallback(const std::string& reason);
++  void OnDirectoryLinkClickFinished(bool success, const std::string& error);
+   void OnNavigationFinished(bool success, const std::string& error);
+   void OnNavigationTimeout();
+ 
+@@ -52,10 +55,12 @@ class NavigateAction : public Action {
+   bool spoof_referrer_ = true;
+   std::string referrer_override_;
+   std::unique_ptr<NavigationWaiter> navigation_waiter_;
+-  std::unique_ptr<Action> directory_click_action_;
++  std::unique_ptr<ClickAction> directory_click_action_;
++  std::string last_directory_click_detail_;
++  bool directory_trusted_click_attempted_ = false;
++  bool directory_referrer_navigation_attempted_ = false;
+   bool direct_fallback_attempted_ = false;
+   std::string direct_fallback_reason_;
+-  std::string last_directory_click_detail_;
+   Callback pending_callback_;
+   raw_ptr<content::WebContents> web_contents_ = nullptr;  // not owned
+   Phase phase_ = Phase::kDirectory;
+diff --git a/chrome/browser/ui/webui/dashboard/actions/scrape_table_action.cc b/chrome/browser/ui/webui/dashboard/actions/scrape_table_action.cc
+index fc11c8d43a98a..6fd13802ecf8f 100644
+--- a/chrome/browser/ui/webui/dashboard/actions/scrape_table_action.cc
++++ b/chrome/browser/ui/webui/dashboard/actions/scrape_table_action.cc
+@@ -25,6 +25,7 @@
+ #include "chrome/browser/ui/webui/dashboard/actions/native_page_map_matcher.h"
+ #include "chrome/browser/ui/webui/dashboard/page_map_extractor.h"
+ #include "chrome/browser/ui/webui/dashboard/debug_config.h"
++#include "chrome/browser/ui/webui/dashboard/execution_run_context.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/web_contents.h"
+ 
+@@ -1849,6 +1850,12 @@ void ScrapeTableAction::Execute(content::WebContents* web_contents,
+   semantic_callback_.Reset();
+   resolver_page_map_extractor_.reset();
+ 
++  if (!dashboard::ExecutionRunContext::Get().ShouldUseUnifiedPageMap()) {
++    StartResolverPageMapFallback(web_contents, std::move(callback),
++                                 "page_map_disabled_in_script_mode");
++    return;
++  }
++
+   dashboard::FetchUnifiedPageMapSnapshot(
+       web_contents,
+       base::BindOnce(&ScrapeTableAction::OnNativePageMapCaptured,
+@@ -1956,7 +1963,7 @@ void ScrapeTableAction::StartResolverPageMapFallback(
+       base::BindOnce(&ScrapeTableAction::OnResolverPageMapFallbackReady,
+                      weak_ptr_factory_.GetWeakPtr(), web_contents,
+                      std::move(callback), reason),
+-      /*greedy=*/true,
++      /*greedy=*/false,
+       /*is_agent_mode=*/false,
+       /*timeout_ms=*/4000);
+ }
+diff --git a/chrome/browser/ui/webui/dashboard/actions/type_action.cc b/chrome/browser/ui/webui/dashboard/actions/type_action.cc
+index e518f2ef551f2..299001d068757 100644
+--- a/chrome/browser/ui/webui/dashboard/actions/type_action.cc
++++ b/chrome/browser/ui/webui/dashboard/actions/type_action.cc
+@@ -102,7 +102,8 @@ void SanitizeSerializedTypeParams(base::Value::Dict* params) {
+ 
+ base::Value::Dict BuildTypeFocusClickParams(
+     const std::vector<dashboard::Locator>& locators,
+-    int wait_timeout_ms) {
++    int wait_timeout_ms,
++    bool force_activation) {
+   base::Value::Dict params;
+   base::Value::List locator_values;
+   for (const auto& locator : locators) {
+@@ -114,7 +115,7 @@ base::Value::Dict BuildTypeFocusClickParams(
+   params.Set("click_count", 1);
+   params.Set("humanOffset", false);
+   params.Set("allowHrefNavigationFallback", false);
+-  params.Set("forceActivation", false);
++  params.Set("forceActivation", force_activation);
+   return params;
+ }
+ 
+@@ -177,7 +178,8 @@ void TypeAction::Execute(content::WebContents* web_contents, Callback callback)
+     focus_click_action_ = std::make_unique<ClickAction>(profile_);
+     focus_click_action_->SetExecutionPathLabel("native");
+     if (focus_click_action_->SetParams(
+-            BuildTypeFocusClickParams(scoped_locators, wait_timeout_ms_))) {
++            BuildTypeFocusClickParams(scoped_locators, wait_timeout_ms_,
++                                      IsForceNativeRun()))) {
+       focus_click_action_->Execute(
+           web_contents,
+           base::BindOnce(&TypeAction::OnFocusClickComplete,
+diff --git a/chrome/browser/ui/webui/dashboard/dashboard_ui_message_handler_agent.cc b/chrome/browser/ui/webui/dashboard/dashboard_ui_message_handler_agent.cc
+index 017ef1c5623bc..b47f794172e9b 100644
+--- a/chrome/browser/ui/webui/dashboard/dashboard_ui_message_handler_agent.cc
++++ b/chrome/browser/ui/webui/dashboard/dashboard_ui_message_handler_agent.cc
+@@ -11,6 +11,7 @@
+ 
+ #include "base/auto_reset.h"
+ #include "base/functional/bind.h"
++#include "base/logging.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -109,11 +110,16 @@ void DashboardUIMessageHandler::HandleAgentGetActivePageInfo(
+   base::Value::Dict out;
+   // Prefer the last active browser. This avoids returning the dashboard
+   // WebUI itself when it is not the tab the user is actually acting on.
+-  if (Browser* browser = chrome::FindLastActive()) {
++  if (Browser* browser = chrome::FindLastActiveWithProfile(profile_)) {
+     content::WebContents* wc = browser->tab_strip_model()->GetActiveWebContents();
+     if (wc) {
+       out.Set("url", wc->GetLastCommittedURL().spec());
+       out.Set("title", base::UTF16ToUTF8(wc->GetTitle()));
++      const int tab_id = sessions::SessionTabHelper::IdForTab(wc).id();
++      if (tab_id > 0) {
++        out.Set("tab_id", tab_id);
++        out.Set("tabId", tab_id);
++      }
+     }
+   }
+   ResolveCallback(cb, out);
+@@ -213,6 +219,21 @@ void DashboardUIMessageHandler::HandlePerformAgentAction(
+     return;
+   }
+ 
++  const int resolved_tab_id = sessions::SessionTabHelper::IdForTab(target_wc).id();
++  LOG(INFO) << "[Agent] Starting timeline run"
++            << " tab_id=" << resolved_tab_id
++            << " url=" << target_wc->GetLastCommittedURL().spec()
++            << " requested_tab_id="
++            << (requested_tab_id.has_value()
++                    ? base::NumberToString(*requested_tab_id)
++                    : "none")
++            << " actions=" << timeline.size()
++            << " wait_for_completion="
++            << read_bool_option("wait_for_completion", "waitForCompletion", false)
++            << " force_native="
++            << read_bool_option("force_native_execution", "forceNativeExecution",
++                                false);
++
+   dashboard::ScriptExecutionService* exec_service =
+       dashboard::ScriptExecutionServiceFactory::GetForProfile(profile_);
+   if (!exec_service) {
+@@ -223,6 +244,15 @@ void DashboardUIMessageHandler::HandlePerformAgentAction(
+   }
+   const bool wait_for_completion =
+       read_bool_option("wait_for_completion", "waitForCompletion", false);
++  const bool force_cdp_execution =
++      read_bool_option("force_cdp_execution", "forceCdpExecution", false);
++  const bool force_native_execution =
++      read_bool_option("force_native_execution", "forceNativeExecution", false);
++  dashboard::ScriptExecutionService::RunOptions run_options;
++  run_options.force_cdp_execution = force_cdp_execution;
++  run_options.force_native_execution = force_native_execution;
++  run_options.is_agent_mode =
++      read_bool_option("is_agent_mode", "isAgentMode", is_agent_mode_);
+   // Optional: include a screenshot of current tab state before queuing.
+   bool want_screenshot = false;
+   std::optional<bool> b = payload->FindBool("includeScreenshot");
+@@ -283,8 +313,8 @@ void DashboardUIMessageHandler::HandlePerformAgentAction(
+ 
+   if (wait_for_completion) {
+     auto execution_id_ref = std::make_shared<std::string>();
+-    std::string execution_id = exec_service->StartAdHocRun(
+-        timeline, target_wc,
++    std::string execution_id = exec_service->StartAdHocRunWithOptions(
++        timeline, target_wc, run_options,
+         base::BindOnce(
+             [](base::WeakPtr<DashboardUIMessageHandler> self,
+                std::string cb_id,
+@@ -322,7 +352,8 @@ void DashboardUIMessageHandler::HandlePerformAgentAction(
+     return;
+   }
+ 
+-  const std::string execution_id = exec_service->StartAdHocRun(timeline, target_wc);
++  const std::string execution_id =
++      exec_service->StartAdHocRunWithOptions(timeline, target_wc, run_options);
+   out.Set("ok", !execution_id.empty());
+   out.Set("queued", !execution_id.empty());
+   out.Set("count", static_cast<int>(timeline.size()));
+@@ -364,13 +395,25 @@ void DashboardUIMessageHandler::HandleAgentRunTimeline(
+   const std::string cb =
+       (args.size() > 0 && args[0].is_string()) ? args[0].GetString()
+                                                : std::string();
++  base::Value::List forwarded_args;
++  forwarded_args.Append(cb);
++  if (args.size() > 1 && args[1].is_dict()) {
++    base::Value::Dict payload = args[1].GetDict().Clone();
++    if (!payload.contains("is_agent_mode") &&
++        !payload.contains("isAgentMode")) {
++      payload.Set("is_agent_mode", false);
++    }
++    forwarded_args.Append(std::move(payload));
++    HandlePerformAgentAction(forwarded_args);
++    return;
++  }
+   const base::Value::List* timeline =
+       (args.size() > 1 && args[1].is_list()) ? &args[1].GetList() : nullptr;
+   base::Value::Dict payload;
+-  if (timeline)
++  if (timeline) {
+     payload.Set("timeline", timeline->Clone());
+-  base::Value::List forwarded_args;
+-  forwarded_args.Append(cb);
++  }
++  payload.Set("is_agent_mode", false);
+   forwarded_args.Append(std::move(payload));
+   HandlePerformAgentAction(forwarded_args);
+ }
+diff --git a/chrome/browser/ui/webui/dashboard/execution_run_context.cc b/chrome/browser/ui/webui/dashboard/execution_run_context.cc
+new file mode 100644
+index 0000000000000..392acc0116867
+--- /dev/null
++++ b/chrome/browser/ui/webui/dashboard/execution_run_context.cc
+@@ -0,0 +1,28 @@
++#include "chrome/browser/ui/webui/dashboard/execution_run_context.h"
++
++namespace dashboard {
++
++namespace {
++
++ExecutionRunContext* GetContextStorage() {
++  static thread_local ExecutionRunContext context;
++  return &context;
++}
++
++}  // namespace
++
++ExecutionRunContext& ExecutionRunContext::Get() {
++  return *GetContextStorage();
++}
++
++void ExecutionRunContext::Set(bool is_agent_mode, bool force_native_execution) {
++  is_agent_mode_ = is_agent_mode;
++  force_native_execution_ = force_native_execution;
++}
++
++void ExecutionRunContext::Clear() {
++  is_agent_mode_ = false;
++  force_native_execution_ = false;
++}
++
++}  // namespace dashboard
+diff --git a/chrome/browser/ui/webui/dashboard/execution_run_context.h b/chrome/browser/ui/webui/dashboard/execution_run_context.h
+new file mode 100644
+index 0000000000000..0bc3bf0449465
+--- /dev/null
++++ b/chrome/browser/ui/webui/dashboard/execution_run_context.h
+@@ -0,0 +1,31 @@
++#ifndef CHROME_BROWSER_UI_WEBUI_DASHBOARD_EXECUTION_RUN_CONTEXT_H_
++#define CHROME_BROWSER_UI_WEBUI_DASHBOARD_EXECUTION_RUN_CONTEXT_H_
++
++namespace dashboard {
++
++// Thread-local run flags for the active ScriptExecutor run. Script mode keeps
++// locator-only resolution; agent mode enables APC/page-map pipelines.
++class ExecutionRunContext {
++ public:
++  static ExecutionRunContext& Get();
++
++  void Set(bool is_agent_mode, bool force_native_execution);
++  void Clear();
++
++  bool is_agent_mode() const { return is_agent_mode_; }
++  bool force_native_execution() const { return force_native_execution_; }
++
++  bool ShouldUseUnifiedPageMap() const { return is_agent_mode_; }
++
++  ExecutionRunContext() = default;
++  ~ExecutionRunContext() = default;
++
++ private:
++
++  bool is_agent_mode_ = false;
++  bool force_native_execution_ = false;
++};
++
++}  // namespace dashboard
++
++#endif  // CHROME_BROWSER_UI_WEBUI_DASHBOARD_EXECUTION_RUN_CONTEXT_H_
+diff --git a/chrome/browser/ui/webui/dashboard/native_run_activation.cc b/chrome/browser/ui/webui/dashboard/native_run_activation.cc
+new file mode 100644
+index 0000000000000..20664ac85585e
+--- /dev/null
++++ b/chrome/browser/ui/webui/dashboard/native_run_activation.cc
+@@ -0,0 +1,42 @@
++#include "chrome/browser/ui/webui/dashboard/native_run_activation.h"
++
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_finder.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "content/public/browser/web_contents.h"
++
++namespace dashboard {
++
++void ActivateWebContentsForNativeScriptRun(content::WebContents* web_contents) {
++  if (!web_contents) {
++    return;
++  }
++
++  web_contents->Focus();
++
++  Browser* browser = chrome::FindBrowserWithTab(web_contents);
++  if (!browser) {
++    return;
++  }
++
++  TabStripModel* tabs = browser->tab_strip_model();
++  if (tabs) {
++    const int index = tabs->GetIndexOfWebContents(web_contents);
++    if (index >= 0 && tabs->GetActiveWebContents() != web_contents) {
++      tabs->ActivateTabAt(index);
++    }
++  }
++
++  if (BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser)) {
++    if (browser_view->GetWidget()) {
++      browser_view->GetWidget()->Activate();
++      return;
++    }
++  }
++  if (browser->window()) {
++    browser->window()->Activate();
++  }
++}
++
++}  // namespace dashboard
+diff --git a/chrome/browser/ui/webui/dashboard/native_run_activation.h b/chrome/browser/ui/webui/dashboard/native_run_activation.h
+new file mode 100644
+index 0000000000000..d8c3e78c4d986
+--- /dev/null
++++ b/chrome/browser/ui/webui/dashboard/native_run_activation.h
+@@ -0,0 +1,14 @@
++#ifndef CHROME_BROWSER_UI_WEBUI_DASHBOARD_NATIVE_RUN_ACTIVATION_H_
++#define CHROME_BROWSER_UI_WEBUI_DASHBOARD_NATIVE_RUN_ACTIVATION_H_
++
++namespace content {
++class WebContents;
++}
++
++namespace dashboard {
++
++void ActivateWebContentsForNativeScriptRun(content::WebContents* web_contents);
++
++}  // namespace dashboard
++
++#endif  // CHROME_BROWSER_UI_WEBUI_DASHBOARD_NATIVE_RUN_ACTIVATION_H_
+diff --git a/chrome/browser/ui/webui/dashboard/page_map_extractor.cc b/chrome/browser/ui/webui/dashboard/page_map_extractor.cc
+index c04208a797a46..4ac3f935b088e 100644
+--- a/chrome/browser/ui/webui/dashboard/page_map_extractor.cc
++++ b/chrome/browser/ui/webui/dashboard/page_map_extractor.cc
+@@ -5,6 +5,7 @@
+ // #include "chrome/browser/ui/webui/dashboard/page_map_extractor.h" // <-- Removed duplicate include
+ 
+ #include "base/functional/bind.h"
++#include "base/logging.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "content/public/browser/web_contents.h"
+@@ -228,24 +229,43 @@ void RunStealthResolverAsync(PageMapExtractor* extractor,
+                              base::OnceClosure done_cb);
+ 
+ // Thunks to avoid capturing lambdas in base::BindOnce
+-static void AfterResolverThunk(PageMapExtractor* self,
+-                               PageMapExtractor::PageMapStreamCallback stream_cb,
+-                               PageMapExtractor::PageMapReadyCallback callback) {
++void PageMapExtractor::AfterResolverCollected(
++    PageMapStreamCallback stream_cb) {
+   if (stream_cb)
+-    stream_cb.Run(self->BuildPageMap());
+-  std::move(callback).Run(self->BuildPageMap());
++    stream_cb.Run(BuildPageMap());
++  CompleteRun(BuildPageMap());
+ }
+ 
+-static void AfterDomThunk(PageMapExtractor* self,
+-                          content::WebContents* web_contents,
+-                          bool greedy,
+-                          PageMapExtractor::PageMapStreamCallback stream_cb,
+-                          PageMapExtractor::PageMapReadyCallback callback) {
++void PageMapExtractor::AfterDomCollected(
++    content::WebContents* web_contents,
++    bool greedy,
++    PageMapStreamCallback stream_cb) {
+   if (stream_cb)
+-    stream_cb.Run(self->BuildPageMap());
+-  auto after_resolver = base::BindOnce(&AfterResolverThunk, self,
+-                                       std::move(stream_cb), std::move(callback));
+-  RunStealthResolverAsync(self, web_contents, greedy, std::move(after_resolver));
++    stream_cb.Run(BuildPageMap());
++  RunStealthResolverAsync(
++      this, web_contents, greedy,
++      base::BindOnce(&PageMapExtractor::AfterResolverCollected,
++                     weak_factory_.GetWeakPtr(), std::move(stream_cb)));
++}
++
++void PageMapExtractor::CompleteRun(base::Value::Dict page_map) {
++  if (!run_in_progress_) {
++    return;
++  }
++  run_in_progress_ = false;
++  run_timeout_timer_.Stop();
++  if (pending_run_callback_.is_null()) {
++    return;
++  }
++  std::move(pending_run_callback_).Run(std::move(page_map));
++}
++
++void PageMapExtractor::OnRunTimeout() {
++  if (!run_in_progress_) {
++    return;
++  }
++  LOG(WARNING) << "[PageMapExtractor] Run timed out; returning partial page map";
++  CompleteRun(BuildPageMap());
+ }
+ 
+ void PageMapExtractor::Run(content::WebContents* web_contents,
+@@ -258,10 +278,21 @@ void PageMapExtractor::Run(content::WebContents* web_contents,
+     std::move(callback).Run(base::Value::Dict());
+     return;
+   }
+-  auto after_dom = base::BindOnce(&AfterDomThunk, this, web_contents, greedy,
+-                                  std::move(stream_cb), std::move(callback));
++
++  run_timeout_timer_.Stop();
++  run_in_progress_ = true;
++  pending_run_callback_ = std::move(callback);
++  if (timeout_ms > 0) {
++    run_timeout_timer_.Start(
++        FROM_HERE, base::Milliseconds(timeout_ms),
++        base::BindOnce(&PageMapExtractor::OnRunTimeout,
++                       weak_factory_.GetWeakPtr()));
++  }
++
++  auto after_dom = base::BindOnce(&PageMapExtractor::AfterDomCollected,
++                                  weak_factory_.GetWeakPtr(), web_contents,
++                                  greedy, std::move(stream_cb));
+   RunDomCollectorAsync(this, web_contents, greedy, std::move(after_dom));
+-  (void)timeout_ms;  // Unused for now.
+ }
+ 
+ // Non-streaming convenience overload: forwards to the streaming variant
+diff --git a/chrome/browser/ui/webui/dashboard/page_map_extractor.h b/chrome/browser/ui/webui/dashboard/page_map_extractor.h
+index 1d1368f9d57be..684557f4a11cf 100644
+--- a/chrome/browser/ui/webui/dashboard/page_map_extractor.h
++++ b/chrome/browser/ui/webui/dashboard/page_map_extractor.h
+@@ -9,6 +9,7 @@
+ #include "base/functional/callback.h"
+ #include "base/time/time.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
+ #include "base/values.h"
+ #include "url/gurl.h"
+ #include "content/public/browser/web_contents.h"
+@@ -124,6 +125,17 @@ class PageMapExtractor {
+   base::Value::Dict BuildPageMap() const;
+ 
+  private:
++  void AfterDomCollected(content::WebContents* web_contents,
++                         bool greedy,
++                         PageMapStreamCallback stream_cb);
++  void AfterResolverCollected(PageMapStreamCallback stream_cb);
++  void CompleteRun(base::Value::Dict page_map);
++  void OnRunTimeout();
++
++  bool run_in_progress_ = false;
++  base::OneShotTimer run_timeout_timer_;
++  PageMapReadyCallback pending_run_callback_;
++
+   struct ShadowBucket {
+     std::string host_selector;
+     base::Value::List elements;  // of PageElementSnapshot::ToValueDict()
+diff --git a/chrome/browser/ui/webui/dashboard/script_execution_service.cc b/chrome/browser/ui/webui/dashboard/script_execution_service.cc
+index f3b8a4a1a9864..ada86f09ac55b 100644
+--- a/chrome/browser/ui/webui/dashboard/script_execution_service.cc
++++ b/chrome/browser/ui/webui/dashboard/script_execution_service.cc
+@@ -28,6 +28,7 @@
+ #include "chrome/browser/ui/webui/dashboard/script_executor.h"
+ #include "chrome/browser/ui/webui/dashboard/script_store.h"
+ #include "components/os_crypt/sync/os_crypt.h"
++#include "components/sessions/content/session_tab_helper.h"
+ #include "content/public/browser/web_contents.h"
+ 
+ namespace dashboard {
+@@ -1161,6 +1162,14 @@ std::string ScriptExecutionService::StartRunInternal(
+     return std::string();
+   }
+ 
++  const int target_tab_id =
++      sessions::SessionTabHelper::IdForTab(target_web_contents).id();
++  LOG(INFO) << "[ExecutionService] StartRun target tab_id=" << target_tab_id
++            << " url=" << target_web_contents->GetLastCommittedURL().spec()
++            << " script_id=" << script_id
++            << " actions=" << timeline.size()
++            << " forced_native=" << (options.force_native_execution ? 1 : 0);
++
+   if (runs_.size() >= max_concurrent_runs_) {
+     LOG(ERROR) << "[ExecutionService] StartRun refused: max concurrency "
+                << max_concurrent_runs_ << " reached";
+@@ -1285,6 +1294,9 @@ std::string ScriptExecutionService::StartRunInternal(
+ 
+             it->second.executor->SetForceCdpExecutionForRun(
+                 run_options.force_cdp_execution);
++            it->second.executor->SetForceNativeExecutionForRun(
++                run_options.force_native_execution);
++            it->second.executor->SetAgentModeForRun(run_options.is_agent_mode);
+ 
+             int replacement_count = 0;
+             int locator_fanout_count = 0;
+@@ -1319,6 +1331,8 @@ std::string ScriptExecutionService::StartRunInternal(
+                       << " actions=" << expanded_timeline.size()
+                       << " forced_cdp="
+                       << (run_options.force_cdp_execution ? 1 : 0)
++                      << " forced_native="
++                      << (run_options.force_native_execution ? 1 : 0)
+                       << " token_expansions=" << replacement_count
+                       << " locator_fanouts=" << locator_fanout_count
+                       << " prep_delay_ms=" << prep_delay_ms
+diff --git a/chrome/browser/ui/webui/dashboard/script_execution_service.h b/chrome/browser/ui/webui/dashboard/script_execution_service.h
+index a09130b62cb5d..cf0dbf3155108 100644
+--- a/chrome/browser/ui/webui/dashboard/script_execution_service.h
++++ b/chrome/browser/ui/webui/dashboard/script_execution_service.h
+@@ -28,6 +28,8 @@ class ScriptExecutionService : public KeyedService {
+  public:
+   struct RunOptions {
+     bool force_cdp_execution = false;
++    bool force_native_execution = false;
++    bool is_agent_mode = false;
+   };
+ 
+   using CompletionCallback =
+diff --git a/chrome/browser/ui/webui/dashboard/script_executor.cc b/chrome/browser/ui/webui/dashboard/script_executor.cc
+index b0d1bc5c5ff70..360ba53769138 100644
+--- a/chrome/browser/ui/webui/dashboard/script_executor.cc
++++ b/chrome/browser/ui/webui/dashboard/script_executor.cc
+@@ -1,6 +1,8 @@
+ // script_executor.cc — Updated with step tracking and last_run recording
+ 
+ #include "chrome/browser/ui/webui/dashboard/script_executor.h"
++
++#include "chrome/browser/ui/webui/dashboard/unified_page_context.h"
+ #include <algorithm>
+ #include <cmath>
+ #include <cstring>
+@@ -40,6 +42,8 @@
+ #include "chrome/browser/ui/webui/dashboard/script_schema.h"
+ #include "chrome/browser/ui/webui/dashboard/unified_page_context.h"
+ #include "chrome/browser/ui/webui/dashboard/debug_config.h"
++#include "chrome/browser/ui/webui/dashboard/execution_run_context.h"
++#include "chrome/browser/ui/webui/dashboard/native_run_activation.h"
+ #include "chrome/browser/ui/webui/dashboard/failure_replay_recorder.h"
+ #include "chrome/browser/ui/webui/dashboard/run_history_store.h"
+ #include "chrome/browser/ui/webui/dashboard/script_store.h"
+@@ -69,6 +73,15 @@ constexpr int kAuthRecoveryRequiredConsecutiveFailures = 2;
+ constexpr char kNestedActionPathPrefix[] = "[nested_action_path=";
+ constexpr char kNestedActionPathSuffix = ']';
+ 
++bool ShouldRefreshApcBeforeAction(std::string_view kind) {
++  if (!dashboard::ExecutionRunContext::Get().ShouldUseUnifiedPageMap()) {
++    return false;
++  }
++  return kind == "click" || kind == "type" || kind == "listen" ||
++         kind == "scrape_table" || kind == "scrape_element" ||
++         kind == "drag";
++}
++
+ struct ActionValidationFailure {
+   size_t top_level_index = 0;
+   std::string action_index_label;
+@@ -1547,8 +1560,18 @@ void ScriptExecutor::ExecuteScript(const base::Value::List& timeline,
+ 
+   LOG(INFO) << "[Executor] ExecuteScript: timeline size=" << timeline.size();
+ 
++  const bool preserve_force_cdp = force_cdp_execution_for_run_;
++  const bool preserve_force_native = force_native_execution_for_run_;
++  const bool preserve_agent_mode = is_agent_mode_for_run_;
+   CleanupAfterRun();
++  force_cdp_execution_for_run_ = preserve_force_cdp;
++  force_native_execution_for_run_ = preserve_force_native;
++  is_agent_mode_for_run_ = preserve_agent_mode;
+   action_factory_->SetForceCdpExecution(force_cdp_execution_for_run_);
++  action_factory_->SetForceNativeExecution(force_native_execution_for_run_);
++  action_factory_->SetAgentMode(is_agent_mode_for_run_);
++  dashboard::ExecutionRunContext::Get().Set(is_agent_mode_for_run_,
++                                            force_native_execution_for_run_);
+   run_completion_in_progress_ = false;
+   action_queue_.clear();
+   non_critical_.clear();
+@@ -1597,6 +1620,10 @@ void ScriptExecutor::ExecuteScript(const base::Value::List& timeline,
+ 
+   Observe(target_web_contents_);
+ 
++  if (force_native_execution_for_run_ && target_web_contents_) {
++    dashboard::ActivateWebContentsForNativeScriptRun(target_web_contents_);
++  }
++
+   // Keep a small in-memory replay buffer; write to disk only on failure.
+   failure_replay_recorder_ =
+       target_web_contents_
+@@ -1697,8 +1724,18 @@ void ScriptExecutor::ExecuteScriptFromStep(const base::Value::List& timeline,
+   LOG(INFO) << "[Executor] ExecuteScriptFromStep: timeline size=" << timeline.size()
+             << " start_step_index=" << start_step_index;
+ 
++  const bool preserve_force_cdp = force_cdp_execution_for_run_;
++  const bool preserve_force_native = force_native_execution_for_run_;
++  const bool preserve_agent_mode = is_agent_mode_for_run_;
+   CleanupAfterRun();
++  force_cdp_execution_for_run_ = preserve_force_cdp;
++  force_native_execution_for_run_ = preserve_force_native;
++  is_agent_mode_for_run_ = preserve_agent_mode;
+   action_factory_->SetForceCdpExecution(force_cdp_execution_for_run_);
++  action_factory_->SetForceNativeExecution(force_native_execution_for_run_);
++  action_factory_->SetAgentMode(is_agent_mode_for_run_);
++  dashboard::ExecutionRunContext::Get().Set(is_agent_mode_for_run_,
++                                            force_native_execution_for_run_);
+   run_completion_in_progress_ = false;
+   action_queue_.clear();
+   non_critical_.clear();
+@@ -1729,6 +1766,10 @@ void ScriptExecutor::ExecuteScriptFromStep(const base::Value::List& timeline,
+ 
+   Observe(target_web_contents_);
+ 
++  if (force_native_execution_for_run_ && target_web_contents_) {
++    dashboard::ActivateWebContentsForNativeScriptRun(target_web_contents_);
++  }
++
+   // Keep a small in-memory replay buffer; write to disk only on failure.
+   failure_replay_recorder_ =
+       target_web_contents_
+@@ -1796,9 +1837,39 @@ void ScriptExecutor::SetCompletionCallback(CompletionCallback callback) {
+ 
+ void ScriptExecutor::SetForceCdpExecutionForRun(bool force) {
+   force_cdp_execution_for_run_ = force;
++  if (force) {
++    force_native_execution_for_run_ = false;
++  }
+   if (action_factory_) {
+     action_factory_->SetForceCdpExecution(force_cdp_execution_for_run_);
++    action_factory_->SetForceNativeExecution(force_native_execution_for_run_);
++    action_factory_->SetAgentMode(is_agent_mode_for_run_);
+   }
++  dashboard::ExecutionRunContext::Get().Set(is_agent_mode_for_run_,
++                                            force_native_execution_for_run_);
++}
++
++void ScriptExecutor::SetForceNativeExecutionForRun(bool force) {
++  force_native_execution_for_run_ = force;
++  if (force) {
++    force_cdp_execution_for_run_ = false;
++  }
++  if (action_factory_) {
++    action_factory_->SetForceCdpExecution(force_cdp_execution_for_run_);
++    action_factory_->SetForceNativeExecution(force_native_execution_for_run_);
++    action_factory_->SetAgentMode(is_agent_mode_for_run_);
++  }
++  dashboard::ExecutionRunContext::Get().Set(is_agent_mode_for_run_,
++                                            force_native_execution_for_run_);
++}
++
++void ScriptExecutor::SetAgentModeForRun(bool agent_mode) {
++  is_agent_mode_for_run_ = agent_mode;
++  if (action_factory_) {
++    action_factory_->SetAgentMode(is_agent_mode_for_run_);
++  }
++  dashboard::ExecutionRunContext::Get().Set(is_agent_mode_for_run_,
++                                            force_native_execution_for_run_);
+ }
+ 
+ void ScriptExecutor::FinishRun(bool success,
+@@ -2034,6 +2105,9 @@ void ScriptExecutor::AttemptAction(bool is_key_script,
+       detail.append(base::StringPrintf(" (retry %d)", attempt));
+     }
+     UpdatePlaybackOverlayProgress(detail);
++    if (ShouldRefreshApcBeforeAction(kind)) {
++      dashboard::InvalidateUnifiedPageMapCache(target_web_contents_);
++    }
+   }
+   pending_url_before_ = target_web_contents_->GetLastCommittedURL().spec();
+   pending_action_started_at_ = base::TimeTicks::Now();
+@@ -2128,8 +2202,13 @@ void ScriptExecutor::CleanupAfterRun() {
+   pending_step_capture_.reset();
+   recording_suppression_.reset();
+   force_cdp_execution_for_run_ = false;
++  force_native_execution_for_run_ = false;
++  is_agent_mode_for_run_ = false;
++  dashboard::ExecutionRunContext::Get().Clear();
+   if (action_factory_) {
+     action_factory_->SetForceCdpExecution(false);
++    action_factory_->SetForceNativeExecution(false);
++    action_factory_->SetAgentMode(false);
+   }
+   if (failure_replay_recorder_) {
+     failure_replay_recorder_->Stop();
+diff --git a/chrome/browser/ui/webui/dashboard/script_executor.h b/chrome/browser/ui/webui/dashboard/script_executor.h
+index b7dbf0405657b..ee1766a5d740f 100644
+--- a/chrome/browser/ui/webui/dashboard/script_executor.h
++++ b/chrome/browser/ui/webui/dashboard/script_executor.h
+@@ -69,6 +69,8 @@ class ScriptExecutor : public content::WebContentsObserver {
+   void SetStatusCallback(StatusCallback callback);
+   void SetCompletionCallback(CompletionCallback callback);
+   void SetForceCdpExecutionForRun(bool force);
++  void SetForceNativeExecutionForRun(bool force);
++  void SetAgentModeForRun(bool agent_mode);
+ 
+  private:
+   // content::WebContentsObserver:
+@@ -147,6 +149,8 @@ class ScriptExecutor : public content::WebContentsObserver {
+   bool run_completion_in_progress_ = false;
+   bool humanized_inter_action_delay_enabled_ = true;
+   bool force_cdp_execution_for_run_ = false;
++  bool force_native_execution_for_run_ = false;
++  bool is_agent_mode_for_run_ = false;
+ 
+   base::Value::Dict current_snapshot_;
+   raw_ptr<Profile> profile_;
+diff --git a/chrome/browser/ui/webui/dashboard/unified_page_context.cc b/chrome/browser/ui/webui/dashboard/unified_page_context.cc
+index 3405c9ae295de..45e06c3682c68 100644
+--- a/chrome/browser/ui/webui/dashboard/unified_page_context.cc
++++ b/chrome/browser/ui/webui/dashboard/unified_page_context.cc
+@@ -1,6 +1,6 @@
+ #include "chrome/browser/ui/webui/dashboard/unified_page_context.h"
+ 
+-#include <optional>
++#include "chrome/browser/ui/webui/dashboard/execution_run_context.h"
+ #include <set>
+ #include <string>
+ #include <utility>
+@@ -347,6 +347,118 @@ base::Value::Dict BuildMergedPageMap(
+   return page_map;
+ }
+ 
++constexpr size_t kMaxAgentPageMapElements = 64;
++
++bool IsInteractivePageMapElement(const base::Value::Dict& elem) {
++  if (elem.FindBool("clickable").value_or(false)) {
++    return true;
++  }
++  if (elem.FindBool("focusable").value_or(false)) {
++    return true;
++  }
++  if (elem.FindBool("editable").value_or(false)) {
++    return true;
++  }
++  const std::string* type = elem.FindString("type");
++  if (!type) {
++    return false;
++  }
++  return *type == "input" || *type == "button" || *type == "link" ||
++         base::StartsWith(*type, "FORM_CONTROL_TYPE_",
++                          base::CompareCase::INSENSITIVE_ASCII);
++}
++
++std::string PageMapElementDedupeKey(const base::Value::Dict& elem) {
++  if (const std::string* id = elem.FindString("id"); id && !id->empty()) {
++    return "id:" + *id;
++  }
++  if (const base::Value::Dict* selectors = elem.FindDict("selectors")) {
++    if (const std::string* css = selectors->FindString("css");
++        css && !css->empty()) {
++      return "css:" + *css;
++    }
++    if (const std::string* xpath = selectors->FindString("xpath");
++        xpath && !xpath->empty()) {
++      return "xpath:" + *xpath;
++    }
++  }
++  if (const std::string* text = elem.FindString("text"); text && !text->empty()) {
++    return "text:" + *text;
++  }
++  return std::string();
++}
++
++void FilterInteractiveElementsList(base::Value::List* elements,
++                                 std::set<std::string>& seen_keys,
++                                 size_t& kept_count) {
++  if (!elements) {
++    return;
++  }
++  base::Value::List filtered;
++  for (auto& item : *elements) {
++    if (kept_count >= kMaxAgentPageMapElements) {
++      break;
++    }
++    if (!item.is_dict()) {
++      continue;
++    }
++    const base::Value::Dict& elem = item.GetDict();
++    if (!IsInteractivePageMapElement(elem)) {
++      continue;
++    }
++    const std::string key = PageMapElementDedupeKey(elem);
++    if (key.empty() || !seen_keys.insert(key).second) {
++      continue;
++    }
++    ++kept_count;
++    filtered.Append(std::move(item));
++  }
++  *elements = std::move(filtered);
++}
++
++base::Value::Dict FilterPageMapForAgent(base::Value::Dict page_map) {
++  base::Value::List* frames = page_map.FindList("frames");
++  if (!frames) {
++    return page_map;
++  }
++
++  std::set<std::string> seen_keys;
++  size_t kept_count = 0;
++  for (auto& frame_value : *frames) {
++    if (!frame_value.is_dict()) {
++      continue;
++    }
++    base::Value::Dict& frame = frame_value.GetDict();
++    FilterInteractiveElementsList(frame.FindList("elements"), seen_keys,
++                                  kept_count);
++    if (kept_count >= kMaxAgentPageMapElements) {
++      break;
++    }
++    base::Value::List* shadow_roots = frame.FindList("shadowRoots");
++    if (!shadow_roots) {
++      continue;
++    }
++    for (auto& shadow_value : *shadow_roots) {
++      if (kept_count >= kMaxAgentPageMapElements) {
++        break;
++      }
++      if (!shadow_value.is_dict()) {
++        continue;
++      }
++      FilterInteractiveElementsList(shadow_value.GetDict().FindList("elements"),
++                                    seen_keys, kept_count);
++    }
++  }
++
++  if (base::Value::Dict* metadata = page_map.FindDict("metadata")) {
++    metadata->Set("agentFilteredInteractiveCount",
++                  static_cast<int>(kept_count));
++    metadata->Set("agentFilterMaxElements",
++                  static_cast<int>(kMaxAgentPageMapElements));
++  }
++  return page_map;
++}
++
+ glic::mojom::GetTabContextOptions BuildDashboardPageMapContextOptions() {
+   glic::mojom::GetTabContextOptions options;
+   options.include_viewport_screenshot = false;
+@@ -515,7 +627,8 @@ class UnifiedPageMapFetcher : public base::RefCounted<UnifiedPageMapFetcher> {
+     TRACE_EVENT0("loading", "UnifiedPageMapFetcher::FinishSuccess");
+     UnifiedPageMapResult result;
+     result.ok = true;
+-    result.page_map = BuildMergedPageMap(apc_, fallback_url_, selector_entries_);
++    result.page_map = FilterPageMapForAgent(
++        BuildMergedPageMap(apc_, fallback_url_, selector_entries_));
+     std::move(callback_).Run(std::move(result));
+   }
+ 
+@@ -588,6 +701,8 @@ class UnifiedPageMapRequestCoordinator : public base::SupportsUserData::Data,
+     StartFetch();
+   }
+ 
++  void InvalidateCache() { ++generation_; }
++
+   void DidFinishNavigation(content::NavigationHandle* navigation_handle) override {
+     if (navigation_handle && navigation_handle->IsInPrimaryMainFrame() &&
+         navigation_handle->HasCommitted()) {
+@@ -695,6 +810,11 @@ UnifiedPageMapResult::~UnifiedPageMapResult() = default;
+ void FetchUnifiedPageMapSnapshot(content::WebContents* web_contents,
+                                  UnifiedPageMapCallback callback,
+                                  mojom::SearchScope scope) {
++  if (!ExecutionRunContext::Get().ShouldUseUnifiedPageMap()) {
++    std::move(callback).Run(
++        BuildUnifiedPageMapErrorResult("page_map_disabled_in_script_mode"));
++    return;
++  }
+   if (!web_contents) {
+     std::move(callback).Run(BuildUnifiedPageMapErrorResult("no_web_contents"));
+     return;
+@@ -703,6 +823,13 @@ void FetchUnifiedPageMapSnapshot(content::WebContents* web_contents,
+       std::move(callback), scope);
+ }
+ 
++void InvalidateUnifiedPageMapCache(content::WebContents* web_contents) {
++  if (!web_contents) {
++    return;
++  }
++  UnifiedPageMapRequestCoordinator::GetOrCreate(web_contents)->InvalidateCache();
++}
++
+ void BuildUnifiedPageMapFromAnnotatedPageContent(
+     content::WebContents* web_contents,
+     optimization_guide::proto::AnnotatedPageContent annotated_page_content,
+diff --git a/tools/simulachrome/run_native_welcome_test.py b/tools/simulachrome/run_native_welcome_test.py
+new file mode 100644
+index 0000000000000..46487f4984b8b
+--- /dev/null
++++ b/tools/simulachrome/run_native_welcome_test.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++"""Run welcome_demo (or any script JSON) with force_native_execution via bridge."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++SRC = Path(__file__).resolve().parents[2]
++BRIDGE_DIR = SRC / "chrome/browser/resources/dashboard"
++DEFAULT_SCRIPT = Path.home() / "Library/Application Support/Simulachrome/Scripts/welcome_demo.json"
++DEFAULT_CHROME = SRC / "out/Default/Chromium.app/Contents/MacOS/Chromium"
++DEFAULT_PROFILE = Path.home() / "Library/Application Support/Simulachrome/DevProfile"
++LOG_FILE = Path("/tmp/glic_welcome_native.log")
++
++
++def load_actions(path: Path) -> list:
++  data = json.loads(path.read_text(encoding="utf-8"))
++  actions = data.get("timeline") or data.get("actions") or []
++  if not isinstance(actions, list):
++    raise RuntimeError(f"No actions in {path}")
++  return [a for a in actions if isinstance(a, dict)]
++
++
++def main() -> int:
++  parser = argparse.ArgumentParser()
++  parser.add_argument("--script", type=Path, default=DEFAULT_SCRIPT)
++  parser.add_argument("--cdp-port", type=int, default=9223)
++  parser.add_argument("--timeout-sec", type=float, default=900.0)
++  parser.add_argument("--log-file", type=Path, default=LOG_FILE)
++  parser.add_argument("--start-url", type=str, default="about:blank")
++  args = parser.parse_args()
++
++  sys.path.insert(0, str(BRIDGE_DIR))
++  from headless_executor_bridge import HeadlessExecutorBridge  # noqa: E402
++
++  actions = load_actions(args.script)
++  bridge = HeadlessExecutorBridge(cdp_port=args.cdp_port)
++  bridge.connect(startup_timeout_sec=60.0)
++  try:
++    work_target_id = bridge.create_work_target(args.start_url)
++    print(f"work_target_id={work_target_id}")
++    result = bridge.run_timeline(
++        actions,
++        work_target_id=work_target_id,
++        wait_for_completion=True,
++        force_native_execution=True,
++        timeout_sec=args.timeout_sec,
++    )
++    print(json.dumps(result, indent=2, ensure_ascii=True))
++    return 0 if result.get("ok") else 1
++  finally:
++    bridge.close()
++
++
++if __name__ == "__main__":
++  raise SystemExit(main())
+-- 
+2.50.1 (Apple Git-155)
+
