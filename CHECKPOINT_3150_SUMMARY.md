@@ -55,3 +55,9 @@ Every **5–10** meaningful change sets:
 
 - `~/0llamaModels` (~152GB) — model weights, keep unless you explicitly want them pruned.
 - Current `out/Default` (~140GB) — needed for incremental builds.
+
+## Build verification (2026-09-10)
+
+- `autoninja -C out/Default chrome` → Build Succeeded
+- `autoninja -C out/Default -k 0` (`all`) → **Build Succeeded** (1141 remaining steps; 0 failures; ~153GB free)
+- Patch `3150-*.patch` exported after that green full build
