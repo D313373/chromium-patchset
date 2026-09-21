@@ -2,17 +2,24 @@
 
 Chromium integration patches for [Simulachrome](https://github.com/D313373/Simulachrome).
 
-This repository intentionally does not vendor Chromium or the complete Simulachrome project. It records the Chromium revisions, ordered patches, compatibility notes, and helper scripts needed to reproduce the Simulachrome-enabled Chromium integration in a separate Chromium checkout.
+This repository intentionally does **not** vendor Chromium or the complete Simulachrome project. It records the Chromium revisions, ordered patch series, compatibility notes, and helper scripts needed to reproduce the Simulachrome-enabled Chromium integration in a separate Chromium checkout.
 
-## What this contains
+## What this repository contains
 
-- Ordered Chromium patches under [`patches/`](patches/)
-- Expected revisions in [`BASE_COMMIT`](BASE_COMMIT) and [`HEAD_COMMIT`](HEAD_COMMIT)
-- A machine-readable inventory in [`patchset.json`](patchset.json)
-- Patch application and verification helpers under [`scripts/`](scripts/)
-- Feature documentation in [`PATCHSET.md`](PATCHSET.md) and [`docs/patch-map.md`](docs/patch-map.md)
+- Four ordered Chromium patch files under [`patches/`](patches/)
+- The expected Chromium base and target revisions in [`BASE_COMMIT`](BASE_COMMIT) and [`HEAD_COMMIT`](HEAD_COMMIT)
+- A machine-readable patch inventory in [`patchset.json`](patchset.json)
+- Patch application and metadata validation scripts under [`scripts/`](scripts/)
+- Feature-level documentation in [`PATCHSET.md`](PATCHSET.md) and [`docs/patch-map.md`](docs/patch-map.md)
 
-Chromium source is intentionally external; the full Simulachrome project is maintained separately.
+## What it does not contain
+
+- The Chromium source tree
+- A standalone browser binary
+- The full Simulachrome product repository
+- A complete dependency mirror or release artifact
+
+Keeping Chromium external avoids duplicating a very large upstream repository and makes the integration boundary explicit.
 
 ## Compatibility
 
@@ -21,50 +28,60 @@ Chromium source is intentionally external; the full Simulachrome project is main
 | Chromium base revision | `223dfbac1c7542a06b422390d954afe5b560b607` |
 | Patchset target marker | `836f788f2d7db` |
 | Patch order | `3147 -> 3148 -> 3149 -> 3150` |
-| Build system | Chromium GN/Ninja |
-| Status | Development patchset |
+| Expected build system | Chromium GN/Ninja |
+| Repository status | Development patchset |
+
+The target marker is recorded exactly as supplied by the source checkout and is abbreviated. Confirm compatibility against the intended Chromium branch before applying the series.
 
 ## Patch inventory
 
-1. **3147** — Dashboard WebUI resources, action editors, recorder, script execution, and locator support.
-2. **3148** — Actor/dashboard playback, humanized clicks, Glic feature flags, and typing behavior.
-3. **3149** — Dashboard/Glic Phase A/B, recording and playback APIs, Blink agent support, headless tooling, and test-client support.
-4. **3150** — Chromium m144-specific unified-agent and compatibility delta.
+1. **3147 — Add dashboard WebUI resources**: dashboard resources, action editors, WebUI plumbing, recorder, script execution, and locator support.
+2. **3148 — Simulachrome actor + dashboard playback**: actor/dashboard playback integration, Glic feature flags, humanized click input, and typing behavior changes.
+3. **3149 — Simulachrome dashboard + Glic Phase A/B**: dashboard automation APIs, recording and playback integration, Glic page handlers, Blink agent support, headless tooling, and test-client support.
+4. **3150 — Simulachrome m144 apply delta**: revision-specific changes including unified Glic agent context capture/orchestration and removal of an older recorder binding.
+
+See [`PATCHSET.md`](PATCHSET.md) for the detailed feature map and patch statistics.
+
+## Prerequisites
+
+- Chromium's official `depot_tools` checkout and `fetch` workflow
+- Git
+- A Chromium checkout at the revision recorded in `BASE_COMMIT`
+- The normal Chromium build dependencies for your platform
 
 ## Applying the patchset
+
+From the patchset repository, create or use a separate Chromium checkout and run:
 
 ```bash
 ./scripts/apply-patches.sh --chromium-dir ../chromium
 ```
 
-The script checks that the Chromium checkout is clean and at the expected base revision, applies patches in numeric order, and stops on failure. Use a disposable checkout or Git worktree when experimenting.
+The script verifies that the Chromium checkout is clean and at the expected base revision, applies patches in numeric order, and stops on the first failure. It uses `git am` for the mail-formatted patches 3147–3149 and `git apply` for the raw delta 3150.
 
-To validate metadata and patch applicability without modifying Chromium:
+To validate the repository without a Chromium checkout:
 
 ```bash
 ./scripts/verify-patches.sh
+```
+
+To validate patch application without changing the Chromium checkout, use a disposable clone or worktree and run:
+
+```bash
 ./scripts/verify-patches.sh --chromium-dir ../chromium
 ```
 
-## Running the Simulachrome development client
+## Building patched Chromium
 
-After applying the patchset and building the patched Chromium, the intended development entry point is the checked-in Glic test client:
-
-```bash
-chrome/test/data/webui/glic/test_client/start_glic_dev.sh
-```
-
-Run that command from the Chromium checkout. The script is part of the patched Chromium tree and is the primary development/test-client launcher for this integration. Related helpers include `start_glic_dev_tmux.sh` and `start_proxy.sh` in the same directory.
-
-## Building
-
-Use Chromium's normal GN/Ninja workflow for the target platform. Product-level runtime setup, examples, and external services belong in the main Simulachrome repository.
+After applying the patches, use the standard Chromium GN/Ninja workflow for the target platform. This repository does not prescribe a single `args.gn` configuration because the appropriate Glic, branding, platform, and build flags depend on the development environment. Consult the main Simulachrome repository for product-level setup, test clients, and runtime examples.
 
 ## Related repositories
 
-- [Simulachrome](https://github.com/D313373/Simulachrome) — product code, tooling, examples, and documentation
-- [Chromium checkout instructions](https://www.chromium.org/developers/how-tos/get-the-code/)
+- [Simulachrome](https://github.com/D313373/Simulachrome) — product-level code, tooling, examples, and documentation
+- [Chromium](https://www.chromium.org/developers/how-tos/get-the-code/) — upstream source and build instructions
 
 ## Known limitations
 
-Patch compatibility is tied to the recorded Chromium revision. This repository contains Chromium integration work, not every file or tool in the Simulachrome product.
+- Patch compatibility is tied to the recorded Chromium revision and may require conflict resolution on other milestones.
+- Full Chromium compilation is intentionally not performed by the lightweight metadata validation script.
+- The patchset contains Chromium integration work, not every file or tool in the Simulachrome product.

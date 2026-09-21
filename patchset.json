@@ -7,11 +7,34 @@
     "target_commit_is_abbreviated": true
   },
   "patch_order": [3147, 3148, 3149, 3150],
-  "development_entrypoint": "chrome/test/data/webui/glic/test_client/start_glic_dev.sh",
   "patches": [
-    {"id":3147,"file":"patches/3147-Add-dashboard-WebUI-resources.patch","format":"mbox","area":"dashboard-webui"},
-    {"id":3148,"file":"patches/3148-Simulachrome-actor-dashboard-playback.patch","format":"mbox","area":"actor-playback"},
-    {"id":3149,"file":"patches/3149-Simulachrome-dashboard-glic-phase-A-B.patch","format":"mbox","area":"glic-dashboard"},
-    {"id":3150,"file":"patches/3150-Simulachrome-m144-apply-delta.patch","format":"unified-diff","area":"chromium-m144-delta"}
+    {
+      "id": 3147,
+      "file": "patches/3147-Add-dashboard-WebUI-resources.patch",
+      "format": "mbox",
+      "area": "dashboard-webui",
+      "description": "Adds dashboard resources, action editors, recorder support, and Chromium WebUI plumbing."
+    },
+    {
+      "id": 3148,
+      "file": "patches/3148-Simulachrome-actor-dashboard-playback.patch",
+      "format": "mbox",
+      "area": "actor-playback",
+      "description": "Integrates dashboard playback with Chromium actor behavior and humanized clicks."
+    },
+    {
+      "id": 3149,
+      "file": "patches/3149-Simulachrome-dashboard-glic-phase-A-B.patch",
+      "format": "mbox",
+      "area": "glic-dashboard",
+      "description": "Connects dashboard scripts, recording, Glic, page context, agent support, and development tooling."
+    },
+    {
+      "id": 3150,
+      "file": "patches/3150-Simulachrome-m144-apply-delta.patch",
+      "format": "unified-diff",
+      "area": "chromium-m144-delta",
+      "description": "Applies the revision-specific unified-agent and compatibility delta."
+    }
   ]
 }
