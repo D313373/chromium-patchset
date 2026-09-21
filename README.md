@@ -6,7 +6,8 @@ This repository intentionally does **not** vendor Chromium or the complete Simul
 
 ## What this repository contains
 
-- Four ordered Chromium patch files under [`patches/`](patches/)
+- Ordered Chromium patch files under [`patches/`](patches/) (3147–3154)
+- Full-file overlays under [`overlays/`](overlays/) for patch 3154
 - The expected Chromium base and target revisions in [`BASE_COMMIT`](BASE_COMMIT) and [`HEAD_COMMIT`](HEAD_COMMIT)
 - A machine-readable patch inventory in [`patchset.json`](patchset.json)
 - Patch application and metadata validation scripts under [`scripts/`](scripts/)
@@ -27,7 +28,7 @@ Keeping Chromium external avoids duplicating a very large upstream repository an
 |---|---|
 | Chromium base revision | `223dfbac1c7542a06b422390d954afe5b560b607` |
 | Patchset target marker | `836f788f2d7db` |
-| Patch order | `3147 -> 3148 -> 3149 -> 3150` |
+| Patch order | `3147 -> 3148 -> 3149 -> 3150 -> 3151 -> 3152 -> 3153 -> 3154` |
 | Expected build system | Chromium GN/Ninja |
 | Repository status | Development patchset |
 
@@ -39,6 +40,10 @@ The target marker is recorded exactly as supplied by the source checkout and is 
 2. **3148 — Simulachrome actor + dashboard playback**: actor/dashboard playback integration, Glic feature flags, humanized click input, and typing behavior changes.
 3. **3149 — Simulachrome dashboard + Glic Phase A/B**: dashboard automation APIs, recording and playback integration, Glic page handlers, Blink agent support, headless tooling, and test-client support.
 4. **3150 — Simulachrome m144 apply delta**: revision-specific changes including unified Glic agent context capture/orchestration and removal of an older recorder binding.
+5. **3151 — Script/agent page-map split + native nav**: separates script vs agent page-map pipelines and restores native directory navigation.
+6. **3152 — Script export PII/credential guard**: scans exports for credentials/PII before sharing.
+7. **3153 — Export secret auto-migrate**: suggests secret names and one-click migrates sensitive literals.
+8. **3154 — Glic coordinate click + screenshot grid**: coordinate-only click/type/hover, CSS-pixel grid screenshots with CTA hotspot labels, and destination-tab rebind recovery. Applied via [`overlays/3154/`](overlays/3154/).
 
 See [`PATCHSET.md`](PATCHSET.md) for the detailed feature map and patch statistics.
 
@@ -57,7 +62,7 @@ From the patchset repository, create or use a separate Chromium checkout and run
 ./scripts/apply-patches.sh --chromium-dir ../chromium
 ```
 
-The script verifies that the Chromium checkout is clean and at the expected base revision, applies patches in numeric order, and stops on the first failure. It uses `git am` for the mail-formatted patches 3147–3149 and `git apply` for the raw delta 3150.
+The script verifies that the Chromium checkout is clean and at the expected base revision, applies patches in numeric order, and stops on the first failure. It uses `git am` for mail-formatted patches 3147–3149 and 3151–3153, `git apply` for the raw delta 3150, and copies `overlays/3154/` for coordinate-click support.
 
 To validate the repository without a Chromium checkout:
 

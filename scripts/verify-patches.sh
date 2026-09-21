@@ -41,10 +41,25 @@ PATCHES=(
   "$ROOT_DIR/patches/3148-Simulachrome-actor-dashboard-playback.patch"
   "$ROOT_DIR/patches/3149-Simulachrome-dashboard-glic-phase-A-B.patch"
   "$ROOT_DIR/patches/3150-Simulachrome-m144-apply-delta.patch"
+  "$ROOT_DIR/patches/3151-Script-agent-pagemap-split-native-nav.patch"
+  "$ROOT_DIR/patches/3152-Script-export-PII-credential-guard.patch"
+  "$ROOT_DIR/patches/3153-Export-secret-auto-migrate.patch"
+  "$ROOT_DIR/patches/3154-Glic-agent-coordinate-click-screenshot-grid.patch"
+)
+OVERLAYS=(
+  "$ROOT_DIR/overlays/3154/ollama_client.ts"
+  "$ROOT_DIR/overlays/3154/serve.py"
+  "$ROOT_DIR/overlays/3154/APPLY.txt"
 )
 for patch in "${PATCHES[@]}"; do
   [[ -s "$patch" ]] || {
     echo "error: missing or empty patch: $patch" >&2
+    exit 1
+  }
+done
+for overlay in "${OVERLAYS[@]}"; do
+  [[ -s "$overlay" ]] || {
+    echo "error: missing or empty overlay: $overlay" >&2
     exit 1
   }
 done
@@ -69,10 +84,15 @@ if [[ -n "$CHROMIUM_DIR" ]]; then
     git -C "$CHROMIUM_DIR" apply --check "$patch"
   done
   git -C "$CHROMIUM_DIR" apply --check "${PATCHES[3]}"
-  echo "All patches pass git apply --check against the base checkout."
+  for patch in "${PATCHES[@]:4:3}"; do
+    git -C "$CHROMIUM_DIR" apply --check "$patch"
+  done
+  echo "Patches 3147-3153 pass git apply --check against the base checkout."
+  echo "Note: 3154 is an overlay copy (see overlays/3154/APPLY.txt), not a context hunk patch."
 fi
 
 echo "Patchset metadata is valid."
 echo "Base revision: $BASE_COMMIT"
 echo "Target marker: $TARGET_COMMIT"
 printf 'Patch: %s\n' "${PATCHES[@]}"
+printf 'Overlay: %s\n' "${OVERLAYS[@]}"

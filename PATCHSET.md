@@ -10,8 +10,8 @@ The patch series spans browser C++, renderer/Blink C++, Chromium WebUI JavaScrip
 
 - `BASE_COMMIT` identifies the expected starting Chromium revision.
 - `HEAD_COMMIT` records the target marker from the source patch workflow.
-- Patch files are applied in numeric order: `3147`, `3148`, `3149`, `3150`.
-- Patches `3147`–`3149` are mail-formatted patches; `3150` is a raw unified diff.
+- Patch files are applied in numeric order: `3147` … `3154`.
+- Patches `3147`–`3149` and `3151`–`3153` are mail-formatted patches; `3150` is a raw unified diff; `3154` is applied from `overlays/3154/`.
 
 The application script deliberately checks for a clean checkout and an exact base revision. This prevents silently applying the series to an incompatible Chromium tree.
 
@@ -27,7 +27,9 @@ The application script deliberately checks for a clean checkout and an exact bas
 | Actor behavior | 3148, 3149 | `chrome/renderer/actor/`, actor policy and tool utilities |
 | Blink agent support | 3149 | `third_party/blink/renderer/core/agent/` |
 | Headless automation | 3149 | `headless_listener_host.py`, headless listener switches |
-| Glic development client | 3149 | `chrome/test/data/webui/glic/test_client/` |
+| Glic development client | 3149, 3154 | `chrome/test/data/webui/glic/test_client/` |
+| Script export / secrets | 3152, 3153 | dashboard script export + secret migration helpers |
+| Page-map / native navigation | 3151 | script vs agent page-map split, native directory nav |
 
 ## Patch statistics
 
@@ -37,6 +39,8 @@ The following figures come from the patch headers and are per-patch, not a dedup
 - Patch 3148: 12 files changed, 195 insertions, 10 deletions
 - Patch 3149: 214 files changed, 40,676 insertions, 5,360 deletions
 - Patch 3150: a raw revision delta; its file count is not included in the patch header
+- Patches 3151–3153: follow-on mail-formatted feature patches
+- Patch 3154: full-file overlay under `overlays/3154/` (preferred over the placeholder hunk patch)
 
 Later patches modify files introduced by earlier patches, so summing these figures will overcount the final tree.
 

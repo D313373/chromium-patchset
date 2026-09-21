@@ -56,6 +56,23 @@ PATCH_3150="$ROOT_DIR/patches/3150-Simulachrome-m144-apply-delta.patch"
 echo "Applying $(basename "$PATCH_3150") with git apply"
 git apply --index "$PATCH_3150"
 
+for patch in \
+  "$ROOT_DIR/patches/3151-Script-agent-pagemap-split-native-nav.patch" \
+  "$ROOT_DIR/patches/3152-Script-export-PII-credential-guard.patch" \
+  "$ROOT_DIR/patches/3153-Export-secret-auto-migrate.patch"; do
+  echo "Applying $(basename "$patch") with git am"
+  git am --3way "$patch"
+done
+
+echo "Applying overlay 3154 (coordinate click + screenshot grid)"
+cp "$ROOT_DIR/overlays/3154/ollama_client.ts" \
+  "$CHROMIUM_DIR/chrome/test/data/webui/glic/test_client/ollama_client.ts"
+cp "$ROOT_DIR/overlays/3154/serve.py" \
+  "$CHROMIUM_DIR/chrome/test/data/webui/glic/test_client/serve.py"
+git -C "$CHROMIUM_DIR" add \
+  chrome/test/data/webui/glic/test_client/ollama_client.ts \
+  chrome/test/data/webui/glic/test_client/serve.py
+
 echo "Patchset applied successfully."
 echo "Current Chromium revision: $(git rev-parse HEAD)"
-echo "Note: patch 3150 is applied to the index/worktree and is not committed by this script."
+echo "Note: patches 3150 and 3154 update the index/worktree and are not committed by this script."

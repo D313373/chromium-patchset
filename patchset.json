@@ -6,7 +6,16 @@
     "target_commit": "836f788f2d7db",
     "target_commit_is_abbreviated": true
   },
-  "patch_order": [3147, 3148, 3149, 3150],
+  "patch_order": [
+    3147,
+    3148,
+    3149,
+    3150,
+    3151,
+    3152,
+    3153,
+    3154
+  ],
   "patches": [
     {
       "id": 3147,
@@ -35,6 +44,35 @@
       "format": "unified-diff",
       "area": "chromium-m144-delta",
       "description": "Applies the revision-specific unified-agent and compatibility delta."
+    },
+    {
+      "id": 3151,
+      "file": "patches/3151-Script-agent-pagemap-split-native-nav.patch",
+      "format": "mbox",
+      "area": "script-agent-pagemap",
+      "description": "Splits script vs agent page-map pipelines and restores native directory navigation."
+    },
+    {
+      "id": 3152,
+      "file": "patches/3152-Script-export-PII-credential-guard.patch",
+      "format": "mbox",
+      "area": "script-export-pii",
+      "description": "Adds script export with PII/credential scanning before sharing."
+    },
+    {
+      "id": 3153,
+      "file": "patches/3153-Export-secret-auto-migrate.patch",
+      "format": "mbox",
+      "area": "export-secret-migrate",
+      "description": "Suggests secret names on export and one-click migrates sensitive literals."
+    },
+    {
+      "id": 3154,
+      "file": "patches/3154-Glic-agent-coordinate-click-screenshot-grid.patch",
+      "format": "overlay",
+      "overlay": "overlays/3154/",
+      "area": "glic-coordinate-click",
+      "description": "Coordinate-only click/type/hover, CSS screenshot grid with CTA hotspots, and destination-tab rebind recovery. Apply via overlays/3154 full-file copy."
     }
   ]
 }

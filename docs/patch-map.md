@@ -25,3 +25,16 @@ Patch 3149 adds agent-related files under `third_party/blink/renderer/core/agent
 ## Headless and development tooling
 
 Patch 3149 adds headless listener behavior to Chromium startup and includes `headless_listener_host.py`, Glic test-client scripts, an Ollama client, payload debugging, sanitization tests, and startup helpers. These are development-oriented components rather than a general-purpose release packaging system.
+
+
+## Script export and secrets
+
+Patches 3152 and 3153 harden script sharing: export scans for credentials/PII, then offers one-click migration of sensitive literals into named secrets.
+
+## Page-map pipelines and native navigation
+
+Patch 3151 separates script playback page-map handling from the agent page-map path and restores native directory navigation behavior.
+
+## Coordinate clicks and screenshot grids
+
+Patch 3154 (via `overlays/3154/`) enables coordinate-only click/type/hover for the Glic agent, attaches CSS-pixel grid screenshots with painted CTA hotspot labels, and rebinds to existing destination tabs instead of opening duplicates during recovery.
