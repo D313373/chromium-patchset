@@ -14,7 +14,8 @@
     3151,
     3152,
     3153,
-    3154
+    3154,
+    3155
   ],
   "patches": [
     {
@@ -73,6 +74,14 @@
       "overlay": "overlays/3154/",
       "area": "glic-coordinate-click",
       "description": "Coordinate-only click/type/hover, CSS screenshot grid with CTA hotspots, and destination-tab rebind recovery. Apply via overlays/3154 full-file copy."
+    },
+    {
+      "id": 3155,
+      "file": "patches/3155-Sync-running-tip-autoheal-anthropic-launch-dirs.patch",
+      "format": "overlay",
+      "overlay": "overlays/3155/",
+      "area": "running-tip-sync",
+      "description": "Syncs auto-heal Anthropic wiring, model aliasing, and start_glic_dev profile/dir bootstrap to the live tip."
     }
   ]
 }

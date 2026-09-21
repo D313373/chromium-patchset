@@ -2,8 +2,8 @@ Apply 3154 (Glic agent coordinate click + CSS screenshot grid/hotspots):
 
   cp overlays/3154/ollama_client.ts \
     "$CHROMIUM_SRC/chrome/test/data/webui/glic/test_client/ollama_client.ts"
-      cp overlays/3154/serve.py \
-        "$CHROMIUM_SRC/chrome/test/data/webui/glic/test_client/serve.py"
+  cp overlays/3154/serve.py \
+    "$CHROMIUM_SRC/chrome/test/data/webui/glic/test_client/serve.py"
 
-    Then rebuild:
-      autoninja -C out/Default chrome/test/data/webui/glic:generate_test_files
+Then rebuild:
+  autoninja -C out/Default chrome/test/data/webui/glic:generate_test_files

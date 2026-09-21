@@ -10,8 +10,8 @@ The patch series spans browser C++, renderer/Blink C++, Chromium WebUI JavaScrip
 
 - `BASE_COMMIT` identifies the expected starting Chromium revision.
 - `HEAD_COMMIT` records the target marker from the source patch workflow.
-- Patch files are applied in numeric order: `3147` … `3154`.
-- Patches `3147`–`3149` and `3151`–`3153` are mail-formatted patches; `3150` is a raw unified diff; `3154` is applied from `overlays/3154/`.
+- Patch files are applied in numeric order: `3147` … `3155`.
+- Patches `3147`–`3149` and `3151`–`3153` are mail-formatted patches; `3150` is a raw unified diff; `3154`–`3155` are applied from `overlays/`.
 
 The application script deliberately checks for a clean checkout and an exact base revision. This prevents silently applying the series to an incompatible Chromium tree.
 
@@ -41,6 +41,7 @@ The following figures come from the patch headers and are per-patch, not a dedup
 - Patch 3150: a raw revision delta; its file count is not included in the patch header
 - Patches 3151–3153: follow-on mail-formatted feature patches
 - Patch 3154: full-file overlay under `overlays/3154/` (preferred over the placeholder hunk patch)
+- Patch 3155: full-file overlay under `overlays/3155/` (auto-heal Anthropic + launch dir bootstrap)
 
 Later patches modify files introduced by earlier patches, so summing these figures will overcount the final tree.
 
@@ -51,7 +52,8 @@ Later patches modify files introduced by earlier patches, so summing these figur
 3. Confirm the Chromium worktree is clean.
 4. Run `scripts/apply-patches.sh --chromium-dir <path>`.
 5. Configure and build Chromium using the normal GN/Ninja workflow for the target platform.
-6. Use the Simulachrome repository for product-level runtime instructions and test clients.
+6. Follow `docs/GETTING_STARTED.md` and run `start_glic_dev.sh` (creates profile/Scripts/Headless automatically).
+7. Use the Simulachrome repository for product-level runtime instructions and examples.
 
 ## Failure recovery
 

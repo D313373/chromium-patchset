@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: D313373 <d.1337.edu@gmail.com>
+Date: Mon, 21 Sep 2026 13:45:00 -0700
+Subject: [PATCH] Sync running tip: auto-heal Anthropic + launch profile dirs
+
+Bring the patchset current with the live Simulachrome tip used in development.
+Prefer overlays/3155/ full-file copy (see APPLY.txt).
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+diff --git a/chrome/test/data/webui/glic/test_client/TIP_SYNC_3155.md b/chrome/test/data/webui/glic/test_client/TIP_SYNC_3155.md
+new file mode 100644
+--- /dev/null
++++ b/chrome/test/data/webui/glic/test_client/TIP_SYNC_3155.md
+@@ -0,0 +1,16 @@
++# 3155 — Sync running tip (auto-heal Anthropic + launch dirs)
++
++## Summary
++- Auto-heal uses Settings provider/model (`__DASH_PROVIDER` / `__DASH_MODEL`)
++- Removes non-working pinned `claude-haiku-4-5-20251001` from dropdowns; aliases remap
++- C++ Anthropic chat remaps retired model ids
++- `start_glic_dev.sh` creates DevProfile / Scripts / Headless / SimulachromeData roots
++
++## Apply
++Use full-file overlay (preferred):
++
++```
++rsync -a overlays/3155/chrome/ "$CHROMIUM_SRC/chrome/"
++```
++
++See overlays/3155/APPLY.txt.

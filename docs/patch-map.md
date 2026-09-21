@@ -38,3 +38,8 @@ Patch 3151 separates script playback page-map handling from the agent page-map p
 ## Coordinate clicks and screenshot grids
 
 Patch 3154 (via `overlays/3154/`) enables coordinate-only click/type/hover for the Glic agent, attaches CSS-pixel grid screenshots with painted CTA hotspot labels, and rebinds to existing destination tabs instead of opening duplicates during recovery.
+
+
+## Running-tip sync (3155)
+
+Overlay `overlays/3155/` copies the live tip for auto-heal Anthropic connection (Settings provider/model), model alias cleanup, dashboard bootstrap globals, and `start_glic_dev.sh` so first launch creates Simulachrome home directories automatically.

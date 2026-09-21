@@ -6,8 +6,8 @@ This repository intentionally does **not** vendor Chromium or the complete Simul
 
 ## What this repository contains
 
-- Ordered Chromium patch files under [`patches/`](patches/) (3147–3154)
-- Full-file overlays under [`overlays/`](overlays/) for patch 3154
+- Ordered Chromium patch files under [`patches/`](patches/) (3147–3155)
+- Full-file overlays under [`overlays/`](overlays/) for patches 3154–3155
 - The expected Chromium base and target revisions in [`BASE_COMMIT`](BASE_COMMIT) and [`HEAD_COMMIT`](HEAD_COMMIT)
 - A machine-readable patch inventory in [`patchset.json`](patchset.json)
 - Patch application and metadata validation scripts under [`scripts/`](scripts/)
@@ -28,7 +28,7 @@ Keeping Chromium external avoids duplicating a very large upstream repository an
 |---|---|
 | Chromium base revision | `223dfbac1c7542a06b422390d954afe5b560b607` |
 | Patchset target marker | `836f788f2d7db` |
-| Patch order | `3147 -> 3148 -> 3149 -> 3150 -> 3151 -> 3152 -> 3153 -> 3154` |
+| Patch order | `3147 -> … -> 3155` |
 | Expected build system | Chromium GN/Ninja |
 | Repository status | Development patchset |
 
@@ -44,8 +44,9 @@ The target marker is recorded exactly as supplied by the source checkout and is 
 6. **3152 — Script export PII/credential guard**: scans exports for credentials/PII before sharing.
 7. **3153 — Export secret auto-migrate**: suggests secret names and one-click migrates sensitive literals.
 8. **3154 — Glic coordinate click + screenshot grid**: coordinate-only click/type/hover, CSS-pixel grid screenshots with CTA hotspot labels, and destination-tab rebind recovery. Applied via [`overlays/3154/`](overlays/3154/).
+9. **3155 — Sync running tip**: auto-heal Anthropic provider/model wiring, model alias cleanup, and `start_glic_dev.sh` profile/dir bootstrap. Applied via [`overlays/3155/`](overlays/3155/).
 
-See [`PATCHSET.md`](PATCHSET.md) for the detailed feature map and patch statistics.
+See [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) for a first-run walkthrough and [`PATCHSET.md`](PATCHSET.md) for the detailed feature map.
 
 ## Prerequisites
 
@@ -62,7 +63,7 @@ From the patchset repository, create or use a separate Chromium checkout and run
 ./scripts/apply-patches.sh --chromium-dir ../chromium
 ```
 
-The script verifies that the Chromium checkout is clean and at the expected base revision, applies patches in numeric order, and stops on the first failure. It uses `git am` for mail-formatted patches 3147–3149 and 3151–3153, `git apply` for the raw delta 3150, and copies `overlays/3154/` for coordinate-click support.
+The script verifies that the Chromium checkout is clean and at the expected base revision, applies patches in numeric order, and stops on the first failure. It uses `git am` for mail-formatted patches 3147–3149 and 3151–3153, `git apply` for the raw delta 3150, and copies `overlays/3154/` plus `overlays/3155/` for the Glic client and running-tip sync.
 
 To validate the repository without a Chromium checkout:
 
@@ -75,6 +76,17 @@ To validate patch application without changing the Chromium checkout, use a disp
 ```bash
 ./scripts/verify-patches.sh --chromium-dir ../chromium
 ```
+
+## First run after applying
+
+Follow [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md). Short version:
+
+```bash
+# after build
+chrome/test/data/webui/glic/test_client/start_glic_dev.sh
+```
+
+Chromium creates `DevProfile/`; the script creates `Scripts/` and `Headless/` (override root with `SIMULACHROME_HOME`). Secrets and saved scripts are created later through the Dashboard UI — they are intentionally not vendored here.
 
 ## Building patched Chromium
 

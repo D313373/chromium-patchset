@@ -1,0 +1,25 @@
+Apply 3155 (bring Chromium tree current with running Simulachrome tip):
+
+  After patches 3147-3154 (and overlay 3154), copy:
+
+    rsync -a overlays/3155/chrome/ "$CHROMIUM_SRC/chrome/"
+
+  Or per-file:
+
+    cp overlays/3155/chrome/browser/resources/dashboard/settings.js \
+      "$CHROMIUM_SRC/chrome/browser/resources/dashboard/settings.js"
+    # ...same for each path under overlays/3155/chrome/
+
+  Then rebuild dashboard resources + chrome + glic test files:
+
+    autoninja -C out/Default \
+      chrome/browser/resources/dashboard:resources \
+      chrome \
+      chrome/test/data/webui/glic:generate_test_files
+
+Notes:
+  - Includes Anthropic auto-heal provider wiring, pinned-model removal/aliasing,
+    and start_glic_dev.sh which creates Scripts/Headless (Chromium creates DevProfile).
+  - Runtime profile data (secrets, saved scripts, global_settings.json) is created
+    on first use under $SIMULACHROME_HOME (default macOS:
+    ~/Library/Application Support/Simulachrome) — not shipped in this repo.

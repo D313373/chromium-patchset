@@ -198,7 +198,6 @@ const PROVIDER_MODEL_OPTIONS: Record<AgentProvider, ModelOption[]> = {
   ],
   anthropic: [
     {value: 'claude-haiku-4-5', label: 'claude-haiku-4-5 (cheap, default)'},
-    {value: 'claude-haiku-4-5-20251001', label: 'claude-haiku-4-5-20251001 (pinned)'},
     {value: 'claude-sonnet-4-5', label: 'claude-sonnet-4-5 (higher quality)'},
     {value: 'claude-sonnet-5', label: 'claude-sonnet-5 (higher quality)'},
   ],
@@ -211,17 +210,30 @@ function normalizeAgentProvider(raw: string|undefined|null): AgentProvider {
       'ollama';
 }
 
-function defaultModelForProvider(provider: AgentProvider): string {
+const ANTHROPIC_MODEL_ALIASES: Record<string, string> = {
+  'claude-haiku-4-5-20251001': 'claude-haiku-4-5',
+  'claude-3-5-haiku-latest': 'claude-haiku-4-5',
+  'claude-3-5-sonnet-latest': 'claude-sonnet-4-5',
+  'claude-sonnet-4-20250514': 'claude-sonnet-4-5',
+};
+
+function normalizeModelForProvider(provider: AgentProvider, model: string): string {
+  let candidate = String(model || '').trim();
+  if (provider === 'anthropic') {
+    const aliased = ANTHROPIC_MODEL_ALIASES[candidate];
+    if (aliased) {
+      candidate = aliased;
+    }
+  }
+  const options = PROVIDER_MODEL_OPTIONS[provider] || [];
+  if (options.some((opt) => opt.value === candidate)) {
+    return candidate;
+  }
   return DEFAULT_MODELS_BY_PROVIDER[provider] || DEFAULT_MODELS_BY_PROVIDER.ollama;
 }
 
 function sanitizeModelForProvider(provider: AgentProvider, model: string): string {
-  const candidate = String(model || '').trim();
-  const options = PROVIDER_MODEL_OPTIONS[provider] || [];
-  if (options.some((option) => option.value === candidate)) {
-    return candidate;
-  }
-  return defaultModelForProvider(provider);
+  return normalizeModelForProvider(provider, model);
 }
 
 function modelOptionLabel(provider: AgentProvider, option: ModelOption): string {

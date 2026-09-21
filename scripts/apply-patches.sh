@@ -73,6 +73,22 @@ git -C "$CHROMIUM_DIR" add \
   chrome/test/data/webui/glic/test_client/ollama_client.ts \
   chrome/test/data/webui/glic/test_client/serve.py
 
+echo "Applying overlay 3155 (running-tip sync)"
+if command -v rsync >/dev/null 2>&1; then
+  rsync -a "$ROOT_DIR/overlays/3155/chrome/" "$CHROMIUM_DIR/chrome/"
+else
+  # Fallback without rsync: copy each file under overlays/3155/chrome
+  while IFS= read -r -d '' src; do
+    rel="${src#"$ROOT_DIR/overlays/3155/"}"
+    mkdir -p "$CHROMIUM_DIR/$(dirname "$rel")"
+    cp -f "$src" "$CHROMIUM_DIR/$rel"
+  done < <(find "$ROOT_DIR/overlays/3155/chrome" -type f -print0)
+fi
+git -C "$CHROMIUM_DIR" add -A chrome/browser/resources/dashboard   chrome/browser/ui/webui/dashboard   chrome/test/data/webui/glic/test_client/start_glic_dev.sh   chrome/test/data/webui/glic/test_client/ollama_client.ts   chrome/test/data/webui/glic/test_client/serve.py || true
+
 echo "Patchset applied successfully."
 echo "Current Chromium revision: $(git rev-parse HEAD)"
-echo "Note: patches 3150 and 3154 update the index/worktree and are not committed by this script."
+echo "Note: patches 3150/3154/3155 update the index/worktree and are not committed by this script."
+echo "Next: build Chromium, then run:"
+echo "  $CHROMIUM_DIR/chrome/test/data/webui/glic/test_client/start_glic_dev.sh"
+echo "Chromium creates DevProfile; start_glic_dev creates Scripts/ and Headless/ under SIMULACHROME_HOME."
