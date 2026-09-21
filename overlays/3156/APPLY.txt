@@ -1,0 +1,29 @@
+Apply 3156 (bake start_glic_dev essentials into the binary):
+
+  After overlays 3154–3155:
+
+    rsync -a overlays/3156/chrome/ "$CHROMIUM_SRC/chrome/"
+
+  Then rebuild:
+
+    autoninja -C out/Default \
+      chrome/browser/resources/dashboard:resources \
+      chrome \
+      chrome/test/data/webui/glic:generate_test_files
+
+  Package the guest UI into the app (also done by start_glic_dev.sh):
+
+    rsync -a out/Default/gen/chrome/test/data/webui/glic/glic/test_client/ \
+      out/Default/Chromium.app/Contents/Resources/simulachrome_agent/
+
+What this overlay bakes in:
+  - chrome://simulachrome-agent packaged guest (default --glic-guest-url)
+  - --simulachrome-agent auth bypass (Release-safe; --glic-dev remains opt-in)
+  - Glic features + open-on-startup + occlusion/timer/visible-widget defaults
+  - Settings-derived relaunch switches (incl. remoteDebuggingEnabled opt-in)
+  - SIMULACHROME_HOME path defaults for Scripts/Headless
+  - Local OpenAI-compatible provider (Settings + in-process dashboardAgentOllamaChat)
+  - Guest UI prefers chrome.send chat over serve.py sidecar when packaged
+
+Still outside the binary (thin launcher / script):
+  - Ollama autostart, rebuild helpers, log tails

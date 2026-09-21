@@ -1,0 +1,5 @@
+Subject: [PATCH] 3156 Bake Glic/Simulachrome product defaults + packaged agent UI
+
+This is an overlay patch (see overlays/3156/). Full-file copies under
+overlays/3156/chrome/ replace the corresponding Chromium paths after 3155.
+

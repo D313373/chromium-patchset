@@ -17,7 +17,7 @@ You do **not** need to manually create Simulachrome folders. Chromium creates th
 ./scripts/apply-patches.sh --chromium-dir /path/to/chromium/src
 ```
 
-This applies patches `3147`–`3153`, then copies overlays `3154` and `3155` (Glic client + running-tip sync).
+This applies patches `3147`–`3153`, then copies overlays `3154`–`3156` (Glic client + running-tip sync).
 
 Validate metadata any time with:
 
@@ -37,7 +37,17 @@ autoninja -C out/Default chrome/test/data/webui/glic:generate_test_files
 
 Exact `args.gn` flags depend on your platform; enable Glic-related features as you would for local Glic development.
 
-## 3. Launch the Simulachrome / Glic dev environment
+## 3. Launch the Simulachrome / Glic environment
+
+After overlay 3156, a Release/Default `Chromium.app` applies product defaults in C++
+(`simulachrome::ApplyBrowserCommandLineDefaults`): Glic features, open-on-startup,
+occlusion/timer/visible-widget switches, Scripts/Headless under `SIMULACHROME_HOME`,
+and guest URL `chrome://simulachrome-agent/…` (packaged). Remote debugging stays off
+unless Settings enables it. `start_glic_dev.sh` remains useful for packaging the
+agent UI into Resources and optional localhost/`--glic-dev` workflows
+(`USE_LOCALHOST_GUEST=1`).
+
+## 3b. Dev launcher (optional)
 
 ```bash
 chrome/test/data/webui/glic/test_client/start_glic_dev.sh
@@ -70,7 +80,7 @@ A first-run profile is empty until you configure provider/model in **Settings** 
 
 1. Launch with `start_glic_dev.sh`
 2. Open the Dashboard / Glic UI
-3. Settings → provider **Anthropic** (or Ollama) → choose a model → Save
+3. Settings → provider **Anthropic** (or Local OpenAI-compatible) → choose a model → Save
 4. Data → Secrets → set `ANTHROPIC_API_KEY` (for hosted providers)
 5. Run a Glic task or enable auto-heal and exercise a failing script
 
