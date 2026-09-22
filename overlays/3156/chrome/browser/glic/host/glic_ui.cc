@@ -132,6 +132,13 @@ GlicUI::GlicUI(content::WebUI* web_ui) : ui::MojoWebUIController(web_ui) {
                                                       net_log::GlicPage::kGlic);
   source->AddBoolean("simulateNoConnection", simulate_no_connection_);
 
+  // Packaged Simulachrome agent guest — skip Gemini web-client handshake /
+  // cookie sync expectations in the host WebUI.
+  const bool simulachrome_agent_guest =
+      command_line->HasSwitch("simulachrome-agent") ||
+      guest_url.host() == "simulachrome-agent";
+  source->AddBoolean("simulachromeAgentGuest", simulachrome_agent_guest);
+
   source->AddResourcePath("glic_logo.svg", GetResourceID(IDR_GLIC_LOGO));
 
   // Set up guest api source.
@@ -184,7 +191,8 @@ GlicUI::GlicUI(content::WebUI* web_ui) : ui::MojoWebUIController(web_ui) {
   // timeout, and max unresponsive ui time.
   source->AddBoolean(
       "isClientResponsivenessCheckEnabled",
-      base::FeatureList::IsEnabled(features::kGlicClientResponsivenessCheck));
+      !simulachrome_agent_guest &&
+          base::FeatureList::IsEnabled(features::kGlicClientResponsivenessCheck));
   source->AddInteger("clientResponsivenessCheckIntervalMs",
                      features::kGlicClientResponsivenessCheckIntervalMs.Get());
   source->AddInteger("clientResponsivenessCheckTimeoutMs",

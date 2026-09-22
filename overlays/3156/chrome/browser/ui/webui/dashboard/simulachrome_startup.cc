@@ -208,6 +208,14 @@ void ApplyBrowserCommandLineDefaults() {
 
   EnsureSimulachromeDirs();
 
+  // Isolated headless listener process: skip Glic/agent UI wiring. It has no
+  // startup window and only needs ListenerManager + the control socket.
+  if (cl->HasSwitch(switches::kHeadlessListener)) {
+    ApplySettingsDerivedSwitches(cl);
+    VLOG(1) << "Simulachrome headless-listener defaults applied (no Glic)";
+    return;
+  }
+
   AppendEnableFeatures(cl, "Glic,GlicDefaultTabContextSetting");
   AppendSwitchASCIIIfMissing(cl, switches::kGlicOpenOnStartup, "attached");
   AppendSwitchIfMissing(cl, "disable-backgrounding-occluded-windows");

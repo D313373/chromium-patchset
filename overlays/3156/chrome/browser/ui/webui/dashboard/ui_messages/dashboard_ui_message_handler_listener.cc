@@ -21,10 +21,11 @@
 #include "base/containers/flat_map.h"
 #include "base/containers/flat_set.h"
 #include "base/containers/span.h"
-#include "base/feature_list.h"
+#include "base/files/file.h"
 #include "base/files/file_util.h"
 #include "base/files/scoped_file.h"
 #include "base/functional/bind.h"
+#include "base/functional/callback_helpers.h"
 #include "base/i18n/time_formatting.h"
 #include "base/json/json_reader.h"
 #include "base/json/json_writer.h"
@@ -39,6 +40,7 @@
 #include "base/strings/strcat.h"
 #include "base/strings/string_split.h"
 #include "base/strings/string_util.h"
+#include "base/task/sequenced_task_runner.h"
 #include "base/task/thread_pool.h"
 #include "base/time/time.h"
 #include "chrome/browser/profiles/profile.h"
@@ -48,14 +50,21 @@
 #include "chrome/browser/ui/tabs/tab_strip_model.h"
 #include "chrome/browser/ui/webui/dashboard/dashboard.h"
 #include "chrome/browser/ui/webui/dashboard/dashboard_global_settings.h"
+#include "chrome/browser/ui/webui/dashboard/execution_run_context.h"
 #include "chrome/browser/ui/webui/dashboard/headless_investigation_service.h"
+#include "chrome/browser/ui/webui/dashboard/headless_listener_agent.h"
+#include "chrome/browser/ui/webui/dashboard/headless_listener_controller.h"
+#include "chrome/browser/ui/webui/dashboard/headless_listener_ipc.h"
 #include "chrome/browser/ui/webui/dashboard/headless_listener_prewarm.h"
+#include "chrome/common/chrome_switches.h"
 #include "chrome/browser/ui/webui/dashboard/listener_manager.h"
 #include "chrome/browser/ui/webui/dashboard/run_history_store.h"
 #include "chrome/browser/ui/webui/dashboard/script_execution_service.h"
 #include "chrome/browser/ui/webui/dashboard/script_execution_service_factory.h"
 #include "chrome/browser/ui/webui/dashboard/script_store.h"
+#include "chrome/common/chrome_paths.h"
 #include "components/viz/common/frame_sinks/copy_output_result.h"
+#include "content/public/browser/navigation_controller.h"
 #include "content/public/browser/render_widget_host_view.h"
 #include "content/public/browser/web_contents.h"
 #include "content/public/browser/web_contents_observer.h"
@@ -70,22 +79,9 @@
 #include "base/posix/eintr_wrapper.h"
 #endif
 
-namespace dashboard {
-
-// Allows headless-host spawn/wait helpers to join the child process.
-// Friended in base/threading/thread_restrictions.h.
-class [[maybe_unused, nodiscard]] HeadlessHostScopedAllowBaseSyncPrimitives
-    : public base::ScopedAllowBaseSyncPrimitives {};
-
-}  // namespace dashboard
-
 namespace {
 
-BASE_FEATURE(kDashboardNativeHeadlessListeners,
-             "DashboardNativeHeadlessListeners",
-             base::FEATURE_DISABLED_BY_DEFAULT);
-
-constexpr int kHeadlessListenerStartWaitMs = 15000;
+constexpr int kHeadlessListenerStartWaitMs [[maybe_unused]] = 15000;
 
 const base::Value::Dict* ReadScriptSettingsOverrides(
     const base::Value::Dict& script) {
@@ -347,6 +343,23 @@ base::flat_map<std::string, std::string> BuildListenerMatchTokenMapFromEvent(
   SetListenerMatchToken(&token_map, "listener.match.attr", attr);
   SetListenerMatchToken(&token_map, "listener.match.url", matched_url);
   SetListenerMatchToken(&token_map, "listener.match.page_url", page_url);
+
+  if (const base::Value::Dict* tokens = event.FindDict("tokens")) {
+    for (auto it : *tokens) {
+      if (it.second.is_string()) {
+        SetListenerMatchToken(&token_map, it.first, it.second.GetString());
+      }
+    }
+    if (matched_url.empty()) {
+      if (const std::string* url = tokens->FindString("listener.match.url")) {
+        SetListenerMatchToken(&token_map, "listener.match.url", *url);
+      }
+    }
+  }
+  if (const std::string* match_url = event.FindString("match_url");
+      match_url && !match_url->empty()) {
+    SetListenerMatchToken(&token_map, "listener.match.url", *match_url);
+  }
 
   const std::string normalized_listener_id =
       NormalizeDataKey(listener_script_id);
@@ -791,6 +804,12 @@ struct TriggerDispatchRequest {
   base::flat_map<std::string, std::string> token_map;
 };
 
+struct ListenerEventsFetchResult {
+  base::Value::List events;
+  std::string headless_warning;
+  std::vector<TriggerDispatchRequest> headless_trigger_dispatches;
+};
+
 struct PreparedTriggerDispatch {
   std::string trigger_script_id;
   std::string listener_script_id;
@@ -1108,246 +1127,6 @@ void DispatchTriggerScriptsAsync(Profile* profile,
           base::Unretained(profile), std::move(log_prefix)));
 }
 
-bool ResolveRunListenersHeadlessForScript(const base::Value::Dict& script) {
-  bool global_default = true;
-  if (const base::Value::Dict* listener_mode =
-          dashboard::GlobalSettingsStore().FindDict("listenerMode")) {
-    if (auto v = listener_mode->FindBool("runListenersInHeadlessMode")) {
-      global_default = *v;
-    }
-  }
-
-  if (!global_default) {
-    return false;
-  }
-
-  const base::Value::Dict* overrides = ReadScriptSettingsOverrides(script);
-  if (!overrides) {
-    return true;
-  }
-  if (auto v = overrides->FindBool("runListenersInHeadlessMode")) {
-    return *v;
-  }
-  return true;
-}
-
-bool AllowHeadlessFallbackToBackgroundTab() {
-  if (const base::Value::Dict* listener_mode =
-          dashboard::GlobalSettingsStore().FindDict("listenerMode")) {
-    if (auto v = listener_mode->FindBool(
-            "fallbackToBackgroundTabOnHeadlessFailure")) {
-      return *v;
-    }
-  }
-  // Prefer failing closed so "headless" never silently means a headed tab.
-  return false;
-}
-
-base::FilePath InstalledHeadlessHostScriptPath() {
-  if (const char* home = std::getenv("SIMULACHROME_HOME"); home && *home) {
-    return base::FilePath::FromUTF8Unsafe(home)
-        .AppendASCII("Headless")
-        .AppendASCII("headless_listener_host.py");
-  }
-  base::FilePath app_data_dir;
-  if (base::PathService::Get(base::DIR_APP_DATA, &app_data_dir) &&
-      !app_data_dir.empty()) {
-    return app_data_dir.AppendASCII("Simulachrome")
-        .AppendASCII("Headless")
-        .AppendASCII("headless_listener_host.py");
-  }
-  return base::FilePath();
-}
-
-void MaybeInstallHeadlessHostScript(const base::FilePath& source) {
-  if (source.empty() || !base::PathExists(source)) {
-    return;
-  }
-  const base::FilePath installed = InstalledHeadlessHostScriptPath();
-  if (installed.empty() || installed == source) {
-    return;
-  }
-  if (base::PathExists(installed)) {
-    return;
-  }
-  if (!base::CreateDirectory(installed.DirName())) {
-    return;
-  }
-  if (!base::CopyFile(source, installed)) {
-    LOG(WARNING) << "[Dashboard] Failed to install headless host script to "
-                 << installed;
-  } else {
-    LOG(INFO) << "[Dashboard] Installed headless host script at " << installed;
-  }
-}
-
-std::optional<base::FilePath> ResolveHeadlessHostScriptPath() {
-  const char* env = std::getenv("SIMULACHROME_HEADLESS_HOST_SCRIPT");
-  if (env && *env) {
-    base::FilePath path = base::FilePath::FromUTF8Unsafe(env);
-    if (base::PathExists(path)) {
-      return path;
-    }
-  }
-
-  const base::FilePath installed = InstalledHeadlessHostScriptPath();
-  if (!installed.empty() && base::PathExists(installed)) {
-    return installed;
-  }
-
-  const base::FilePath relative_host_path =
-      base::FilePath(FILE_PATH_LITERAL("chrome"))
-          .AppendASCII("browser")
-          .AppendASCII("resources")
-          .AppendASCII("dashboard")
-          .AppendASCII("headless_listener_host.py");
-
-  std::vector<base::FilePath> roots;
-  base::FilePath cwd;
-  if (base::GetCurrentDirectory(&cwd)) {
-    roots.push_back(cwd);
-  }
-  roots.push_back(base::CommandLine::ForCurrentProcess()->GetProgram().DirName());
-  base::FilePath exe = base::CommandLine::ForCurrentProcess()->GetProgram();
-  if (!exe.IsAbsolute()) {
-    base::FilePath abs_exe = base::MakeAbsoluteFilePath(exe);
-    if (!abs_exe.empty()) {
-      roots.push_back(abs_exe.DirName());
-    }
-  }
-
-  for (const auto& start : roots) {
-    if (start.empty()) {
-      continue;
-    }
-    base::FilePath cur = start;
-    while (true) {
-      const base::FilePath candidate = cur.Append(relative_host_path);
-      if (base::PathExists(candidate)) {
-        MaybeInstallHeadlessHostScript(candidate);
-        return candidate;
-      }
-      const base::FilePath parent = cur.DirName();
-      if (parent == cur || parent.empty()) {
-        break;
-      }
-      cur = parent;
-    }
-  }
-  return std::nullopt;
-}
-
-base::FilePath ResolvePython3Binary() {
-  const char* env = std::getenv("SIMULACHROME_PYTHON_BIN");
-  if (env && *env) {
-    base::FilePath from_env = base::FilePath::FromUTF8Unsafe(env);
-    if (base::PathExists(from_env)) {
-      return from_env;
-    }
-  }
-
-  const base::FilePath candidates[] = {
-      base::FilePath(FILE_PATH_LITERAL("/usr/bin/python3")),
-      base::FilePath(FILE_PATH_LITERAL("/opt/homebrew/bin/python3")),
-      base::FilePath(FILE_PATH_LITERAL("/usr/local/bin/python3")),
-  };
-  for (const auto& candidate : candidates) {
-    if (base::PathExists(candidate)) {
-      return candidate;
-    }
-  }
-
-  return base::FilePath(FILE_PATH_LITERAL("python3"));
-}
-
-std::optional<base::Value> ParseFirstJsonObjectFromOutput(
-    const std::string& output) {
-  const size_t start = output.find('{');
-  if (start == std::string::npos) {
-    return std::nullopt;
-  }
-
-  int depth = 0;
-  bool in_string = false;
-  bool escape = false;
-  for (size_t i = start; i < output.size(); ++i) {
-    const char ch = output[i];
-    if (in_string) {
-      if (escape) {
-        escape = false;
-      } else if (ch == '\\') {
-        escape = true;
-      } else if (ch == '"') {
-        in_string = false;
-      }
-      continue;
-    }
-    if (ch == '"') {
-      in_string = true;
-      continue;
-    }
-    if (ch == '{') {
-      ++depth;
-      continue;
-    }
-    if (ch == '}') {
-      --depth;
-      if (depth == 0) {
-        std::string candidate = output.substr(start, i - start + 1);
-        return base::JSONReader::Read(candidate,
-                                      base::JSON_PARSE_CHROMIUM_EXTENSIONS);
-      }
-    }
-  }
-  return std::nullopt;
-}
-
-struct HeadlessHostCommandResult {
-  bool ok = false;
-  base::Value::Dict response;
-  std::string error;
-};
-
-struct ListenerEventsFetchResult {
-  base::Value::List events;
-  std::vector<TriggerDispatchRequest> headless_trigger_dispatches;
-  std::string headless_warning;
-};
-
-struct HeadlessRelayState {
-  bool enabled = false;
-  bool in_flight = false;
-};
-
-std::map<Profile*, HeadlessRelayState>& HeadlessRelayStates() {
-  static base::NoDestructor<std::map<Profile*, HeadlessRelayState>> states;
-  return *states;
-}
-
-constexpr int kHeadlessRelayWaitMs = 10000;
-constexpr base::TimeDelta kHeadlessRelayImmediateRescheduleDelay =
-    base::Milliseconds(1);
-constexpr base::TimeDelta kHeadlessRelayErrorBackoff = base::Seconds(2);
-
-void ScheduleHeadlessRelayPoll(Profile* profile, base::TimeDelta delay);
-
-HeadlessHostCommandResult InvokeHeadlessListenerHostForResultBlocking(
-    const std::string& command,
-    const std::string& script_id,
-    const base::FilePath& profile_path,
-    const base::FilePath& scripts_dir,
-    const base::FilePath& browser_program,
-    int wait_ms = 0);
-
-HeadlessHostCommandResult InvokeHeadlessListenerHostForResultWithRequestBlocking(
-    const std::string& command,
-    const std::string& script_id,
-    const base::FilePath& profile_path,
-    const base::FilePath& scripts_dir,
-    const base::FilePath& browser_program,
-    int wait_ms,
-    const std::string& request_json);
-
 void AppendListenerEventAsync(Profile* profile, base::Value::Dict event) {
   if (!profile) {
     return;
@@ -1357,11 +1136,13 @@ void AppendListenerEventAsync(Profile* profile, base::Value::Dict event) {
       {base::MayBlock(), base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
       base::BindOnce(
           [](Profile* profile, base::Value::Dict event) {
-            (void)dashboard::RunHistoryStore::AppendListenerEvent(profile, event);
+            (void)dashboard::RunHistoryStore::AppendListenerEvent(profile,
+                                                                  event);
           },
           base::Unretained(profile), std::move(event)));
 }
 
+// Convert pushed headless trigger events into headed onMatch dispatches.
 void ProcessHeadlessEvents(Profile* profile,
                            const base::Value::List& host_events) {
   if (!profile) {
@@ -1402,8 +1183,6 @@ void ProcessHeadlessEvents(Profile* profile,
                      normalized.FindString("match_url")) {
         preferred_start_url = *match_url;
       }
-      // Never fall back to the listener pageUrl (e.g. discord.com/channels/...).
-      // An empty start URL opens about:blank, then navigate uses the token.
       dispatches.push_back(TriggerDispatchRequest{
           trigger_script_id, listener_script_id, preferred_start_url,
           std::move(token_map)});
@@ -1418,463 +1197,87 @@ void ProcessHeadlessEvents(Profile* profile,
   }
 }
 
-void PollHeadlessRelayNow(Profile* profile) {
-  if (!profile) {
-    return;
-  }
-  auto& states = HeadlessRelayStates();
-  auto it = states.find(profile);
-  if (it == states.end() || !it->second.enabled || it->second.in_flight) {
-    return;
-  }
-  it->second.in_flight = true;
-
-  const base::FilePath profile_path = profile->GetPath();
-  const base::FilePath scripts_dir = dashboard::ScriptStore::ScriptsDir(profile);
-  const base::FilePath browser_program =
-      base::CommandLine::ForCurrentProcess()->GetProgram();
-  base::ThreadPool::PostTaskAndReplyWithResult(
-      FROM_HERE,
-      {base::MayBlock(), base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
-      base::BindOnce(&InvokeHeadlessListenerHostForResultBlocking, "poll_events",
-                     /*script_id=*/"", profile_path, scripts_dir, browser_program,
-                     kHeadlessRelayWaitMs),
-      base::BindOnce(
-          [](Profile* profile, HeadlessHostCommandResult host_result) {
-            auto& states = HeadlessRelayStates();
-            auto it = states.find(profile);
-            if (it == states.end()) {
-              return;
-            }
-            it->second.in_flight = false;
-            if (!it->second.enabled) {
-              return;
-            }
-            if (host_result.ok) {
-              if (const base::Value::List* host_events =
-                      host_result.response.FindList("events")) {
-                ProcessHeadlessEvents(profile, *host_events);
-              }
-              ScheduleHeadlessRelayPoll(
-                  profile, kHeadlessRelayImmediateRescheduleDelay);
-            } else if (!host_result.error.empty()) {
-              VLOG(1) << "[Dashboard] headless relay poll warning: "
-                      << host_result.error;
-              ScheduleHeadlessRelayPoll(profile, kHeadlessRelayErrorBackoff);
-            }
-          },
-          base::Unretained(profile)));
-}
-
-void ScheduleHeadlessRelayPoll(Profile* profile, base::TimeDelta delay) {
-  if (!profile) {
-    return;
-  }
-  auto& states = HeadlessRelayStates();
-  auto it = states.find(profile);
-  if (it == states.end() || !it->second.enabled) {
-    return;
-  }
-  base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
-      FROM_HERE, base::BindOnce(&PollHeadlessRelayNow, base::Unretained(profile)),
-      delay);
-}
-
-void EnsureHeadlessRelayEnabled(Profile* profile) {
-  if (!profile) {
-    return;
-  }
-  auto& states = HeadlessRelayStates();
-  HeadlessRelayState& state = states[profile];
-  if (state.enabled) {
-    return;
-  }
-  state.enabled = true;
-  state.in_flight = false;
-  PollHeadlessRelayNow(profile);
-}
-
-#if BUILDFLAG(IS_POSIX)
-bool WriteAllToFd(int fd, base::span<const uint8_t> bytes) {
-  while (!bytes.empty()) {
-    const ssize_t rv = HANDLE_EINTR(write(fd, bytes.data(), bytes.size()));
-    if (rv <= 0) {
-      return false;
+bool ResolveRunListenersHeadlessForScript(const base::Value::Dict& script) {
+  bool global_default = true;
+  if (const base::Value::Dict* listener_mode =
+          dashboard::GlobalSettingsStore().FindDict("listenerMode")) {
+    if (auto v = listener_mode->FindBool("runListenersInHeadlessMode")) {
+      global_default = *v;
     }
-    bytes = bytes.subspan(static_cast<size_t>(rv));
+  }
+
+  if (!global_default) {
+    return false;
+  }
+
+  const base::Value::Dict* overrides = ReadScriptSettingsOverrides(script);
+  if (!overrides) {
+    return true;
+  }
+  if (auto v = overrides->FindBool("runListenersInHeadlessMode")) {
+    return *v;
   }
   return true;
 }
 
-bool ReadAllFromFd(int fd, base::span<uint8_t> bytes) {
-  while (!bytes.empty()) {
-    const ssize_t rv = HANDLE_EINTR(read(fd, bytes.data(), bytes.size()));
-    if (rv <= 0) {
-      return false;
+bool AllowHeadlessFallbackToBackgroundTab() {
+  if (const base::Value::Dict* listener_mode =
+          dashboard::GlobalSettingsStore().FindDict("listenerMode")) {
+    if (auto v = listener_mode->FindBool(
+            "fallbackToBackgroundTabOnHeadlessFailure")) {
+      return *v;
     }
-    bytes = bytes.subspan(static_cast<size_t>(rv));
   }
-  return true;
+  // Prefer failing closed so "headless" never silently means a headed tab.
+  return false;
 }
 
-bool ReadFramedJsonFromFd(int fd, std::string* payload_json) {
-  if (!payload_json) {
-    return false;
-  }
-
-  std::array<uint8_t, 4> header{};
-  if (!ReadAllFromFd(fd, base::span<uint8_t>(header))) {
-    return false;
-  }
-
-  const uint32_t payload_len =
-      static_cast<uint32_t>(header[0]) |
-      (static_cast<uint32_t>(header[1]) << 8) |
-      (static_cast<uint32_t>(header[2]) << 16) |
-      (static_cast<uint32_t>(header[3]) << 24);
-
-  constexpr uint32_t kMaxNativeResponseBytes = 16u * 1024u * 1024u;
-  if (payload_len > kMaxNativeResponseBytes) {
-    return false;
-  }
-
-  std::string response(payload_len, '\0');
-  if (payload_len > 0 &&
-      !ReadAllFromFd(fd, base::as_writable_byte_span(response))) {
-    return false;
-  }
-
-  *payload_json = std::move(response);
-  return true;
-}
-
-HeadlessHostCommandResult InvokeHeadlessListenerHostViaNativeMessagingBlocking(
-    const base::FilePath& python_bin,
-    const base::FilePath& host_script,
-    const std::string& command,
-    const std::string& script_id,
-    const base::FilePath& profile_path,
-    const base::FilePath& scripts_dir,
-    const base::FilePath& browser_program,
-    int wait_ms,
-    const std::string& request_json) {
-  // These helpers always run on ThreadPool MayBlock tasks and must wait on the
-  // child host process. Allow base sync waits explicitly (MayBlock alone is not
-  // enough for WaitForExit / GetAppOutputAndError).
-  dashboard::HeadlessHostScopedAllowBaseSyncPrimitives allow_wait;
-  HeadlessHostCommandResult out;
-
-  base::Value::Dict native_msg;
-  native_msg.Set("type", command);
-  native_msg.Set("profile_dir", profile_path.AsUTF8Unsafe());
-  native_msg.Set("browser_bin", browser_program.AsUTF8Unsafe());
-  if (wait_ms > 0) {
-    native_msg.Set("wait_ms", wait_ms);
-  }
-  if (!script_id.empty()) {
-    native_msg.Set("script_id", script_id);
-    base::FilePath script_path =
-        scripts_dir.AppendASCII(script_id + ".json");
-    const size_t slash = script_id.find('/');
-    if (slash != std::string::npos && slash + 1 < script_id.size()) {
-      script_path = scripts_dir.AppendASCII(script_id.substr(0, slash))
-                        .AppendASCII(script_id.substr(slash + 1) + ".json");
-    }
-    native_msg.Set("script_path", script_path.AsUTF8Unsafe());
-  }
-
-  if (!request_json.empty()) {
-    std::optional<base::Value> parsed_request =
-        base::JSONReader::Read(request_json,
-                               base::JSON_PARSE_CHROMIUM_EXTENSIONS);
-    if (!parsed_request || !parsed_request->is_dict()) {
-      out.error = "Failed to parse headless investigation request payload.";
-      return out;
-    }
-    native_msg.Set("request", parsed_request->GetDict().Clone());
-  }
-
-  std::string native_msg_json;
-  if (!base::JSONWriter::Write(base::Value(std::move(native_msg)),
-                               &native_msg_json)) {
-    out.error = "Failed to serialize headless host native request.";
-    return out;
-  }
-  if (native_msg_json.size() > std::numeric_limits<uint32_t>::max()) {
-    out.error = "Headless host native request is too large.";
-    return out;
-  }
-
-  int stdin_pipe[2];
-  if (HANDLE_EINTR(pipe(stdin_pipe)) != 0) {
-    out.error =
-        "Failed to create native messaging stdin pipe for headless host.";
-    return out;
-  }
-  int stdout_pipe[2];
-  if (HANDLE_EINTR(pipe(stdout_pipe)) != 0) {
-    IGNORE_EINTR(close(stdin_pipe[0]));
-    IGNORE_EINTR(close(stdin_pipe[1]));
-    out.error =
-        "Failed to create native messaging stdout pipe for headless host.";
-    return out;
-  }
-
-  base::ScopedFD child_stdin_read(stdin_pipe[0]);
-  base::ScopedFD parent_stdin_write(stdin_pipe[1]);
-  base::ScopedFD parent_stdout_read(stdout_pipe[0]);
-  base::ScopedFD child_stdout_write(stdout_pipe[1]);
-
-  base::LaunchOptions options;
-  options.fds_to_remap.emplace_back(child_stdin_read.get(), STDIN_FILENO);
-  options.fds_to_remap.emplace_back(child_stdout_write.get(), STDOUT_FILENO);
-
-  std::vector<std::string> argv = {
-      python_bin.AsUTF8Unsafe(),
-      host_script.AsUTF8Unsafe(),
-  };
-
-  base::Process process = base::LaunchProcess(argv, options);
-  if (!process.IsValid()) {
-    out.error = "Failed to launch headless host process for native request.";
-    return out;
-  }
-
-  child_stdin_read.reset();
-  child_stdout_write.reset();
-
-  const uint32_t msg_len = static_cast<uint32_t>(native_msg_json.size());
-  std::array<uint8_t, 4> header = {
-      static_cast<uint8_t>(msg_len & 0xffu),
-      static_cast<uint8_t>((msg_len >> 8) & 0xffu),
-      static_cast<uint8_t>((msg_len >> 16) & 0xffu),
-      static_cast<uint8_t>((msg_len >> 24) & 0xffu),
-  };
-
-  if (!WriteAllToFd(parent_stdin_write.get(), base::span<const uint8_t>(header)) ||
-      !WriteAllToFd(parent_stdin_write.get(),
-                    base::as_byte_span(native_msg_json))) {
-    out.error = "Failed to write native request to headless host process.";
-    process.Terminate(0, false);
-    return out;
-  }
-  parent_stdin_write.reset();
-
-  std::string response_json;
-  if (!ReadFramedJsonFromFd(parent_stdout_read.get(), &response_json)) {
-    out.error = "Headless host native response was invalid or incomplete.";
-    process.Terminate(0, false);
-    return out;
-  }
-  parent_stdout_read.reset();
-
-  int exit_code = 0;
-  process.WaitForExit(&exit_code);
-
-  auto parsed = base::JSONReader::Read(response_json,
-                                       base::JSON_PARSE_CHROMIUM_EXTENSIONS);
-  if (!parsed || !parsed->is_dict()) {
-    out.error = "Headless host native response JSON parsing failed.";
-    return out;
-  }
-
-  base::Value::Dict res = parsed->GetDict().Clone();
-  out.ok = res.FindBool("ok").value_or(false);
-  if (!out.ok) {
-    out.error = res.FindString("error")
-                    ? *res.FindString("error")
-                    : "Headless host native command failed.";
-  } else if (exit_code != 0) {
-    out.ok = false;
-    out.error = "Headless host process exited with non-zero status.";
-  }
-  out.response = std::move(res);
-  return out;
-}
-#endif  // BUILDFLAG(IS_POSIX)
-
-HeadlessHostCommandResult InvokeHeadlessListenerHostForResultBlocking(
-    const std::string& command,
-    const std::string& script_id,
-    const base::FilePath& profile_path,
-    const base::FilePath& scripts_dir,
-    const base::FilePath& browser_program,
-    int wait_ms) {
-  return InvokeHeadlessListenerHostForResultWithRequestBlocking(
-      command, script_id, profile_path, scripts_dir, browser_program, wait_ms,
-      std::string());
-}
-
-HeadlessHostCommandResult InvokeHeadlessListenerHostForResultWithRequestBlocking(
-    const std::string& command,
-    const std::string& script_id,
-    const base::FilePath& profile_path,
-    const base::FilePath& scripts_dir,
-    const base::FilePath& browser_program,
-    int wait_ms,
-    const std::string& request_json) {
-  // Same as native-messaging path: blocking host spawn/wait is intentional.
-  dashboard::HeadlessHostScopedAllowBaseSyncPrimitives allow_wait;
-  HeadlessHostCommandResult out;
-  const std::optional<base::FilePath> host_script =
-      ResolveHeadlessHostScriptPath();
-  if (!host_script) {
-    out.error =
-        "Headless listener host script not found. Set "
-        "SIMULACHROME_HEADLESS_HOST_SCRIPT to enable headless listeners.";
-    return out;
-  }
-
-  const base::FilePath python_bin = ResolvePython3Binary();
-  if (!request_json.empty()) {
-#if BUILDFLAG(IS_POSIX)
-    return InvokeHeadlessListenerHostViaNativeMessagingBlocking(
-        python_bin, *host_script, command, script_id, profile_path, scripts_dir,
-        browser_program, wait_ms, request_json);
-#else
-    out.error =
-        "Secure headless request transport is unsupported on this platform.";
-    return out;
-#endif
-  }
-
-  base::FilePath absolute_browser = browser_program;
-  if (!absolute_browser.IsAbsolute()) {
-    base::FilePath resolved = base::MakeAbsoluteFilePath(absolute_browser);
-    if (!resolved.empty()) {
-      absolute_browser = std::move(resolved);
-    }
-  }
-
-  std::vector<std::string> argv = {
-      python_bin.AsUTF8Unsafe(),
-      host_script->AsUTF8Unsafe(),
-      "--command",
-      command,
-      "--profile-dir",
-      profile_path.AsUTF8Unsafe(),
-      "--browser-bin",
-      absolute_browser.AsUTF8Unsafe(),
-  };
-  if (wait_ms > 0) {
-    argv.push_back("--wait-ms");
-    argv.push_back(base::NumberToString(wait_ms));
-  }
-  if (!script_id.empty()) {
-    base::FilePath script_path =
-        scripts_dir.AppendASCII(script_id + ".json");
-    // Collection ids use Scripts/<collection>/<id>.json.
-    const size_t slash = script_id.find('/');
-    if (slash != std::string::npos && slash + 1 < script_id.size()) {
-      script_path = scripts_dir.AppendASCII(script_id.substr(0, slash))
-                        .AppendASCII(script_id.substr(slash + 1) + ".json");
-    }
-    argv.push_back("--script-id");
-    argv.push_back(script_id);
-    argv.push_back("--script-path");
-    argv.push_back(script_path.AsUTF8Unsafe());
-  }
-  std::string output;
-  const bool process_ok = base::GetAppOutputAndError(argv, &output);
-
-  auto parsed =
-      base::JSONReader::Read(output, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
-  if (!parsed || !parsed->is_dict()) {
-    std::vector<std::string> lines = base::SplitString(
-        output, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
-    if (!lines.empty()) {
-      parsed = base::JSONReader::Read(lines.back(),
-                                      base::JSON_PARSE_CHROMIUM_EXTENSIONS);
-    }
-  }
-  if ((!parsed || !parsed->is_dict()) && !output.empty()) {
-    parsed = ParseFirstJsonObjectFromOutput(output);
-  }
-  // Host returns exit code 1 on {"ok":false}; still prefer the structured error.
-  if (parsed && parsed->is_dict()) {
-    base::Value::Dict res = parsed->GetDict().Clone();
-    out.ok = res.FindBool("ok").value_or(false);
-    if (!out.ok) {
-      out.error = res.FindString("error")
-                      ? *res.FindString("error")
-                      : "Headless listener host command failed.";
-    }
-    out.response = std::move(res);
-    return out;
-  }
-
-  if (!process_ok) {
-    out.error = base::StrCat(
-        {"Failed to execute headless listener host command (python=",
-         python_bin.AsUTF8Unsafe(), ")."});
-    if (!output.empty()) {
-      out.error = base::StrCat(
-          {out.error, " Host output: ",
-           output.substr(0, std::min<size_t>(output.size(), 512))});
-    }
-    return out;
-  }
-
-  out.error = "Headless listener host returned invalid response.";
-  if (!output.empty()) {
-    out.error = base::StrCat(
-        {out.error, " Host output: ",
-         output.substr(0, std::min<size_t>(output.size(), 512))});
-  }
-  return out;
-}
-
-void PrewarmHeadlessListenerHostBlocking(
-    const base::FilePath& profile_path,
-    const base::FilePath& scripts_dir,
-    const base::FilePath& browser_program) {
-  HeadlessHostCommandResult result = InvokeHeadlessListenerHostForResultBlocking(
-      "warm_headless", /*script_id=*/"", profile_path, scripts_dir,
-      browser_program, /*wait_ms=*/0);
-  if (result.ok) {
-    LOG(INFO) << "[Dashboard] Headless listener host prewarmed";
-  } else {
-    LOG(WARNING) << "[Dashboard] Headless listener host prewarm failed: "
-                 << result.error;
-  }
-}
 
 }  // namespace
 
 namespace dashboard {
 
+namespace {
+
+// When the headed browser crashes/quits, its --headless-listener child can be
+// left running (--no-startup-window + LSUIElement). On macOS, Launch Services
+// then treats that invisible process as Chromium.app, so the next launch shows
+// nothing. Reap orphans on headed startup (MayBlock worker only).
+void ReapOrphanedHeadlessListenerProcessesBlocking() {
+  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+          switches::kHeadlessListener)) {
+    return;
+  }
+#if BUILDFLAG(IS_POSIX)
+  std::vector<std::string> argv = {"/usr/bin/pkill", "-f",
+                                   "--headless-listener"};
+  base::Process p = base::LaunchProcess(argv, base::LaunchOptions());
+  if (p.IsValid()) {
+    int exit = 0;
+    p.WaitForExit(&exit);
+    if (exit == 0) {
+      LOG(WARNING) << "[Headless] Reaped orphaned --headless-listener "
+                      "process(es) so headed Chromium can show a window";
+    }
+  }
+  const base::FilePath sock = DefaultHeadlessControlSocketPath();
+  if (!sock.empty()) {
+    base::DeleteFile(sock);
+  }
+#endif
+}
+
+}  // namespace
+
 void MaybePrewarmHeadlessListenerHost(Profile* profile) {
-  if (!profile) {
-    return;
-  }
-  bool run_headless = true;
-  if (const base::Value::Dict* listener_mode =
-          GlobalSettingsStore().FindDict("listenerMode")) {
-    if (auto v = listener_mode->FindBool("runListenersInHeadlessMode")) {
-      run_headless = *v;
-    }
-  }
-  if (!run_headless) {
-    return;
-  }
-
-  const base::FilePath profile_path = profile->GetPath();
-  const base::FilePath scripts_dir = ScriptStore::ScriptsDir(profile);
-  base::FilePath browser_program =
-      base::CommandLine::ForCurrentProcess()->GetProgram();
-  if (!browser_program.IsAbsolute()) {
-    base::FilePath resolved = base::MakeAbsoluteFilePath(browser_program);
-    if (!resolved.empty()) {
-      browser_program = std::move(resolved);
-    }
-  }
-
+  // Do not pre-launch headless (dock-tile issue). Instead, clear orphans left
+  // behind after a headed crash so the next open -a Chromium is visible.
+  (void)profile;
   base::ThreadPool::PostTask(
       FROM_HERE,
       {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
        base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
-      base::BindOnce(&PrewarmHeadlessListenerHostBlocking, profile_path,
-                     scripts_dir, browser_program));
+      base::BindOnce(&ReapOrphanedHeadlessListenerProcessesBlocking));
 }
 
 void InvestigatePageOnHeadlessListener(
@@ -1886,71 +1289,32 @@ void InvestigatePageOnHeadlessListener(
     out.Set("ok", false);
     out.Set("error", "Missing profile.");
     out.Set("command", "investigate_page");
-    out.Set("transport", "headless_listener");
+    out.Set("transport", "native_headless");
     std::move(callback).Run(std::move(out));
     return;
   }
 
-  // Default to closing the headless CDP target when the probe finishes.
-  // Callers may keep it warm with close_target/closeTarget=false.
-  if (!payload.FindBool("close_target").has_value() &&
-      !payload.FindBool("closeTarget").has_value()) {
-    payload.Set("close_target", true);
-    payload.Set("closeTarget", true);
+  // Ensure the C++-owned headless Chromium is up, then run investigate_page
+  // over the length-prefixed JSON control channel.
+  auto* existing = HeadlessListenerController::GetForProfile(profile);
+  HeadlessListenerController* controller = existing;
+  std::unique_ptr<HeadlessListenerController> owned;
+  if (!controller) {
+    owned = std::make_unique<HeadlessListenerController>(profile);
+    controller = owned.get();
+    owned.release();
   }
-
-  int wait_ms = 0;
-  if (auto wait = payload.FindInt("wait_ms")) {
-    wait_ms = *wait;
-  } else if (auto wait_alt = payload.FindInt("waitMs")) {
-    wait_ms = *wait_alt;
-  }
-  // Investigation often includes navigate + settle + snapshot; allow up to 2m.
-  if (wait_ms <= 0) {
-    wait_ms = 120000;
-  }
-  wait_ms = std::clamp(wait_ms, 1, 180000);
-
-  std::string request_json;
-  if (!base::JSONWriter::Write(base::Value(payload.Clone()), &request_json) ||
-      request_json.empty()) {
-    base::Value::Dict out;
-    out.Set("ok", false);
-    out.Set("error", "Failed to serialize investigation payload.");
-    out.Set("command", "investigate_page");
-    out.Set("transport", "headless_listener");
-    std::move(callback).Run(std::move(out));
-    return;
-  }
-
-  const base::FilePath profile_path = profile->GetPath();
-  const base::FilePath scripts_dir = ScriptStore::ScriptsDir(profile);
-  base::FilePath browser_program =
-      base::CommandLine::ForCurrentProcess()->GetProgram();
-  if (!browser_program.IsAbsolute()) {
-    base::FilePath resolved = base::MakeAbsoluteFilePath(browser_program);
-    if (!resolved.empty()) {
-      browser_program = std::move(resolved);
-    }
-  }
-
-  base::ThreadPool::PostTaskAndReplyWithResult(
-      FROM_HERE,
-      {base::MayBlock(), base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
-      base::BindOnce(&InvokeHeadlessListenerHostForResultWithRequestBlocking,
-                     "investigate_page", /*script_id=*/"", profile_path,
-                     scripts_dir, browser_program, wait_ms, request_json),
+  controller->InvestigatePage(
+      std::move(payload),
       base::BindOnce(
-          [](base::OnceCallback<void(base::Value::Dict)> callback,
-             HeadlessHostCommandResult host_result) {
-            base::Value::Dict out = host_result.response.Clone();
-            out.Set("ok", host_result.ok);
+          [](base::OnceCallback<void(base::Value::Dict)> callback, bool ok,
+             base::Value::Dict response) {
+            base::Value::Dict out = std::move(response);
             out.Set("command", "investigate_page");
-            out.Set("transport", "headless_listener");
-            if (!host_result.ok) {
-              out.Set("error", host_result.error.empty()
-                                   ? "Headless investigation failed."
-                                   : host_result.error);
+            out.Set("transport", "native_headless");
+            out.Set("ok", ok);
+            if (!ok && !out.FindString("error")) {
+              out.Set("error", "investigate_page failed.");
             }
             std::move(callback).Run(std::move(out));
           },
@@ -1993,96 +1357,20 @@ void DashboardUIMessageHandler::HandleGetListenerEvents(
     }
   }
 
-  const base::FilePath profile_path = profile_->GetPath();
-  const base::FilePath scripts_dir = dashboard::ScriptStore::ScriptsDir(profile_);
-  const base::FilePath browser_program =
-      base::CommandLine::ForCurrentProcess()->GetProgram();
-  const bool use_native_headless =
-      base::FeatureList::IsEnabled(kDashboardNativeHeadlessListeners);
+  // Triggers are pushed live over the native control channel; this API only
+  // reads persisted listener event history for the Debugging UI.
   base::ThreadPool::PostTaskAndReplyWithResult(
       FROM_HERE,
       {base::MayBlock(), base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
       base::BindOnce(
-          [](Profile* profile, const base::FilePath& profile_path,
-             const base::FilePath& scripts_dir,
-             const base::FilePath& browser_program, bool use_native_headless,
-             base::Time from, base::Time to,
+          [](Profile* profile, base::Time from, base::Time to,
              uint32_t limit) -> ListenerEventsFetchResult {
             ListenerEventsFetchResult out;
-            if (!use_native_headless) {
-              const HeadlessHostCommandResult host_result =
-                  InvokeHeadlessListenerHostForResultBlocking(
-                      "poll_events", /*script_id=*/"", profile_path, scripts_dir,
-                      browser_program, /*wait_ms=*/0);
-              if (host_result.ok) {
-                if (const base::Value::List* host_events =
-                        host_result.response.FindList("events")) {
-                  for (const auto& ev : *host_events) {
-                    const base::Value::Dict* d = ev.GetIfDict();
-                    if (!d) {
-                      continue;
-                    }
-                    const std::string action =
-                        d->FindString("action")
-                            ? base::ToLowerASCII(*d->FindString("action"))
-                            : std::string();
-                    if (action == "trigger") {
-                      const std::string listener_script_id =
-                          d->FindString("listener_script_id")
-                              ? *d->FindString("listener_script_id")
-                              : std::string();
-                      std::string trigger_script_id =
-                          d->FindString("trigger_script_id")
-                              ? *d->FindString("trigger_script_id")
-                              : std::string();
-                      if (trigger_script_id.empty() &&
-                          !listener_script_id.empty()) {
-                        trigger_script_id = ReadOnMatchScriptIdFromListenerScript(
-                            profile, listener_script_id);
-                      }
-                      if (!trigger_script_id.empty()) {
-                        base::flat_map<std::string, std::string> token_map =
-                            BuildListenerMatchTokenMapFromEvent(*d);
-                        std::string preferred_start_url;
-                        // Prefer the captured outbound link, not the listener
-                        // page (e.g. discord.com/channels/...).
-                        auto token_it = token_map.find("listener.match.url");
-                        if (token_it != token_map.end() &&
-                            !token_it->second.empty()) {
-                          preferred_start_url = token_it->second;
-                        } else if (const std::string* match_url =
-                                       d->FindString("match_url")) {
-                          preferred_start_url = *match_url;
-                        }
-                        // Do not fall back to pageUrl (listener channel page).
-                        out.headless_trigger_dispatches.push_back(
-                            TriggerDispatchRequest{trigger_script_id,
-                                                   listener_script_id,
-                                                   preferred_start_url,
-                                                   std::move(token_map)});
-                      }
-                    }
-                    base::Value::Dict normalized = d->Clone();
-                    if (!normalized.Find("ts_ms")) {
-                      normalized.Set(
-                          "ts_ms",
-                          static_cast<double>(
-                              base::Time::Now().InMillisecondsSinceUnixEpoch()));
-                    }
-                    (void)dashboard::RunHistoryStore::AppendListenerEvent(
-                        profile, normalized);
-                  }
-                }
-              } else if (!host_result.error.empty()) {
-                out.headless_warning = host_result.error;
-              }
-            }
             out.events = dashboard::RunHistoryStore::ReadListenerEvents(
                 profile, from, to, limit);
             return out;
           },
-          base::Unretained(profile_), profile_path, scripts_dir, browser_program,
-          use_native_headless, from, to, limit),
+          base::Unretained(profile_), from, to, limit),
       base::BindOnce(
           [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb,
              ListenerEventsFetchResult fetch_result) {
@@ -2204,41 +1492,42 @@ void DashboardUIMessageHandler::HandleStartListener(
 
   const base::Value::Dict script = dashboard_->LoadScript(script_id);
   bool run_headless = ResolveRunListenersHeadlessForScript(script);
-  const bool use_native_headless =
-      run_headless &&
-      base::FeatureList::IsEnabled(kDashboardNativeHeadlessListeners);
-  if (use_native_headless) {
-    StartBackgroundTabListenerWithTokenMapAsync(
-        cb, script_id, "Native listener engine active (in-process).",
-        /*report_headless_mode=*/true);
-    return;
-  }
+  // C++-owned isolated headless process (no Python). Background-tab path when
+  // headless mode is off.
   if (run_headless) {
-    const base::FilePath profile_path = profile_->GetPath();
-    const base::FilePath scripts_dir =
-        dashboard::ScriptStore::ScriptsDir(profile_);
-    const base::FilePath browser_program =
-        base::CommandLine::ForCurrentProcess()->GetProgram();
-    base::ThreadPool::PostTaskAndReplyWithResult(
-        FROM_HERE,
-        {base::MayBlock(), base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
-        base::BindOnce(&InvokeHeadlessListenerHostForResultBlocking,
-                       "start_headless_listener", script_id, profile_path,
-                       scripts_dir, browser_program,
-                       /*wait_ms=*/kHeadlessListenerStartWaitMs),
+    dashboard::HeadlessListenerController* controller =
+        dashboard::HeadlessListenerController::GetForProfile(profile_);
+    if (!controller) {
+      headless_listener_controller_ =
+          std::make_unique<dashboard::HeadlessListenerController>(profile_);
+      controller = headless_listener_controller_.get();
+    }
+    controller->SetTriggerCallback(base::BindRepeating(
+        [](base::WeakPtr<DashboardUIMessageHandler> self,
+           base::Value::Dict trigger_event) {
+          if (!self || !self->profile_) {
+            return;
+          }
+          base::Value::List events;
+          events.Append(std::move(trigger_event));
+          ProcessHeadlessEvents(self->profile_, events);
+          DashboardUIMessageHandler::NotifyListenersChanged();
+        },
+        weak_ptr_factory_.GetWeakPtr()));
+    controller->StartListener(
+        script_id,
         base::BindOnce(
             [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb,
-               std::string script_id, HeadlessHostCommandResult host_result) {
+               std::string script_id, bool ok, base::Value::Dict response) {
               if (!self) {
                 return;
               }
               base::Value::Dict res;
-              if (host_result.ok) {
+              if (ok) {
                 self->headless_listener_started_at_[script_id] =
                     base::Time::Now();
-                EnsureHeadlessRelayEnabled(self->profile_);
                 LOG(INFO) << "[Dashboard] Listener started id=" << script_id
-                          << " mode=headless";
+                          << " mode=headless_native";
                 res.Set("success", true);
                 res.Set("error", "");
                 res.Set("mode", "headless");
@@ -2246,31 +1535,21 @@ void DashboardUIMessageHandler::HandleStartListener(
                 DashboardUIMessageHandler::NotifyListenersChanged();
                 return;
               }
-
-              if (!host_result.error.empty()) {
-                LOG(WARNING) << "[Dashboard] Headless listener start failed for "
-                             << script_id << ": " << host_result.error;
-              }
+              const std::string error =
+                  response.FindString("error") ? *response.FindString("error")
+                                               : "Headless listener failed.";
+              LOG(WARNING) << "[Dashboard] Native headless start failed for "
+                           << script_id << ": " << error;
               if (!AllowHeadlessFallbackToBackgroundTab()) {
                 res.Set("success", false);
-                res.Set(
-                    "error",
-                    host_result.error.empty()
-                        ? "Headless listener failed to start."
-                        : host_result.error);
+                res.Set("error", error);
                 res.Set("mode", "headless");
                 self->ResolveCallback(cb, res);
                 return;
               }
-              std::string warning =
-                  host_result.error.empty()
-                      ? "Headless listener failed to start after waiting."
-                      : base::StrCat(
-                            {"Headless listener failed to start after waiting: ",
-                             host_result.error,
-                             ". Falling back to background tab."});
               self->StartBackgroundTabListenerWithTokenMapAsync(
-                  cb, script_id, warning,
+                  cb, script_id,
+                  "Native headless failed; using background tab. " + error,
                   /*report_headless_mode=*/false);
             },
             weak_ptr_factory_.GetWeakPtr(), cb, script_id));
@@ -2279,6 +1558,34 @@ void DashboardUIMessageHandler::HandleStartListener(
 
   StartBackgroundTabListenerWithTokenMapAsync(cb, script_id, std::string(),
                                               /*report_headless_mode=*/false);
+}
+
+void DashboardUIMessageHandler::HandleStopAllScripts(
+    const base::Value::List& args) {
+  const std::string cb =
+      (args.size() > 0 && args[0].is_string()) ? args[0].GetString()
+                                               : std::string();
+
+  size_t stopped = 0;
+  dashboard::ScriptExecutionService* exec_service =
+      dashboard::ScriptExecutionServiceFactory::GetForProfile(profile_);
+  if (exec_service) {
+    stopped = exec_service->StopAllRuns("stop all scripts");
+  }
+  // Break nested listen→onMatch chains that may still be mid-dispatch.
+  dashboard::ExecutionRunContext::Get().set_listen_oneshot_depth(0);
+
+  // Best-effort: clear pending triggers on the native headless control channel.
+  if (auto* controller =
+          dashboard::HeadlessListenerController::GetForProfile(profile_)) {
+    controller->ClearPendingTriggers(base::DoNothing());
+  }
+
+  LOG(INFO) << "[Dashboard] HandleStopAllScripts stopped=" << stopped;
+  base::Value::Dict out;
+  out.Set("ok", true);
+  out.Set("stopped", static_cast<int>(stopped));
+  ResolveCallback(cb, out);
 }
 
 void DashboardUIMessageHandler::HandleStopListener(
@@ -2301,105 +1608,61 @@ void DashboardUIMessageHandler::HandleStopListener(
   const bool was_tracked_headless =
       headless_listener_started_at_.find(script_id) !=
       headless_listener_started_at_.end();
-  if (base::FeatureList::IsEnabled(kDashboardNativeHeadlessListeners)) {
-    if (!listener_manager_) {
-      listener_manager_ =
-          std::make_unique<dashboard::ListenerManager>(profile_, dashboard_);
-    }
-    std::string native_error;
-    const bool native_ok =
-        listener_manager_->StopListener(script_id, &native_error);
-    if (native_ok) {
-      headless_listener_started_at_.erase(script_id);
-      const std::string mode =
-          was_tracked_headless ? "headless" : "background_tab";
-      LOG(INFO) << "[Dashboard] Listener stopped id=" << script_id
-                << " mode=native_" << mode;
-      base::Value::Dict native_res;
-      native_res.Set("success", true);
-      native_res.Set("error", "");
-      native_res.Set("mode", mode);
-      ResolveCallback(cb, native_res);
-      NotifyListenersChanged();
-      return;
-    }
-    LOG(WARNING) << "[Dashboard] Native listener stop failed for " << script_id
-                 << ": " << native_error;
-    base::Value::Dict native_res;
-    native_res.Set("success", false);
-    native_res.Set("error", native_error.empty() ? "Listener is not active."
-                                                 : native_error);
-    native_res.Set("mode",
-                   was_tracked_headless ? "headless" : "background_tab");
-    ResolveCallback(cb, native_res);
-    return;
-  }
-  const base::FilePath profile_path = profile_->GetPath();
-  const base::FilePath scripts_dir = dashboard::ScriptStore::ScriptsDir(profile_);
-  const base::FilePath browser_program =
-      base::CommandLine::ForCurrentProcess()->GetProgram();
-  base::ThreadPool::PostTaskAndReplyWithResult(
-      FROM_HERE,
-      {base::MayBlock(), base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
-      base::BindOnce(&InvokeHeadlessListenerHostForResultBlocking,
-                     "stop_headless_listener", script_id, profile_path,
-                     scripts_dir, browser_program, /*wait_ms=*/0),
-      base::BindOnce(
-          [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb,
-             std::string script_id, bool was_tracked_headless,
-             HeadlessHostCommandResult host_result) {
-            if (!self) {
-              return;
-            }
-            base::Value::Dict res;
-            if (host_result.ok) {
+  if (auto* controller =
+          dashboard::HeadlessListenerController::GetForProfile(profile_);
+      controller && was_tracked_headless) {
+    controller->StopListener(
+        script_id,
+        base::BindOnce(
+            [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb,
+               std::string script_id, bool ok, base::Value::Dict response) {
+              if (!self) {
+                return;
+              }
+              base::Value::Dict res;
               self->headless_listener_started_at_.erase(script_id);
-              const bool already_stopped =
-                  host_result.response.FindBool("already_stopped")
-                      .value_or(false);
-              if (!already_stopped || was_tracked_headless) {
+              if (ok) {
                 LOG(INFO) << "[Dashboard] Listener stopped id=" << script_id
-                          << " mode=headless";
+                          << " mode=headless_native";
                 res.Set("success", true);
                 res.Set("error", "");
                 res.Set("mode", "headless");
-                self->ResolveCallback(cb, res);
-                DashboardUIMessageHandler::NotifyListenersChanged();
-                return;
+              } else {
+                const std::string error =
+                    response.FindString("error") ? *response.FindString("error")
+                                                 : "Stop failed.";
+                res.Set("success", false);
+                res.Set("error", error);
+                res.Set("mode", "headless");
               }
-            } else if (was_tracked_headless) {
-              LOG(WARNING) << "[Dashboard] Headless listener stop failed for "
-                           << script_id << ": " << host_result.error;
-              res.Set("success", false);
-              res.Set("error", host_result.error);
-              res.Set("mode", "headless");
               self->ResolveCallback(cb, res);
-              return;
-            } else if (!host_result.error.empty()) {
-              res.Set("warning", host_result.error);
-            }
+              DashboardUIMessageHandler::NotifyListenersChanged();
+            },
+            weak_ptr_factory_.GetWeakPtr(), cb, script_id));
+    return;
+  }
 
-            if (!self->listener_manager_) {
-              res.Set("success", false);
-              res.Set("error", "No listeners are active.");
-              self->ResolveCallback(cb, res);
-              return;
-            }
-
-            std::string error;
-            const bool ok =
-                self->listener_manager_->StopListener(script_id, &error);
-            LOG(INFO) << "[Dashboard] Listener stop id=" << script_id
-                      << " mode=background_tab success=" << (ok ? 1 : 0)
-                      << (error.empty() ? std::string()
-                                        : std::string(" error=") + error);
-            res.Set("success", ok);
-            res.Set("error", error);
-            res.Set("mode", "background_tab");
-            self->ResolveCallback(cb, res);
-            DashboardUIMessageHandler::NotifyListenersChanged();
-          },
-          weak_ptr_factory_.GetWeakPtr(), cb, script_id, was_tracked_headless));
+  if (!listener_manager_) {
+    listener_manager_ =
+        std::make_unique<dashboard::ListenerManager>(profile_, dashboard_);
+  }
+  std::string native_error;
+  const bool native_ok =
+      listener_manager_->StopListener(script_id, &native_error);
+  headless_listener_started_at_.erase(script_id);
+  const std::string mode =
+      was_tracked_headless ? "headless" : "background_tab";
+  LOG(INFO) << "[Dashboard] Listener stop id=" << script_id
+            << " mode=native_" << mode << " success=" << (native_ok ? 1 : 0)
+            << (native_error.empty() ? std::string()
+                                     : std::string(" error=") + native_error);
+  res.Set("success", native_ok);
+  res.Set("error", native_ok ? ""
+                             : (native_error.empty() ? "Listener is not active."
+                                                     : native_error));
+  res.Set("mode", mode);
+  ResolveCallback(cb, res);
+  NotifyListenersChanged();
 }
 
 void DashboardUIMessageHandler::HandleStopHeadlessTask(
@@ -2443,9 +1706,6 @@ void DashboardUIMessageHandler::HandleRefreshHeadlessTab(
   const std::string cb =
       (args.size() > 0 && args[0].is_string()) ? args[0].GetString()
                                                : std::string();
-  const std::string owner_kind =
-      (args.size() > 1 && args[1].is_string()) ? args[1].GetString()
-                                               : std::string();
   const std::string owner_id =
       (args.size() > 2 && args[2].is_string()) ? args[2].GetString()
                                                : std::string();
@@ -2458,59 +1718,29 @@ void DashboardUIMessageHandler::HandleRefreshHeadlessTab(
     return;
   }
 
-  const std::string kind = base::ToLowerASCII(owner_kind);
-  const bool is_listener =
-      kind.empty() || kind == "listener" || kind == "stop_listener";
-  const std::string script_id = is_listener ? owner_id : std::string();
-  base::Value::Dict request;
-  if (!is_listener) {
-    request.Set("target_id", owner_id);
-  }
-  std::string request_json;
-  if (!request.empty()) {
-    if (!base::JSONWriter::Write(base::Value(request.Clone()), &request_json) ||
-        request_json.empty()) {
-      out.Set("success", false);
-      out.Set("error", "Failed to encode headless refresh request.");
+  // Background-tab listeners: reload in-process WebContents.
+  if (listener_manager_) {
+    if (content::WebContents* wc =
+            listener_manager_->GetListenerWebContents(owner_id)) {
+      wc->GetController().Reload(content::ReloadType::NORMAL,
+                                 /*check_for_repost=*/false);
+      out.Set("success", true);
+      out.Set("owner_id", owner_id);
+      out.Set("ownerId", owner_id);
+      out.Set("mode", "background_tab");
       ResolveCallback(cb, out);
       return;
     }
   }
 
-  const base::FilePath profile_path = profile_->GetPath();
-  const base::FilePath scripts_dir =
-      dashboard::ScriptStore::ScriptsDir(profile_);
-  const base::FilePath browser_program =
-      base::CommandLine::ForCurrentProcess()->GetProgram();
-  base::ThreadPool::PostTaskAndReplyWithResult(
-      FROM_HERE,
-      {base::MayBlock(), base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
-      base::BindOnce(&InvokeHeadlessListenerHostForResultWithRequestBlocking,
-                     "refresh_headless_tab", script_id, profile_path,
-                     scripts_dir, browser_program, /*wait_ms=*/0,
-                     request_json),
-      base::BindOnce(
-          [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb,
-             std::string owner_id, HeadlessHostCommandResult host_result) {
-            if (!self) {
-              return;
-            }
-            base::Value::Dict res;
-            res.Set("success", host_result.ok);
-            res.Set("owner_id", owner_id);
-            res.Set("ownerId", owner_id);
-            if (!host_result.ok) {
-              res.Set("error", host_result.error.empty()
-                                   ? "Failed to refresh headless tab."
-                                   : host_result.error);
-            }
-            if (!host_result.response.empty()) {
-              res.Set("result", host_result.response.Clone());
-            }
-            self->ResolveCallback(cb, res);
-          },
-          weak_ptr_factory_.GetWeakPtr(), cb, owner_id));
+  out.Set("success", false);
+  out.Set("owner_id", owner_id);
+  out.Set("ownerId", owner_id);
+  out.Set("error",
+          "Native headless refresh over the control channel is not wired yet.");
+  ResolveCallback(cb, out);
 }
+
 
 void DashboardUIMessageHandler::HandleGetActiveListeners(
     const base::Value::List& args) {
@@ -2540,12 +1770,9 @@ void DashboardUIMessageHandler::HandleGetActiveListeners(
       d.Set("execution_id", info.execution_id);
       d.Set("current_url", info.current_url);
       d.Set("currentUrl", info.current_url);
-      const bool tracked_headless =
-          headless_listener_started_at_.find(info.script_id) !=
-          headless_listener_started_at_.end();
-      d.Set("mode", tracked_headless ? "headless" : "background_tab");
-      d.Set("mode_kind", tracked_headless ? "headless" : "background_tab");
-      d.Set("modeKind", tracked_headless ? "headless" : "background_tab");
+      d.Set("mode", "background_tab");
+      d.Set("mode_kind", "background_tab");
+      d.Set("modeKind", "background_tab");
       if (exec_service && !info.execution_id.empty()) {
         base::Value::Dict st = exec_service->GetRunStatusDict(info.execution_id);
         d.Set("execution_status", std::move(st));
@@ -2554,369 +1781,269 @@ void DashboardUIMessageHandler::HandleGetActiveListeners(
     }
   }
 
-  if (base::FeatureList::IsEnabled(kDashboardNativeHeadlessListeners)) {
-    base::Value::Dict payload;
-    payload.Set("listeners", std::move(listeners));
-    base::Value::List headless_tabs;
-    const base::Value::List* listeners_out = payload.FindList("listeners");
-    base::flat_set<std::string> seen_tab_ids;
-    auto site_name_from_url = [](const std::string& raw_url) {
-      if (raw_url.empty()) {
-        return std::string("about:blank");
-      }
-      GURL gurl(raw_url);
-      if (gurl.is_valid()) {
-        if (!gurl.host().empty()) {
-          return std::string(gurl.host());
+  auto finish =
+      [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb,
+         base::Value::List listeners) {
+        if (!self) {
+          return;
         }
-        if (!gurl.spec().empty()) {
-          return gurl.spec();
-        }
-      }
-      return raw_url;
-    };
-    auto append_headless_tab = [&headless_tabs, &seen_tab_ids](
-                                   base::Value::Dict tab) {
-      const std::string tab_id =
-          tab.FindString("tab_id") ? *tab.FindString("tab_id") : std::string();
-      if (tab_id.empty() || seen_tab_ids.contains(tab_id)) {
-        return;
-      }
-      seen_tab_ids.insert(tab_id);
-      headless_tabs.Append(std::move(tab));
-    };
-    if (listeners_out) {
-      for (const auto& item : *listeners_out) {
-        const base::Value::Dict* d = item.GetIfDict();
-        if (!d) {
-          continue;
-        }
-        const std::string mode_kind =
-            d->FindString("mode_kind") ? *d->FindString("mode_kind")
-                                       : (d->FindString("mode")
-                                              ? *d->FindString("mode")
-                                              : std::string());
-        if (mode_kind != "headless") {
-          continue;
-        }
-        const std::string script_id =
-            d->FindString("script_id") ? *d->FindString("script_id")
-                                       : std::string();
-        if (script_id.empty()) {
-          continue;
-        }
-        const std::string current_url =
-            d->FindString("current_url") ? *d->FindString("current_url")
-                                         : std::string();
-        const std::string script_name =
-            d->FindString("script_name") ? *d->FindString("script_name")
-                                         : script_id;
-        const std::string site_name = site_name_from_url(current_url);
-        base::Value::Dict tab;
-        tab.Set("tab_id", "listener:" + script_id);
-        tab.Set("tabId", "listener:" + script_id);
-        tab.Set("owner_kind", "listener");
-        tab.Set("ownerKind", "listener");
-        tab.Set("owner_id", script_id);
-        tab.Set("ownerId", script_id);
-        tab.Set("label", script_name);
-        tab.Set("open_reason", "listener");
-        tab.Set("openReason", "listener");
-        tab.Set("current_url", current_url);
-        tab.Set("currentUrl", current_url);
-        tab.Set("site_name", site_name);
-        tab.Set("siteName", site_name);
-        tab.Set("closable", true);
-        tab.Set("close_action", "stop_listener");
-        tab.Set("closeAction", "stop_listener");
-        tab.Set("close_id", script_id);
-        tab.Set("closeId", script_id);
-        append_headless_tab(std::move(tab));
-      }
-    }
-    for (const auto& task :
-         dashboard::GetHeadlessInvestigateTaskSnapshots(profile_)) {
-      const std::string& task_id = task.task_id;
-      if (task_id.empty()) {
-        continue;
-      }
-      base::Value::Dict tab;
-      tab.Set("tab_id", "investigation:" + task_id);
-      tab.Set("tabId", "investigation:" + task_id);
-      tab.Set("owner_kind", "investigation");
-      tab.Set("ownerKind", "investigation");
-      tab.Set("owner_id", task_id);
-      tab.Set("ownerId", task_id);
-      tab.Set("label", task.display_label);
-      tab.Set("open_reason", task.open_reason);
-      tab.Set("openReason", task.open_reason);
-      tab.Set("current_url", task.current_url);
-      tab.Set("currentUrl", task.current_url);
-      tab.Set("site_name", site_name_from_url(task.current_url));
-      tab.Set("siteName", site_name_from_url(task.current_url));
-      tab.Set("closable", true);
-      tab.Set("close_action", "stop_headless_task");
-      tab.Set("closeAction", "stop_headless_task");
-      tab.Set("close_id", task_id);
-      tab.Set("closeId", task_id);
-      append_headless_tab(std::move(tab));
-    }
-    payload.Set("headless_tabs", std::move(headless_tabs));
-    ResolveCallback(cb, payload);
-    return;
-  }
-
-  const base::FilePath profile_path = profile_->GetPath();
-  const base::FilePath scripts_dir = dashboard::ScriptStore::ScriptsDir(profile_);
-  const base::FilePath browser_program =
-      base::CommandLine::ForCurrentProcess()->GetProgram();
-  base::ThreadPool::PostTaskAndReplyWithResult(
-      FROM_HERE,
-      {base::MayBlock(), base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
-      base::BindOnce(&InvokeHeadlessListenerHostForResultBlocking, "list_active",
-                     /*script_id=*/"", profile_path, scripts_dir,
-                     browser_program, /*wait_ms=*/0),
-      base::BindOnce(
-          [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb,
-             base::Value::List listeners, HeadlessHostCommandResult host_result) {
-            if (!self) {
-              return;
+        base::Value::Dict payload;
+        payload.Set("listeners", listeners.Clone());
+        base::Value::List headless_tabs;
+        base::flat_set<std::string> seen_tab_ids;
+        auto site_name_from_url = [](const std::string& raw_url) {
+          if (raw_url.empty()) {
+            return std::string("about:blank");
+          }
+          GURL gurl(raw_url);
+          if (gurl.is_valid()) {
+            if (!gurl.host().empty()) {
+              return std::string(gurl.host());
             }
-            if (const base::Value::Dict* active =
-                    host_result.response.FindDict("listeners")) {
-              for (auto it = active->begin(); it != active->end(); ++it) {
-                const std::string& id = it->first;
-                const base::Value& v = it->second;
-                if (!v.is_dict()) {
+            if (!gurl.spec().empty()) {
+              return gurl.spec();
+            }
+          }
+          return raw_url;
+        };
+        auto append_headless_tab = [&headless_tabs, &seen_tab_ids](
+                                       base::Value::Dict tab) {
+          const std::string tab_id = tab.FindString("tab_id")
+                                         ? *tab.FindString("tab_id")
+                                         : std::string();
+          if (tab_id.empty() || seen_tab_ids.contains(tab_id)) {
+            return;
+          }
+          seen_tab_ids.insert(tab_id);
+          headless_tabs.Append(std::move(tab));
+        };
+        for (const auto& item : listeners) {
+          const base::Value::Dict* d = item.GetIfDict();
+          if (!d) {
+            continue;
+          }
+          const std::string mode_kind =
+              d->FindString("mode_kind")
+                  ? *d->FindString("mode_kind")
+                  : (d->FindString("mode") ? *d->FindString("mode")
+                                           : std::string());
+          if (mode_kind != "headless") {
+            continue;
+          }
+          const std::string script_id =
+              d->FindString("script_id") ? *d->FindString("script_id")
+                                         : std::string();
+          if (script_id.empty()) {
+            continue;
+          }
+          const std::string current_url =
+              d->FindString("current_url") ? *d->FindString("current_url")
+                                           : std::string();
+          const std::string script_name =
+              d->FindString("script_name") ? *d->FindString("script_name")
+                                           : script_id;
+          const std::string site_name = site_name_from_url(current_url);
+          base::Value::Dict tab;
+          tab.Set("tab_id", "listener:" + script_id);
+          tab.Set("tabId", "listener:" + script_id);
+          tab.Set("owner_kind", "listener");
+          tab.Set("ownerKind", "listener");
+          tab.Set("owner_id", script_id);
+          tab.Set("ownerId", script_id);
+          tab.Set("label", script_name);
+          tab.Set("open_reason", "listener");
+          tab.Set("openReason", "listener");
+          tab.Set("current_url", current_url);
+          tab.Set("currentUrl", current_url);
+          tab.Set("site_name", site_name);
+          tab.Set("siteName", site_name);
+          tab.Set("closable", true);
+          tab.Set("close_action", "stop_listener");
+          tab.Set("closeAction", "stop_listener");
+          tab.Set("close_id", script_id);
+          tab.Set("closeId", script_id);
+          append_headless_tab(std::move(tab));
+        }
+        for (const auto& task :
+             dashboard::GetHeadlessInvestigateTaskSnapshots(self->profile_)) {
+          const std::string& task_id = task.task_id;
+          if (task_id.empty()) {
+            continue;
+          }
+          base::Value::Dict tab;
+          tab.Set("tab_id", "investigation:" + task_id);
+          tab.Set("tabId", "investigation:" + task_id);
+          tab.Set("owner_kind", "investigation");
+          tab.Set("ownerKind", "investigation");
+          tab.Set("owner_id", task_id);
+          tab.Set("ownerId", task_id);
+          tab.Set("label", task.display_label);
+          tab.Set("open_reason", task.open_reason);
+          tab.Set("openReason", task.open_reason);
+          tab.Set("current_url", task.current_url);
+          tab.Set("currentUrl", task.current_url);
+          tab.Set("site_name", site_name_from_url(task.current_url));
+          tab.Set("siteName", site_name_from_url(task.current_url));
+          tab.Set("closable", true);
+          tab.Set("close_action", "stop_headless_task");
+          tab.Set("closeAction", "stop_headless_task");
+          tab.Set("close_id", task_id);
+          tab.Set("closeId", task_id);
+          append_headless_tab(std::move(tab));
+        }
+        payload.Set("headless_tabs", headless_tabs.Clone());
+        payload.Set("headlessTabs", std::move(headless_tabs));
+        self->ResolveCallback(cb, payload);
+      };
+
+  if (auto* controller =
+          dashboard::HeadlessListenerController::GetForProfile(profile_)) {
+    // Inline merge+finish so BindOnce does not need to pass the local lambda.
+    controller->ListActive(base::BindOnce(
+        [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb,
+           base::Value::List background_listeners, bool ok,
+           base::Value::Dict response) {
+          base::Value::List listeners = std::move(background_listeners);
+          if (ok) {
+            if (const base::Value::List* remote =
+                    response.FindList("listeners")) {
+              for (const auto& entry : *remote) {
+                if (!entry.is_dict()) {
                   continue;
                 }
-                bool already_added = false;
-                for (const auto& item : listeners) {
-                  if (!item.is_dict()) {
-                    continue;
-                  }
-                  const base::Value::Dict& d = item.GetDict();
-                  if (d.FindString("script_id") &&
-                      *d.FindString("script_id") == id) {
-                    already_added = true;
-                    break;
-                  }
-                }
-                if (already_added) {
-                  continue;
-                }
-                const base::Value::Dict& entry = v.GetDict();
-                const base::Value::Dict script =
-                    self->dashboard_->LoadScript(id);
-                const std::string name = script.FindString("name")
-                                             ? *script.FindString("name")
-                                             : id;
-                base::Value::Dict d;
-                d.Set("script_id", id);
-                d.Set("scriptId", id);
-                d.Set("script_name", name);
-                d.Set("scriptName", name);
-                d.Set("is_active", true);
-                d.Set("isActive", true);
-                const int started_ms = entry.FindInt("started_ms").value_or(0);
-                if (started_ms > 0) {
-                  const base::Time started =
-                      base::Time::FromMillisecondsSinceUnixEpoch(started_ms);
-                  const std::string iso = base::TimeFormatAsIso8601(started);
-                  d.Set("started_at_iso", iso);
-                  d.Set("startedAtIso", iso);
-                }
-                d.Set("status", "listening");
-                d.Set("status_detail", "Headless listener active");
-                d.Set("running_kind", "headless");
+                base::Value::Dict d = entry.GetDict().Clone();
                 d.Set("mode", "headless");
                 d.Set("mode_kind", "headless");
                 d.Set("modeKind", "headless");
-                std::string headless_url;
-                if (const std::string* current =
-                        entry.FindString("current_url")) {
-                  headless_url = *current;
-                } else if (const std::string* start =
-                               entry.FindString("start_url")) {
-                  headless_url = *start;
+                if (const std::string* sid = d.FindString("script_id")) {
+                  d.Set("scriptId", *sid);
                 }
-                d.Set("current_url", headless_url);
-                d.Set("currentUrl", headless_url);
+                if (const std::string* name = d.FindString("script_name")) {
+                  d.Set("scriptName", *name);
+                }
+                if (const std::string* url = d.FindString("current_url")) {
+                  d.Set("currentUrl", *url);
+                }
                 listeners.Append(std::move(d));
               }
             }
+          }
+          if (!self) {
+            return;
+          }
+          base::Value::Dict payload;
+          payload.Set("listeners", listeners.Clone());
+          base::Value::List headless_tabs;
+          base::flat_set<std::string> seen_tab_ids;
+          auto site_name_from_url = [](const std::string& raw_url) {
+            if (raw_url.empty()) {
+              return std::string("about:blank");
+            }
+            GURL gurl(raw_url);
+            if (gurl.is_valid()) {
+              if (!gurl.host().empty()) {
+                return std::string(gurl.host());
+              }
+              if (!gurl.spec().empty()) {
+                return gurl.spec();
+              }
+            }
+            return raw_url;
+          };
+          auto append_headless_tab = [&headless_tabs, &seen_tab_ids](
+                                         base::Value::Dict tab) {
+            const std::string tab_id = tab.FindString("tab_id")
+                                           ? *tab.FindString("tab_id")
+                                           : std::string();
+            if (tab_id.empty() || seen_tab_ids.contains(tab_id)) {
+              return;
+            }
+            seen_tab_ids.insert(tab_id);
+            headless_tabs.Append(std::move(tab));
+          };
+          for (const auto& item : listeners) {
+            const base::Value::Dict* d = item.GetIfDict();
+            if (!d) {
+              continue;
+            }
+            const std::string mode_kind =
+                d->FindString("mode_kind")
+                    ? *d->FindString("mode_kind")
+                    : (d->FindString("mode") ? *d->FindString("mode")
+                                             : std::string());
+            if (mode_kind != "headless") {
+              continue;
+            }
+            const std::string script_id =
+                d->FindString("script_id") ? *d->FindString("script_id")
+                                           : std::string();
+            if (script_id.empty()) {
+              continue;
+            }
+            const std::string current_url =
+                d->FindString("current_url") ? *d->FindString("current_url")
+                                             : std::string();
+            const std::string script_name =
+                d->FindString("script_name") ? *d->FindString("script_name")
+                                             : script_id;
+            const std::string site_name = site_name_from_url(current_url);
+            base::Value::Dict tab;
+            tab.Set("tab_id", "listener:" + script_id);
+            tab.Set("tabId", "listener:" + script_id);
+            tab.Set("owner_kind", "listener");
+            tab.Set("ownerKind", "listener");
+            tab.Set("owner_id", script_id);
+            tab.Set("ownerId", script_id);
+            tab.Set("label", script_name);
+            tab.Set("open_reason", "listener");
+            tab.Set("openReason", "listener");
+            tab.Set("current_url", current_url);
+            tab.Set("currentUrl", current_url);
+            tab.Set("site_name", site_name);
+            tab.Set("siteName", site_name);
+            tab.Set("closable", true);
+            tab.Set("close_action", "stop_listener");
+            tab.Set("closeAction", "stop_listener");
+            tab.Set("close_id", script_id);
+            tab.Set("closeId", script_id);
+            append_headless_tab(std::move(tab));
+          }
+          for (const auto& task :
+               dashboard::GetHeadlessInvestigateTaskSnapshots(self->profile_)) {
+            const std::string& task_id = task.task_id;
+            if (task_id.empty()) {
+              continue;
+            }
+            base::Value::Dict tab;
+            tab.Set("tab_id", "investigation:" + task_id);
+            tab.Set("tabId", "investigation:" + task_id);
+            tab.Set("owner_kind", "investigation");
+            tab.Set("ownerKind", "investigation");
+            tab.Set("owner_id", task_id);
+            tab.Set("ownerId", task_id);
+            tab.Set("label", task.display_label);
+            tab.Set("open_reason", task.open_reason);
+            tab.Set("openReason", task.open_reason);
+            tab.Set("current_url", task.current_url);
+            tab.Set("currentUrl", task.current_url);
+            tab.Set("site_name", site_name_from_url(task.current_url));
+            tab.Set("siteName", site_name_from_url(task.current_url));
+            tab.Set("closable", true);
+            tab.Set("close_action", "stop_headless_task");
+            tab.Set("closeAction", "stop_headless_task");
+            tab.Set("close_id", task_id);
+            tab.Set("closeId", task_id);
+            append_headless_tab(std::move(tab));
+          }
+          payload.Set("headless_tabs", headless_tabs.Clone());
+          payload.Set("headlessTabs", std::move(headless_tabs));
+          self->ResolveCallback(cb, payload);
+        },
+        weak_ptr_factory_.GetWeakPtr(), cb, std::move(listeners)));
+    return;
+  }
 
-            for (const auto& [id, started_at] :
-                 self->headless_listener_started_at_) {
-              bool already_added = false;
-              for (const auto& item : listeners) {
-                if (!item.is_dict()) {
-                  continue;
-                }
-                const base::Value::Dict& existing = item.GetDict();
-                if (existing.FindString("script_id") &&
-                    *existing.FindString("script_id") == id) {
-                  already_added = true;
-                  break;
-                }
-              }
-              if (already_added) {
-                continue;
-              }
-
-              base::Value::Dict d;
-              const base::Value::Dict script = self->dashboard_->LoadScript(id);
-              const std::string name = script.FindString("name")
-                                           ? *script.FindString("name")
-                                           : id;
-              d.Set("script_id", id);
-              d.Set("scriptId", id);
-              d.Set("script_name", name);
-              d.Set("scriptName", name);
-              d.Set("is_active", true);
-              d.Set("isActive", true);
-              const std::string iso = base::TimeFormatAsIso8601(started_at);
-              d.Set("started_at_iso", iso);
-              d.Set("startedAtIso", iso);
-              d.Set("status", "listening");
-              d.Set("status_detail", "Headless listener active");
-              d.Set("running_kind", "headless");
-              d.Set("mode", "headless");
-              d.Set("mode_kind", "headless");
-              d.Set("modeKind", "headless");
-              d.Set("current_url", std::string());
-              d.Set("currentUrl", std::string());
-              listeners.Append(std::move(d));
-            }
-
-            base::Value::Dict payload;
-            payload.Set("listeners", std::move(listeners));
-            if (!host_result.ok && !host_result.error.empty()) {
-              payload.Set("headless_warning", host_result.error);
-            }
-            base::Value::List headless_tabs;
-            base::flat_set<std::string> seen_tab_ids;
-            auto site_name_from_url = [](const std::string& raw_url) {
-              if (raw_url.empty()) {
-                return std::string("about:blank");
-              }
-              GURL gurl(raw_url);
-              if (gurl.is_valid()) {
-                if (!gurl.host().empty()) {
-                  return std::string(gurl.host());
-                }
-                if (!gurl.spec().empty()) {
-                  return gurl.spec();
-                }
-              }
-              return raw_url;
-            };
-            auto append_headless_tab = [&headless_tabs, &seen_tab_ids](
-                                           base::Value::Dict tab) {
-              const std::string tab_id =
-                  tab.FindString("tab_id")
-                      ? *tab.FindString("tab_id")
-                      : std::string();
-              if (tab_id.empty() || seen_tab_ids.contains(tab_id)) {
-                return;
-              }
-              seen_tab_ids.insert(tab_id);
-              headless_tabs.Append(std::move(tab));
-            };
-            const base::Value::List* listeners_out =
-                payload.FindList("listeners");
-            if (listeners_out) {
-              bool has_headless = false;
-              for (const auto& item : *listeners_out) {
-                const base::Value::Dict* d = item.GetIfDict();
-                if (!d) {
-                  continue;
-                }
-                const std::string* running_kind =
-                    d->FindString("running_kind");
-                const std::string mode_kind =
-                    d->FindString("mode_kind")
-                        ? *d->FindString("mode_kind")
-                        : (d->FindString("mode")
-                               ? *d->FindString("mode")
-                               : std::string());
-                if ((running_kind && *running_kind == "headless") ||
-                    mode_kind == "headless") {
-                  has_headless = true;
-                  const std::string script_id =
-                      d->FindString("script_id")
-                          ? *d->FindString("script_id")
-                          : std::string();
-                  if (!script_id.empty()) {
-                    const std::string current_url =
-                        d->FindString("current_url")
-                            ? *d->FindString("current_url")
-                            : std::string();
-                    const std::string script_name =
-                        d->FindString("script_name")
-                            ? *d->FindString("script_name")
-                            : script_id;
-                    const std::string site_name =
-                        site_name_from_url(current_url);
-                    base::Value::Dict tab;
-                    tab.Set("tab_id", "listener:" + script_id);
-                    tab.Set("tabId", "listener:" + script_id);
-                    tab.Set("owner_kind", "listener");
-                    tab.Set("ownerKind", "listener");
-                    tab.Set("owner_id", script_id);
-                    tab.Set("ownerId", script_id);
-                    tab.Set("label", script_name);
-                    tab.Set("open_reason", "listener");
-                    tab.Set("openReason", "listener");
-                    tab.Set("current_url", current_url);
-                    tab.Set("currentUrl", current_url);
-                    tab.Set("site_name", site_name);
-                    tab.Set("siteName", site_name);
-                    tab.Set("closable", true);
-                    tab.Set("close_action", "stop_listener");
-                    tab.Set("closeAction", "stop_listener");
-                    tab.Set("close_id", script_id);
-                    tab.Set("closeId", script_id);
-                    append_headless_tab(std::move(tab));
-                  }
-                }
-              }
-              if (has_headless) {
-                EnsureHeadlessRelayEnabled(self->profile_);
-              }
-            }
-            for (const auto& task :
-                 dashboard::GetHeadlessInvestigateTaskSnapshots(
-                     self->profile_)) {
-              const std::string& task_id = task.task_id;
-              if (task_id.empty()) {
-                continue;
-              }
-              base::Value::Dict tab;
-              tab.Set("tab_id", "investigation:" + task_id);
-              tab.Set("tabId", "investigation:" + task_id);
-              tab.Set("owner_kind", "investigation");
-              tab.Set("ownerKind", "investigation");
-              tab.Set("owner_id", task_id);
-              tab.Set("ownerId", task_id);
-              tab.Set("label", task.display_label);
-              tab.Set("open_reason", task.open_reason);
-              tab.Set("openReason", task.open_reason);
-              tab.Set("current_url", task.current_url);
-              tab.Set("currentUrl", task.current_url);
-              tab.Set("site_name", site_name_from_url(task.current_url));
-              tab.Set("siteName", site_name_from_url(task.current_url));
-              tab.Set("closable", true);
-              tab.Set("close_action", "stop_headless_task");
-              tab.Set("closeAction", "stop_headless_task");
-              tab.Set("close_id", task_id);
-              tab.Set("closeId", task_id);
-              append_headless_tab(std::move(tab));
-            }
-            payload.Set("headless_tabs", std::move(headless_tabs));
-            self->ResolveCallback(cb, payload);
-          },
-          weak_ptr_factory_.GetWeakPtr(), cb, std::move(listeners)));
+  finish(weak_ptr_factory_.GetWeakPtr(), cb, std::move(listeners));
 }
 
 void DashboardUIMessageHandler::HandleRequestHeadlessScreenshot(
@@ -2936,140 +2063,80 @@ void DashboardUIMessageHandler::HandleRequestHeadlessScreenshot(
     return;
   }
 
-  if (base::FeatureList::IsEnabled(kDashboardNativeHeadlessListeners)) {
-    if (!listener_manager_) {
-      listener_manager_ =
-          std::make_unique<dashboard::ListenerManager>(profile_, dashboard_);
-    }
-    content::WebContents* wc =
-        listener_manager_->GetListenerWebContents(script_id);
-    if (!wc) {
-      base::Value::Dict res;
-      res.Set("script_id", script_id);
-      res.Set("scriptId", script_id);
-      res.Set("success", false);
-      res.Set("error", "Listener is not active.");
-      ResolveCallback(cb, res);
-      return;
-    }
-    content::RenderWidgetHostView* view = wc->GetRenderWidgetHostView();
-    if (!view || !view->IsSurfaceAvailableForCopy()) {
-      base::Value::Dict res;
-      res.Set("script_id", script_id);
-      res.Set("scriptId", script_id);
-      res.Set("success", false);
-      res.Set("error", "Listener surface unavailable for screenshot.");
-      ResolveCallback(cb, res);
-      return;
-    }
-    const std::string current_url = wc->GetLastCommittedURL().spec();
-    view->CopyFromSurface(
-        gfx::Rect(), gfx::Size(),
-        base::BindOnce(
-            [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb,
-               std::string script_id, std::string current_url,
-               const viz::CopyOutputBitmapWithMetadata& result) {
-              if (!self) {
-                return;
-              }
-              base::Value::Dict res;
-              res.Set("script_id", script_id);
-              res.Set("scriptId", script_id);
-              if (result.bitmap.drawsNothing()) {
-                res.Set("success", false);
-                res.Set("error", "Captured empty screenshot.");
-                self->ResolveCallback(cb, res);
-                return;
-              }
-              std::optional<std::vector<uint8_t>> png =
-                  gfx::PNGCodec::EncodeBGRASkBitmap(
-                      result.bitmap, /*discard_transparency=*/false);
-              if (!png || png->empty()) {
-                res.Set("success", false);
-                res.Set("error", "Failed to encode screenshot.");
-                self->ResolveCallback(cb, res);
-                return;
-              }
-              const std::string image_base64 =
-                  base::Base64Encode(base::span<const uint8_t>(*png));
-              if (image_base64.empty()) {
-                res.Set("success", false);
-                res.Set("error", "Failed to serialize screenshot.");
-                self->ResolveCallback(cb, res);
-                return;
-              }
-              res.Set("success", true);
-              res.Set("image_base64", image_base64);
-              res.Set("current_url", current_url);
-              res.Set("currentUrl", current_url);
-              const double ts_ms = static_cast<double>(
-                  base::Time::Now().InMillisecondsSinceUnixEpoch());
-              res.Set("ts_ms", ts_ms);
-              res.Set("tsMs", ts_ms);
-              self->ResolveCallback(cb, res);
-            },
-            weak_ptr_factory_.GetWeakPtr(), cb, script_id, current_url));
+  if (!listener_manager_) {
+    listener_manager_ =
+        std::make_unique<dashboard::ListenerManager>(profile_, dashboard_);
+  }
+  content::WebContents* wc =
+      listener_manager_->GetListenerWebContents(script_id);
+  if (!wc) {
+    base::Value::Dict res;
+    res.Set("script_id", script_id);
+    res.Set("scriptId", script_id);
+    res.Set("success", false);
+    res.Set("error",
+            "Listener is not active in this process. Isolated headless "
+            "screenshots over the control channel are not wired yet.");
+    ResolveCallback(cb, res);
     return;
   }
-
-  const base::FilePath profile_path = profile_->GetPath();
-  const base::FilePath scripts_dir = dashboard::ScriptStore::ScriptsDir(profile_);
-  const base::FilePath browser_program =
-      base::CommandLine::ForCurrentProcess()->GetProgram();
-  base::ThreadPool::PostTaskAndReplyWithResult(
-      FROM_HERE,
-      {base::MayBlock(), base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
-      base::BindOnce(&InvokeHeadlessListenerHostForResultBlocking,
-                     "capture_screenshot", script_id, profile_path, scripts_dir,
-                     browser_program, /*wait_ms=*/0),
+  content::RenderWidgetHostView* view = wc->GetRenderWidgetHostView();
+  if (!view || !view->IsSurfaceAvailableForCopy()) {
+    base::Value::Dict res;
+    res.Set("script_id", script_id);
+    res.Set("scriptId", script_id);
+    res.Set("success", false);
+    res.Set("error", "Listener surface unavailable for screenshot.");
+    ResolveCallback(cb, res);
+    return;
+  }
+  const std::string current_url = wc->GetLastCommittedURL().spec();
+  view->CopyFromSurface(
+      gfx::Rect(), gfx::Size(),
       base::BindOnce(
           [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb,
-             std::string script_id, HeadlessHostCommandResult host_result) {
+             std::string script_id, std::string current_url,
+             const viz::CopyOutputBitmapWithMetadata& result) {
             if (!self) {
               return;
             }
             base::Value::Dict res;
             res.Set("script_id", script_id);
             res.Set("scriptId", script_id);
-            res.Set("success", host_result.ok);
-            if (!host_result.ok) {
-              res.Set("error", host_result.error.empty()
-                                   ? "Failed to capture headless screenshot."
-                                   : host_result.error);
+            if (result.bitmap.drawsNothing()) {
+              res.Set("success", false);
+              res.Set("error", "Captured empty screenshot.");
               self->ResolveCallback(cb, res);
               return;
             }
-
-            const std::string* image_base64 =
-                host_result.response.FindString("image_base64");
-            if (image_base64 && !image_base64->empty()) {
-              res.Set("image_base64", *image_base64);
+            std::optional<std::vector<uint8_t>> png =
+                gfx::PNGCodec::EncodeBGRASkBitmap(
+                    result.bitmap, /*discard_transparency=*/false);
+            if (!png || png->empty()) {
+              res.Set("success", false);
+              res.Set("error", "Failed to encode screenshot.");
+              self->ResolveCallback(cb, res);
+              return;
             }
-            if (const std::string* path =
-                    host_result.response.FindString("path")) {
-              res.Set("path", *path);
+            const std::string image_base64 =
+                base::Base64Encode(base::span<const uint8_t>(*png));
+            if (image_base64.empty()) {
+              res.Set("success", false);
+              res.Set("error", "Failed to serialize screenshot.");
+              self->ResolveCallback(cb, res);
+              return;
             }
-            if (const std::string* current_url =
-                    host_result.response.FindString("current_url")) {
-              res.Set("current_url", *current_url);
-              res.Set("currentUrl", *current_url);
-            }
-            if (const std::string* detail =
-                    host_result.response.FindString("detail")) {
-              res.Set("detail", *detail);
-            }
-            if (auto ts_ms = host_result.response.FindInt("ts_ms")) {
-              res.Set("ts_ms", *ts_ms);
-              res.Set("tsMs", *ts_ms);
-            } else if (auto ts_ms_double =
-                           host_result.response.FindDouble("ts_ms")) {
-              res.Set("ts_ms", *ts_ms_double);
-              res.Set("tsMs", *ts_ms_double);
-            }
-
+            res.Set("success", true);
+            res.Set("image_base64", image_base64);
+            res.Set("current_url", current_url);
+            res.Set("currentUrl", current_url);
+            const double ts_ms = static_cast<double>(
+                base::Time::Now().InMillisecondsSinceUnixEpoch());
+            res.Set("ts_ms", ts_ms);
+            res.Set("tsMs", ts_ms);
             self->ResolveCallback(cb, res);
           },
-          weak_ptr_factory_.GetWeakPtr(), cb, script_id));
+          weak_ptr_factory_.GetWeakPtr(), cb, script_id, current_url));
 }
 
 void DashboardUIMessageHandler::HandleAgentInvestigatePage(

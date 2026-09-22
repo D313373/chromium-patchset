@@ -37,6 +37,12 @@ static_library("dashboard") {
     "failure_replay_recorder.h",
     "headless_investigation_service.cc",
     "headless_investigation_service.h",
+    "headless_listener_agent.cc",
+    "headless_listener_agent.h",
+    "headless_listener_controller.cc",
+    "headless_listener_controller.h",
+    "headless_listener_ipc.cc",
+    "headless_listener_ipc.h",
     "recording_suppression.cc",
     "recording_suppression.h",
 

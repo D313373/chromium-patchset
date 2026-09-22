@@ -20,6 +20,7 @@ namespace dashboard {
   class Dashboard;
   class AntiDetectionController;
   class ListenerManager;
+  class HeadlessListenerController;
 }
 class RecorderController;  // forward declaration
 
@@ -62,6 +63,7 @@ class DashboardUIMessageHandler : public content::WebUIMessageHandler {
   void HandleSaveScript(const base::Value::List& args);
   void HandleDeleteScript(const base::Value::List& args);
   void HandlePlayScript(const base::Value::List& args);
+  void HandleStopAllScripts(const base::Value::List& args);
   void HandleResumeScriptFromStep(const base::Value::List& args);
   void HandleSetDebugLogging(const base::Value::List& args);
   void HandleGetDebugLogging(const base::Value::List& args);
@@ -94,6 +96,11 @@ class DashboardUIMessageHandler : public content::WebUIMessageHandler {
   void HandleAgentScreenshot(const base::Value::List& args);
   void HandleAgentOllamaChat(const base::Value::List& args);
 
+ protected:
+  void ResolveCallback(const std::string& cb_fn, const base::Value& payload);
+  void ResolveCallback(const std::string& cb_fn, const base::Value::Dict& payload);
+  void ResolveCallback(const std::string& cb_fn, const base::Value::List& payload);
+
  private:
   // Continues HandleAgentOllamaChat after API-key resolution (hosted providers).
   void StartAgentOllamaChatRequest(std::string cb,
@@ -105,12 +112,16 @@ class DashboardUIMessageHandler : public content::WebUIMessageHandler {
                                    base::Value::List chat_messages,
                                    std::string api_key_name,
                                    std::string api_key);
-  // Utility to call back into JS with the given callback id and payload
-  void ResolveCallback(const std::string& cb_fn, const base::Value& payload);
-  void ResolveCallback(const std::string& cb_fn, const base::Value::Dict& payload);
-  void ResolveCallback(const std::string& cb_fn, const base::Value::List& payload);
 
   void OnGetScriptsLoaded(std::string cb, base::Value::Dict raw);
+
+  // Completes resume after run-history URL resolution (may be async off UI).
+  void FinishResumeScriptFromStep(std::string cb,
+                                  std::string id,
+                                  int step_index,
+                                  base::Value::List final_seq,
+                                  std::string run_history_url,
+                                  std::string timeline_context_url);
 
   // Background init helpers to avoid blocking the UI thread
   void OnInitializeDone(std::string cb, base::Value::Dict scripts);
@@ -149,6 +160,8 @@ class DashboardUIMessageHandler : public content::WebUIMessageHandler {
   std::unique_ptr<RecorderController> recorder_;
   std::unique_ptr<dashboard::AntiDetectionController> anti_detection_controller_;
   std::unique_ptr<dashboard::ListenerManager> listener_manager_;
+  std::unique_ptr<dashboard::HeadlessListenerController>
+      headless_listener_controller_;
   std::map<std::string, base::Time> headless_listener_started_at_;
 
   // Registry accessor for live handlers to broadcast to.

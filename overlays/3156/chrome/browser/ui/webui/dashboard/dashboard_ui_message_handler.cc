@@ -68,6 +68,7 @@
 #include "chrome/browser/ui/webui/dashboard/run_history_store.h"
 #include "chrome/browser/ui/webui/dashboard/script_schema.h"
 #include "chrome/browser/ui/webui/dashboard/script_store.h"
+#include "chrome/browser/ui/webui/dashboard/headless_listener_controller.h"
 #include "chrome/browser/ui/webui/dashboard/listener_manager.h"
 #include "content/public/browser/child_process_security_policy.h"
 #include "content/public/browser/web_ui.h"
@@ -115,6 +116,7 @@ constexpr char kMsgCreateNew[]                = "dashboardCreateNewScript";
 constexpr char kMsgSaveScript[]               = "dashboardSaveScript";
 constexpr char kMsgDeleteScript[]             = "dashboardDeleteScript";
 constexpr char kMsgPlayScript[]               = "dashboardPlayScript";
+constexpr char kMsgStopAllScripts[]           = "dashboardStopAllScripts";
 constexpr char kMsgResumeScriptFromStep[]     = "dashboardResumeScriptFromStep";
 constexpr char kMsgSetDebugLogging[]          = "dashboardSetDebugLogging";
 constexpr char kMsgGetDebugLogging[]          = "dashboardGetDebugLogging";
@@ -718,7 +720,7 @@ base::Value::Dict BuildDefaultScript() {
              "current executable action types and inline notes.");
 
   base::Value::Dict settings;
-  settings.Set("demoVersion", 4);
+  settings.Set("demoVersion", 6);
   settings.Set("startUrl", "https://the-internet.herokuapp.com/login");
   settings.Set("timeoutMs", 30000);
   settings.Set("headless", false);
@@ -920,14 +922,17 @@ base::Value::Dict BuildDefaultScript() {
         "SCRAPE_TABLE: Extract row data using row-relative column locators."));
   }
   {
+    // Same-tab click only. Do not click the site footer "Elemental Selenium"
+    // link — it uses target=_blank and opens elementalselenium.com in a new
+    // tab under trusted/native click injection.
     base::Value::Dict p;
     base::Value::List locs;
-    locs.Append(make_locator("LINK_TEXT", "Elemental Selenium"));
+    locs.Append(make_locator("LINK_TEXT", "edit"));
     p.Set("locators", std::move(locs));
     p.Set("clickCount", 1);
     context_actions.Append(make_action(
         "click", std::move(p),
-        "CLICK: Trigger navigation by link text."));
+        "CLICK: Same-tab link text (tables page edit link uses href=#edit)."));
   }
   {
     base::Value::Dict p;
@@ -936,7 +941,10 @@ base::Value::Dict BuildDefaultScript() {
     p.Set("locators", std::move(locs));
     p.Set("condition", "visible");
     p.Set("timeout_ms", 1000);
-    p.Set("onMatchScriptId", "welcome_demo");
+    // In a normal Play this is one-shot (wait → optional onMatch once → done).
+    // Persistent rearm only happens when kind=listener is started as a listener.
+    // Leave onMatch empty in the stock demo; users can set it for one-shot runs.
+    p.Set("onMatchScriptId", "");
     p.Set("autoRefresh", false);
     p.Set("executionFrequencyMs", 60000);
     p.Set("sampleIntervalMs", 5000);
@@ -945,7 +953,8 @@ base::Value::Dict BuildDefaultScript() {
     p.Set("extremeEvasion", false);
     context_actions.Append(make_action(
         "listen", std::move(p),
-        "LISTEN: Example listener config shape (typically used in listener scripts)."));
+        "LISTEN: Example listener config shape (onMatch applies only when "
+        "this script is started as a listener, not during a normal Play)."));
   }
 
   base::Value::Dict context;
@@ -979,8 +988,11 @@ void EnsureDefaultScript(const Profile* profile) {
             settings ? settings->FindInt("demoVersion") : std::nullopt;
         const bool needs_upgrade =
             (name && *name == "Welcome to Automation Studio") ||
-            !demo_version.has_value() || *demo_version < 4 ||
-            ScriptHasInvalidActions(existing);
+            ScriptHasInvalidActions(existing) ||
+            // Only force demoVersion upgrades on the stock untitled name so
+            // customized copies (e.g. typo-test) keep user edits.
+            (name && *name == "Welcome to Simulachrome" &&
+             (!demo_version.has_value() || *demo_version < 6));
         if (needs_upgrade) {
           base::Value::Dict def = BuildDefaultScript();
           if (!WriteScriptToDisk(profile, "welcome_demo", def)) {
@@ -1240,6 +1252,10 @@ void DashboardUIMessageHandler::RegisterMessages() {
   web_ui()->RegisterMessageCallback(
       kMsgPlayScript,
       base::BindRepeating(&DashboardUIMessageHandler::HandlePlayScript,
+                          base::Unretained(this)));
+  web_ui()->RegisterMessageCallback(
+      kMsgStopAllScripts,
+      base::BindRepeating(&DashboardUIMessageHandler::HandleStopAllScripts,
                           base::Unretained(this)));
   web_ui()->RegisterMessageCallback(
       kMsgResumeScriptFromStep,
@@ -2372,38 +2388,91 @@ void DashboardUIMessageHandler::HandleResumeScriptFromStep(
 
   std::string resume_url;
   auto extract_url_for_step = [&](const base::Value::List* steps) {
-    if (!steps)
-      return;
-    for (const auto& it : *steps) {
-      const base::Value::Dict* sd = it.GetIfDict();
-      if (!sd)
-        continue;
-      std::optional<int> si = sd->FindInt("stepIndex");
-      if (!si || *si != step_index)
-        continue;
-      if (const std::string* u = sd->FindString("url_before"))
-        resume_url = *u;
-      if (resume_url.empty()) {
-        if (const std::string* u = sd->FindString("context_url"))
-          resume_url = *u;
-      }
-      if (resume_url.empty()) {
-        if (const std::string* u = sd->FindString("url_after"))
-          resume_url = *u;
-      }
-      break;
+    if (resume_url.empty()) {
+      resume_url =
+          dashboard::ScriptSchema::ExtractRunHistoryStepUrl(steps, step_index);
     }
   };
 
-  if (!run_id.empty()) {
-    base::Value::Dict detail;
-    if (dashboard::RunHistoryStore::ReadRunDetail(profile_, run_id, &detail)) {
-      extract_url_for_step(detail.FindList("steps"));
-    }
+  // Prefer an already-loaded last_run (in-memory) before optional disk detail.
+  if (const base::Value::Dict* last_run = script.FindDict("last_run")) {
+    extract_url_for_step(last_run->FindList("steps"));
   }
+
+  const std::string timeline_context_url =
+      dashboard::ScriptSchema::ResolveResumeNavigationUrl(final_seq, step_index);
+
+  if (!run_id.empty()) {
+    // Disk read — never on the UI thread.
+    base::ThreadPool::PostTaskAndReplyWithResult(
+        FROM_HERE,
+        {base::MayBlock(), base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
+        base::BindOnce(
+            [](Profile* profile, std::string run_id,
+               int step_index) -> std::string {
+              base::Value::Dict detail;
+              if (!dashboard::RunHistoryStore::ReadRunDetail(profile, run_id,
+                                                             &detail)) {
+                return std::string();
+              }
+              return dashboard::ScriptSchema::ExtractRunHistoryStepUrl(
+                  detail.FindList("steps"), step_index);
+            },
+            base::Unretained(profile_), run_id, step_index),
+        base::BindOnce(
+            [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb,
+               std::string id, int step_index, base::Value::List final_seq,
+               std::string in_memory_history_url,
+               std::string timeline_context_url,
+               std::string disk_history_url) {
+              if (!self) {
+                return;
+              }
+              std::string run_history_url = disk_history_url;
+              if (run_history_url.empty()) {
+                run_history_url = in_memory_history_url;
+              }
+              self->FinishResumeScriptFromStep(
+                  std::move(cb), std::move(id), step_index, std::move(final_seq),
+                  std::move(run_history_url), std::move(timeline_context_url));
+            },
+            weak_ptr_factory_.GetWeakPtr(), cb, id, step_index,
+            std::move(final_seq), resume_url, timeline_context_url));
+    return;
+  }
+
+  FinishResumeScriptFromStep(std::move(cb), std::move(id), step_index,
+                             std::move(final_seq), std::move(resume_url),
+                             timeline_context_url);
+}
+
+void DashboardUIMessageHandler::FinishResumeScriptFromStep(
+    std::string cb,
+    std::string id,
+    int step_index,
+    base::Value::List final_seq,
+    std::string run_history_url,
+    std::string timeline_context_url) {
+  base::Value::Dict out;
+  // Preference: run-history URL > timeline contextUrl. Never start blank when
+  // either source has a real URL. Do NOT rewrite the script's contextUrl here
+  // on failure — only successful executions update it.
+  std::string resume_url = run_history_url;
   if (resume_url.empty()) {
-    if (const base::Value::Dict* last_run = script.FindDict("last_run"))
-      extract_url_for_step(last_run->FindList("steps"));
+    resume_url = timeline_context_url;
+  }
+  const bool context_url_mismatch =
+      !run_history_url.empty() && !timeline_context_url.empty() &&
+      !dashboard::ScriptSchema::ContextUrlsEquivalent(run_history_url,
+                                                      timeline_context_url);
+  if (context_url_mismatch) {
+    LOG(WARNING) << "[Dashboard] Resume URL mismatch script=" << id
+                 << " step=" << step_index << " run_history=" << run_history_url
+                 << " contextUrl=" << timeline_context_url
+                 << " (navigating to run history; leaving contextUrl)";
+    out.Set("context_url_mismatch", true);
+    out.Set("run_history_url", run_history_url);
+    out.Set("timeline_context_url", timeline_context_url);
   }
 
   content::WebContents* target_wc = nullptr;
@@ -2435,6 +2504,9 @@ void DashboardUIMessageHandler::HandleResumeScriptFromStep(
 
   out.Set("success", !execution_id.empty());
   out.Set("runId", execution_id);
+  if (!resume_url.empty()) {
+    out.Set("resume_url", resume_url);
+  }
   if (execution_id.empty()) {
     out.Set("error", "Failed to start resumed script run.");
   }
