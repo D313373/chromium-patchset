@@ -2,7 +2,11 @@
 
 Chromium integration patches for [Simulachrome](https://github.com/D313373/Simulachrome).
 
-**Demo:** [`docs/media/simulachrome_demo.mp4`](docs/media/simulachrome_demo.mp4): the agent signing in and filing a support request with Data-tab tokens, saving the run as a script, then replaying it from the dashboard with zero model calls.
+## Demo
+
+[![Simulachrome demo: click to play](docs/media/simulachrome_demo_poster.jpg)](docs/media/simulachrome_demo.mp4)
+
+The agent signs in and files a support request using Data-tab tokens, saves the run as a script, then the dashboard replays it with zero model calls (2 min 12 s, narrated).
 
 **Prebuilt macOS (Intel) binary:** see [Releases](https://github.com/D313373/chromium-patchset/releases).
 
