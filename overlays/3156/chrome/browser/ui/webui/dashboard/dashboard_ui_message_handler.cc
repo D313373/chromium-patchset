@@ -1190,6 +1190,10 @@ DashboardUIMessageHandler::~DashboardUIMessageHandler() {
     vec.erase(it);
 }
 
+void DashboardUIMessageHandler::DetachDashboard() {
+  dashboard_ = nullptr;
+}
+
 // ----------------------------------------------------------------------
 // HandleToggleRecording
 // ----------------------------------------------------------------------
@@ -1370,6 +1374,22 @@ void DashboardUIMessageHandler::RegisterMessages() {
   
   // Agent action aliases used by dashboard_app.js
   web_ui()->RegisterMessageCallback(
+      "dashboardAgentOpenTab",
+      base::BindRepeating(&DashboardUIMessageHandler::HandleAgentOpenTab,
+                          base::Unretained(this)));
+  web_ui()->RegisterMessageCallback(
+      "dashboardAgentAttachPanel",
+      base::BindRepeating(&DashboardUIMessageHandler::HandleAgentAttachPanel,
+                          base::Unretained(this)));
+  web_ui()->RegisterMessageCallback(
+      "dashboardAgentDetachPanel",
+      base::BindRepeating(&DashboardUIMessageHandler::HandleAgentDetachPanel,
+                          base::Unretained(this)));
+  web_ui()->RegisterMessageCallback(
+      "dashboardAgentGetPanelState",
+      base::BindRepeating(&DashboardUIMessageHandler::HandleAgentGetPanelState,
+                          base::Unretained(this)));
+  web_ui()->RegisterMessageCallback(
       "dashboardAgentCallAction",
       base::BindRepeating(&DashboardUIMessageHandler::HandleAgentCallAction,
                           base::Unretained(this)));
@@ -1404,6 +1424,22 @@ void DashboardUIMessageHandler::RegisterMessages() {
       base::BindRepeating(
           &DashboardUIMessageHandler::HandleAgentGetActivePageInfo,
           base::Unretained(this)));
+  web_ui()->RegisterMessageCallback(
+      "dashboardAgentListTabs",
+      base::BindRepeating(&DashboardUIMessageHandler::HandleAgentListTabs,
+                          base::Unretained(this)));
+  web_ui()->RegisterMessageCallback(
+      "dashboardAgentActivateTab",
+      base::BindRepeating(&DashboardUIMessageHandler::HandleAgentActivateTab,
+                          base::Unretained(this)));
+  web_ui()->RegisterMessageCallback(
+      "dashboardAgentGetPageContext",
+      base::BindRepeating(&DashboardUIMessageHandler::HandleAgentGetPageContext,
+                          base::Unretained(this)));
+  web_ui()->RegisterMessageCallback(
+      "dashboardAgentSaveScript",
+      base::BindRepeating(&DashboardUIMessageHandler::HandleAgentSaveScript,
+                          base::Unretained(this)));
   web_ui()->RegisterMessageCallback(
       "dashboardAgentOllamaChat",
       base::BindRepeating(&DashboardUIMessageHandler::HandleAgentOllamaChat,

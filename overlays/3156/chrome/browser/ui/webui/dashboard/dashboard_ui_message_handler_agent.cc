@@ -21,11 +21,18 @@
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_split.h"
 #include "base/strings/string_util.h"
+#include "base/strings/stringprintf.h"
 #include "base/strings/utf_string_conversions.h"
+#include "base/task/sequenced_task_runner.h"
 #include "base/task/thread_pool.h"
 #include "base/time/time.h"
+#include "base/uuid.h"
 #include "chrome/browser/profiles/profile.h"
+#include "chrome/browser/glic/public/glic_enabling.h"
+#include "chrome/browser/glic/public/glic_keyed_service.h"
+#include "chrome/browser/glic/widget/glic_window_controller_impl.h"
 #include "chrome/browser/ui/webui/dashboard/dashboard_global_settings.h"
+#include "chrome/browser/ui/webui/dashboard/native_run_activation.h"
 #include "components/os_crypt/sync/os_crypt.h"
 #include "content/public/browser/storage_partition.h"
 #include "net/base/net_errors.h"
@@ -36,6 +43,7 @@
 #include "chrome/browser/ui/browser.h"
 #include "chrome/browser/ui/browser_finder.h"
 #include "chrome/browser/ui/browser_list.h"
+#include "chrome/browser/ui/browser_window.h"
 #include "chrome/browser/ui/browser_navigator.h"
 #include "chrome/browser/ui/browser_navigator_params.h"
 #include "chrome/browser/ui/tabs/tab_strip_model.h"
@@ -43,11 +51,20 @@
 #include "chrome/browser/ui/webui/dashboard/recorder_controller.h"
 #include "chrome/browser/ui/webui/dashboard/script_execution_service.h"
 #include "chrome/browser/ui/webui/dashboard/script_execution_service_factory.h"
+#include "chrome/browser/ui/webui/dashboard/script_schema.h"
 #include "chrome/browser/ui/webui/dashboard/script_store.h"
 #include "components/sessions/content/session_tab_helper.h"
+#include "components/viz/common/frame_sinks/copy_output_result.h"
 #include "content/public/browser/navigation_controller.h"
 #include "content/public/browser/reload_type.h"
+#include "content/public/browser/render_frame_host.h"
+#include "content/public/common/isolated_world_ids.h"
+#include "content/public/browser/render_widget_host_view.h"
 #include "content/public/browser/web_contents.h"
+#include "base/strings/strcat.h"
+#include "ui/gfx/codec/png_codec.h"
+#include "ui/gfx/geometry/rect.h"
+#include "ui/gfx/geometry/size.h"
 #include "url/gurl.h"
 
 namespace {
@@ -271,6 +288,105 @@ content::WebContents* FindWebContentsForTabId(Profile* profile, int tab_id) {
   return nullptr;
 }
 
+bool LooksLikeOauthLoginUrl(const GURL& url) {
+  if (!url.is_valid()) {
+    return false;
+  }
+  const std::string host = base::ToLowerASCII(url.host());
+  static constexpr std::string_view kExactHosts[] = {
+      "accounts.google.com", "accounts.youtube.com", "appleid.apple.com",
+      "idmsa.apple.com",     "login.microsoftonline.com",
+      "login.live.com",      "login.yahoo.com",
+      "facebook.com",        "www.facebook.com",
+      "m.facebook.com",      "twitter.com",
+      "api.twitter.com",     "x.com",
+  };
+  for (std::string_view known : kExactHosts) {
+    if (host == known) {
+      return true;
+    }
+  }
+  if (base::EndsWith(host, ".google.com") &&
+      (host.find("accounts") != std::string::npos ||
+       host.find("oauth") != std::string::npos)) {
+    return true;
+  }
+  const std::string path = base::ToLowerASCII(url.path());
+  return path.find("/o/oauth2") != std::string::npos ||
+         path.find("/oauth2") != std::string::npos ||
+         path.find("/signin/oauth") != std::string::npos;
+}
+
+void ActivateWebContentsWindow(content::WebContents* wc) {
+  if (!wc) {
+    return;
+  }
+  Browser* browser = chrome::FindBrowserWithTab(wc);
+  if (!browser) {
+    return;
+  }
+  // OAuth popups can exist before BrowserView/widget is ready. Activating
+  // then also makes the popup last-active and used to re-dock Glic onto a
+  // window with no side-panel entry (CHECK in SidePanelUIBase::Show).
+  if (BrowserView* view = BrowserView::GetBrowserViewForBrowser(browser)) {
+    if (!view->GetWidget()) {
+      return;
+    }
+  } else if (browser->is_type_popup() || browser->is_type_app_popup()) {
+    return;
+  }
+  dashboard::ActivateWebContentsForNativeScriptRun(wc);
+}
+
+base::Value::List BuildAgentTabList(Profile* profile) {
+  base::Value::List tabs;
+  if (!profile) {
+    return tabs;
+  }
+  for (Browser* browser : *BrowserList::GetInstance()) {
+    if (!browser || browser->profile() != profile) {
+      continue;
+    }
+    TabStripModel* strip = browser->tab_strip_model();
+    if (!strip) {
+      continue;
+    }
+    const bool popup =
+        browser->is_type_popup() || browser->is_type_app_popup();
+    const bool window_active =
+        browser->window() && browser->window()->IsActive();
+    const int window_id = browser->session_id().id();
+    for (int i = 0; i < strip->count(); ++i) {
+      content::WebContents* wc = strip->GetWebContentsAt(i);
+      if (!wc) {
+        continue;
+      }
+      const int tab_id = sessions::SessionTabHelper::IdForTab(wc).id();
+      if (tab_id <= 0) {
+        continue;
+      }
+      const GURL& visible = wc->GetVisibleURL().is_empty()
+                                ? wc->GetLastCommittedURL()
+                                : wc->GetVisibleURL();
+      if (IsDashboardOrInternalToolingUrl(visible)) {
+        continue;
+      }
+      base::Value::Dict tab;
+      tab.Set("tabId", tab_id);
+      tab.Set("tab_id", tab_id);
+      tab.Set("windowId", window_id);
+      tab.Set("url", visible.spec());
+      tab.Set("title", base::UTF16ToUTF8(wc->GetTitle()));
+      tab.Set("isActiveInWindow", i == strip->active_index());
+      tab.Set("isWindowActive", window_active);
+      tab.Set("isPopup", popup);
+      tab.Set("isOauth", LooksLikeOauthLoginUrl(visible));
+      tabs.Append(std::move(tab));
+    }
+  }
+  return tabs;
+}
+
 
 // Convert OpenAI-style multimodal content (string or list with image_url) into
 // Anthropic Messages API content blocks (text + base64 image).
@@ -380,6 +496,704 @@ base::Value::List BuildAnthropicContentParts(const base::Value& content_value) {
 
 }  // namespace
 
+namespace {
+
+// Agent screenshots must stay in the same DIP space as SetPositionInWidget.
+// Never downscale the copy: a 1280-wide bitmap of a ~1440–1920 DIP view plus
+// the guest's old 2x-retina guess mapped every click into the top-left
+// quadrant. Callback is (png_b64, bitmap_w, bitmap_h, css_w, css_h, error).
+void CaptureWebContentsPngWithRetry(
+    base::WeakPtr<content::WebContents> web_contents,
+    int attempts_left,
+    base::OnceCallback<void(std::string, int, int, int, int, std::string)>
+        done) {
+  content::WebContents* wc = web_contents.get();
+  if (!wc) {
+    std::move(done).Run(std::string(), 0, 0, 0, 0, "tab closed");
+    return;
+  }
+  content::RenderWidgetHostView* view = wc->GetRenderWidgetHostView();
+  const bool surface_ready = view && view->IsSurfaceAvailableForCopy();
+  if (!view || (!surface_ready && attempts_left > 3)) {
+    if (attempts_left <= 0) {
+      std::move(done).Run(std::string(), 0, 0, 0, 0,
+                          view ? "surface unavailable" : "no render view");
+      return;
+    }
+    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
+        FROM_HERE,
+        base::BindOnce(&CaptureWebContentsPngWithRetry, web_contents,
+                       attempts_left - 1, std::move(done)),
+        base::Milliseconds(250));
+    return;
+  }
+  const gfx::Size view_dip = view->GetViewBounds().size();
+  gfx::Size output = view_dip;
+  if (output.IsEmpty()) {
+    std::move(done).Run(std::string(), 0, 0, 0, 0, "empty view bounds");
+    return;
+  }
+  view->CopyFromSurface(
+      gfx::Rect(), output,
+      base::BindOnce(
+          [](base::WeakPtr<content::WebContents> retry_wc, int attempts_left,
+             gfx::Size view_dip,
+             base::OnceCallback<void(std::string, int, int, int, int,
+                                     std::string)> inner,
+             const viz::CopyOutputBitmapWithMetadata& result) {
+            if (result.bitmap.drawsNothing()) {
+              if (attempts_left > 0) {
+                base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
+                    FROM_HERE,
+                    base::BindOnce(&CaptureWebContentsPngWithRetry, retry_wc,
+                                   attempts_left - 1, std::move(inner)),
+                    base::Milliseconds(250));
+                return;
+              }
+              std::move(inner).Run(std::string(), 0, 0, view_dip.width(),
+                                   view_dip.height(), "empty bitmap");
+              return;
+            }
+            std::optional<std::vector<uint8_t>> png =
+                gfx::PNGCodec::EncodeBGRASkBitmap(
+                    result.bitmap, /*discard_transparency=*/false);
+            if (!png) {
+              std::move(inner).Run(std::string(), 0, 0, view_dip.width(),
+                                   view_dip.height(), "png encode failed");
+              return;
+            }
+            std::move(inner).Run(base::Base64Encode(*png), result.bitmap.width(),
+                                 result.bitmap.height(), view_dip.width(),
+                                 view_dip.height(), std::string());
+          },
+          web_contents, attempts_left, view_dip, std::move(done)));
+}
+
+constexpr char kScrapeAgentPageContextScript[] = R"js(
+(() => {
+  const vw = window.innerWidth || 1;
+  const vh = window.innerHeight || 1;
+  const cssEscape = (value) => {
+    try {
+      if (window.CSS && CSS.escape) {
+        return CSS.escape(value);
+      }
+    } catch (e) {}
+    return String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+  };
+  const clsOf = (el) =>
+      (typeof el.className === 'string' ? el.className : '').toLowerCase();
+  const idOf = (el) => ((el.id || '') + '').toLowerCase();
+  const roleOf = (el) =>
+      ((el.getAttribute && el.getAttribute('role')) || '').toLowerCase();
+  const overlayBlob = (el) => roleOf(el) + ' ' + clsOf(el) + ' ' + idOf(el);
+  const looksStrongOverlayName = (el) =>
+      /(dialog|alertdialog|modal|popup|popover|overlay|drawer|sheet)/.test(
+          overlayBlob(el));
+  const looksWeakOverlayName = (el) =>
+      /(store|banner|toast|cookie|consent)/.test(overlayBlob(el));
+  const isLaidOut = (el) => {
+    if (!el || !el.getBoundingClientRect) {
+      return false;
+    }
+    try {
+      if (window.getComputedStyle(el).display === 'none') {
+        return false;
+      }
+    } catch (e) {
+      return false;
+    }
+    return true;
+  };
+  const rectOf = (el) => {
+    const r = el.getBoundingClientRect();
+    return {
+      x: r.x, y: r.y, w: r.width, h: r.height,
+      area: r.width * r.height
+    };
+  };
+  const hasHitBox = (r) => r.w >= 2 && r.h >= 2;
+  const inViewport = (r) =>
+      r.x < vw + 8 && r.y < vh + 8 && (r.x + r.w) > -8 && (r.y + r.h) > -8;
+  const isOffscreenBait = (r) =>
+      (r.x + r.w) < -80 || (r.y + r.h) < -80 || r.x > vw + 80 || r.y > vh + 80;
+  const labelFor = (el) => {
+    if (!el) {
+      return null;
+    }
+    if (el.labels && el.labels[0]) {
+      return el.labels[0];
+    }
+    if (el.id) {
+      try {
+        return document.querySelector('label[for="' + cssEscape(el.id) + '"]');
+      } catch (e) {
+        return document.querySelector('label[for="' + el.id + '"]');
+      }
+    }
+    return el.closest ? el.closest('label') : null;
+  };
+  const overlayRoots = [];
+  const rememberRoot = (n) => {
+    if (!n || overlayRoots.indexOf(n) >= 0) {
+      return;
+    }
+    const strong = looksStrongOverlayName(n) || roleOf(n) === 'dialog' ||
+                   roleOf(n) === 'alertdialog' ||
+                   (n.getAttribute && n.getAttribute('aria-modal') === 'true');
+    if (!isLaidOut(n)) {
+      if (strong) {
+        overlayRoots.push(n);
+      }
+      return;
+    }
+    const r = rectOf(n);
+    let st = null;
+    try {
+      st = window.getComputedStyle(n);
+    } catch (e) {}
+    const z = st ? parseInt(st.zIndex, 10) : 0;
+    const pos = st ? st.position : '';
+    const layered = (pos === 'fixed' || pos === 'absolute') &&
+                    ((z || 0) >= 1 || strong);
+    const covering = r.w * r.h > vw * vh * 0.18;
+    if (r.w < 8 && r.h < 8) {
+      if (strong) {
+        overlayRoots.push(n);
+      }
+      return;
+    }
+    if (strong || covering || (layered && looksWeakOverlayName(n)) ||
+        (looksWeakOverlayName(n) && r.w > 200 && r.h > 200)) {
+      overlayRoots.push(n);
+    }
+  };
+  document.querySelectorAll(
+      '[role="dialog"],[role="alertdialog"],[aria-modal="true"],' +
+      '[class*="modal"],[class*="dialog"],[class*="popup"],[class*="popover"],' +
+      '[class*="overlay"],[class*="drawer"],[class*="store"],[class*="sheet"],' +
+      '[class*="banner"],[class*="toast"],[class*="cookie"]')
+      .forEach(rememberRoot);
+  const scanLayered = (root, depth) => {
+    if (!root || !root.children || depth > 3) {
+      return;
+    }
+    Array.from(root.children).forEach((n) => {
+      const st = window.getComputedStyle(n);
+      if (st.display === 'none') {
+        scanLayered(n, depth + 1);
+        return;
+      }
+      const z = parseInt(st.zIndex, 10);
+      const pos = st.position;
+      const r = rectOf(n);
+      if ((pos === 'fixed' || pos === 'absolute' || pos === 'sticky') &&
+          ((z || 0) >= 2 || looksStrongOverlayName(n) ||
+           looksWeakOverlayName(n)) &&
+          inViewport(r) && (r.w > 40 || r.h > 40)) {
+        rememberRoot(n);
+      }
+      scanLayered(n, depth + 1);
+    });
+  };
+  if (document.body) {
+    scanLayered(document.body, 0);
+  }
+  const inOverlay = (el) => {
+    let n = el;
+    while (n && n !== document.body) {
+      if (overlayRoots.indexOf(n) >= 0 || looksStrongOverlayName(n) ||
+          roleOf(n) === 'tablist') {
+        return true;
+      }
+      if (n.getAttribute && n.getAttribute('aria-modal') === 'true') {
+        return true;
+      }
+      n = n.parentElement;
+    }
+    return false;
+  };
+  const siblingHit = (el) => {
+    const p = el && el.parentElement;
+    if (!p) {
+      return null;
+    }
+    const kids = Array.from(p.children);
+    for (let i = 0; i < kids.length; i++) {
+      const sib = kids[i];
+      if (sib === el || !isLaidOut(sib)) {
+        continue;
+      }
+      const r = rectOf(sib);
+      if (!hasHitBox(r) || r.w > vw * 0.7 || r.h > vh * 0.7) {
+        continue;
+      }
+      if (String(sib.innerText || '').trim().length >= 1) {
+        return sib;
+      }
+    }
+    return null;
+  };
+  const hitTarget = (el) => {
+    if (!el) {
+      return null;
+    }
+    if (isLaidOut(el) && hasHitBox(rectOf(el))) {
+      return el;
+    }
+    const lab = labelFor(el);
+    if (lab && isLaidOut(lab) && hasHitBox(rectOf(lab))) {
+      return lab;
+    }
+    const sib = siblingHit(el);
+    if (sib) {
+      return sib;
+    }
+    let n = el.parentElement;
+    for (let i = 0; i < 4 && n && n !== document.body; i++) {
+      if (isLaidOut(n) && hasHitBox(rectOf(n))) {
+        const r = rectOf(n);
+        if (r.w < vw * 0.96 && r.h < vh * 0.96) {
+          return n;
+        }
+      }
+      n = n.parentElement;
+    }
+    return null;
+  };
+  const oauthClassOf = (el) => {
+    if (!el) {
+      return '';
+    }
+    const hit = clsOf(el).trim().split(/\s+/).find(
+        (c) => /^(google-btn|apple-btn|facebook-btn|gsi-material-button)$/i
+                   .test(c) ||
+               /(google-btn|apple-btn|facebook-btn)/i.test(c));
+    return hit || '';
+  };
+  const looksOauthHost = (el) => {
+    if (!el) {
+      return false;
+    }
+    if (oauthClassOf(el)) {
+      return true;
+    }
+    const tag = ((el.tagName || '') + '').toLowerCase();
+    return /google-auth|apple-auth|facebook-auth/.test(tag);
+  };
+  const oauthHost = (el) => {
+    let n = el;
+    let found = null;
+    for (let i = 0; i < 6 && n && n !== document.body; i++) {
+      if (looksOauthHost(n)) {
+        if (oauthClassOf(n)) {
+          return n;
+        }
+        found = found || n;
+      }
+      n = n.parentElement;
+    }
+    return found;
+  };
+  const selector = [
+    'a[href]', 'button', 'input', 'select', 'textarea', 'label',
+    '[role="button"]', '[role="link"]', '[role="textbox"]',
+    '[role="checkbox"]', '[role="radio"]', '[role="tab"]',
+    '[role="menuitem"]', '[contenteditable="true"]',
+    '[class*="store-tab"]', '[class*="tab-option"]', '[id*="store_tab"]',
+    '[class*="close"]', '[aria-label*="close" i]', '[aria-label*="dismiss" i]',
+    '[class*="google-btn"]', '[class*="apple-btn"]', '[class*="facebook-btn"]',
+    'app-google-auth-button', 'app-apple-auth-button', 'app-facebook-auth-button'
+  ].join(',');
+  const raw = Array.from(document.querySelectorAll(selector));
+  const candidates = [];
+  const seenTarget = new Set();
+  for (const el of raw) {
+    if (!isLaidOut(el) && !labelFor(el)) {
+      continue;
+    }
+    const type = ((el.getAttribute && el.getAttribute('type')) || '').toLowerCase();
+    if (type === 'hidden') {
+      continue;
+    }
+    let target = hitTarget(el);
+    const host = oauthHost(el) || oauthHost(target);
+    if (host) {
+      const hostBtn = host.querySelector &&
+                      host.querySelector('button, [role="button"], a[href]');
+      if (hostBtn && isLaidOut(hostBtn) && hasHitBox(rectOf(hostBtn))) {
+        target = hostBtn;
+      } else if (isLaidOut(host) && hasHitBox(rectOf(host))) {
+        target = host;
+      }
+    }
+    if (!target || seenTarget.has(target)) {
+      continue;
+    }
+    const r = rectOf(target);
+    if (!hasHitBox(r) || isOffscreenBait(r)) {
+      continue;
+    }
+    if (r.w < 8 && r.h < 8 &&
+        String(target.innerText || '').trim().length < 2) {
+      continue;
+    }
+    seenTarget.add(target);
+    const text = String(
+        target.innerText || el.getAttribute('aria-label') ||
+        target.getAttribute('aria-label') ||
+        el.getAttribute('placeholder') || el.getAttribute('value') ||
+        el.getAttribute('name') || '').trim().replace(/\s+/g, ' ').slice(0, 160);
+    let css = '';
+    let cssClass = oauthClassOf(host) || oauthClassOf(el) || oauthClassOf(target);
+    if (!cssClass) {
+      let n = host || target || el;
+      for (let i = 0; i < 6 && n && n !== document.body && !cssClass; i++) {
+        cssClass = oauthClassOf(n);
+        n = n.parentElement;
+      }
+    }
+    if (cssClass) {
+      css = '.' + cssEscape(cssClass);
+      if (target && target.tagName &&
+          /^(BUTTON|A)$/.test(target.tagName)) {
+        css += ' ' + target.tagName.toLowerCase();
+      }
+    } else if (el.id) {
+      css = '#' + cssEscape(el.id);
+    } else if (target.id) {
+      css = '#' + cssEscape(target.id);
+    } else if (target.getAttribute && target.getAttribute('for')) {
+      css = 'label[for="' + target.getAttribute('for') + '"]';
+    } else if (el.getAttribute && el.getAttribute('data-testid')) {
+      css = '[data-testid="' + el.getAttribute('data-testid') + '"]';
+    } else if (el.getAttribute && el.getAttribute('name')) {
+      css = el.tagName.toLowerCase() + '[name="' + el.getAttribute('name') + '"]';
+    } else {
+      const cls = clsOf(target).trim().split(/\s+/).filter(Boolean).slice(0, 2);
+      css = target.tagName.toLowerCase() +
+            (cls.length ? '.' + cls.map(cssEscape).join('.') : '');
+    }
+    const overlay = inOverlay(target) || inOverlay(el);
+    const dismiss = /^(×|x|close|dismiss|not now|no thanks|got it|accept|agree|continue|skip)$/i
+                        .test(text);
+    const tabby = type === 'radio' || type === 'checkbox' ||
+                  roleOf(el) === 'tab' || roleOf(target) === 'tab' ||
+                  /tab|bonus|play for|gold coin/i.test(text + ' ' + css);
+    let score = 0;
+    if (overlay) {
+      score += 100;
+    }
+    if (inViewport(r)) {
+      score += 40;
+    }
+    if (text) {
+      score += 30;
+    }
+    if (dismiss) {
+      score += 35;
+    }
+    if (tabby) {
+      score += 25;
+    }
+    if (cssClass) {
+      score += 40;
+    }
+    if (r.area >= 400) {
+      score += 10;
+    }
+    candidates.push({
+      el: el,
+      target: target,
+      overlay: overlay,
+      score: score,
+      text: text,
+      type: type,
+      css: css,
+      cssClass: cssClass,
+      x: Math.round(r.x),
+      y: Math.round(r.y),
+      w: Math.round(r.w),
+      h: Math.round(r.h)
+    });
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  const overlayOpen = overlayRoots.length > 0 ||
+                      candidates.some((c) => c.overlay);
+  const overlayCap = overlayOpen ? 100 : 60;
+  const pageCap = overlayOpen ? 20 : 60;
+  let overlayUsed = 0;
+  let pageUsed = 0;
+  const elements = [];
+  const seen = new Set();
+  for (const c of candidates) {
+    if (c.overlay) {
+      if (overlayUsed >= overlayCap) {
+        continue;
+      }
+    } else if (pageUsed >= pageCap) {
+      continue;
+    }
+    const key = c.css + '@' + c.x + ',' + c.y + ':' + c.text.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const locators = [
+      {type: 'CSS_SELECTOR', value: c.css},
+      {type: 'CSS', value: c.css}
+    ];
+    if (c.cssClass) {
+      locators.unshift(
+          {type: 'CSS_SELECTOR', value: '.' + cssEscape(c.cssClass) + ' button'},
+          {type: 'CSS_SELECTOR', value: '.' + cssEscape(c.cssClass)});
+    }
+    if (c.el !== c.target && c.el.id) {
+      locators.push({type: 'CSS_SELECTOR', value: '#' + cssEscape(c.el.id)});
+    }
+    if (c.target.getAttribute && c.target.getAttribute('for')) {
+      locators.push({
+        type: 'CSS_SELECTOR',
+        value: 'label[for="' + c.target.getAttribute('for') + '"]'
+      });
+    }
+    elements.push({
+      id: elements.length + 1,
+      label: c.text,
+      role: roleOf(c.target) || roleOf(c.el) || c.target.tagName.toLowerCase(),
+      formType: c.type || (c.el.getAttribute && c.el.getAttribute('type')) || '',
+      fieldName: (c.el.getAttribute && (c.el.getAttribute('name') || c.el.id)) ||
+                 (c.target.getAttribute && c.target.getAttribute('for')) || '',
+      cssClass: c.cssClass || '',
+      clickable: true,
+      focusable: true,
+      overlay: !!c.overlay,
+      editable: !!(c.target.isContentEditable ||
+                   /^(INPUT|TEXTAREA|SELECT)$/.test(c.el.tagName)),
+      visible: true,
+      bounds: {x: c.x, y: c.y, width: c.w, height: c.h},
+      locators: locators
+    });
+    if (c.overlay) {
+      overlayUsed++;
+    } else {
+      pageUsed++;
+    }
+  }
+  let overlayText = '';
+  overlayRoots.forEach((root) => {
+    overlayText += ((root.innerText || '') + '\n');
+  });
+  const bodyText = (document.body && document.body.innerText) || '';
+  const inner = (overlayText + '\n' + bodyText).trim().slice(0, 12000);
+  return {
+    innerText: inner,
+    elements: elements,
+    href: location.href || '',
+    title: document.title || '',
+    readyState: document.readyState || '',
+    hasOverlay: overlayRoots.length > 0 || overlayUsed > 0,
+    viewportCss: {width: vw, height: vh}
+  };
+})()
+)js";
+
+base::Value::Dict BuildAgentPageContextDict(int tab_id_value,
+                                            std::string page_url,
+                                            std::string page_title,
+                                            base::Value::List apc_elements,
+                                            base::Value result) {
+  std::string inner;
+  base::Value::List js_elements;
+  bool has_overlay = false;
+  if (result.is_dict()) {
+    const base::Value::Dict& dict = result.GetDict();
+    if (const std::string* text = dict.FindString("innerText")) {
+      inner = *text;
+    }
+    if (const base::Value::List* scraped = dict.FindList("elements")) {
+      js_elements = scraped->Clone();
+    }
+    has_overlay = dict.FindBool("hasOverlay").value_or(false);
+    if (page_url.empty() || page_url == "about:blank") {
+      if (const std::string* href = dict.FindString("href")) {
+        page_url = *href;
+      }
+    }
+    if (page_title.empty()) {
+      if (const std::string* title = dict.FindString("title")) {
+        page_title = *title;
+      }
+    }
+  } else if (result.is_string()) {
+    inner = result.GetString();
+  }
+  if (!has_overlay) {
+    for (const base::Value& el : js_elements) {
+      if (el.is_dict() && el.GetDict().FindBool("overlay").value_or(false)) {
+        has_overlay = true;
+        break;
+      }
+    }
+  }
+  base::Value::List elements =
+      !apc_elements.empty() ? std::move(apc_elements) : std::move(js_elements);
+  base::Value::Dict out;
+  out.Set("ok", true);
+  out.Set("tab_id", tab_id_value);
+  out.Set("tabId", tab_id_value);
+  out.Set("url", page_url);
+  out.Set("title", page_title);
+  out.Set("documentId",
+          base::StringPrintf("%d:%s", tab_id_value, page_url.c_str()));
+  out.Set("innerText", inner);
+  out.Set("hasOverlay", has_overlay);
+  out.Set("element_count", static_cast<int>(elements.size()));
+  out.Set("elements", std::move(elements));
+  if (result.is_dict()) {
+    const base::Value::Dict* vp = result.GetDict().FindDict("viewportCss");
+    int css_w = 0;
+    int css_h = 0;
+    if (vp) {
+      css_w = vp->FindInt("width").value_or(0);
+      css_h = vp->FindInt("height").value_or(0);
+      if (css_w <= 0) {
+        css_w = static_cast<int>(vp->FindDouble("width").value_or(0));
+      }
+      if (css_h <= 0) {
+        css_h = static_cast<int>(vp->FindDouble("height").value_or(0));
+      }
+    }
+    if (css_w > 0 && css_h > 0) {
+      base::Value::Dict css;
+      css.Set("width", css_w);
+      css.Set("height", css_h);
+      out.Set("viewportCss", std::move(css));
+      out.Set("viewportWidth", css_w);
+      out.Set("viewportHeight", css_h);
+    }
+  }
+  return out;
+}
+
+glic::GlicWindowControllerImpl* SingleGlicWindow(Profile* profile) {
+  glic::GlicKeyedService* glic = glic::GlicKeyedService::Get(profile);
+  if (!glic || glic::GlicEnabling::IsMultiInstanceEnabled()) {
+    return nullptr;
+  }
+  return static_cast<glic::GlicWindowControllerImpl*>(
+      &glic->GetSingleInstanceWindowController());
+}
+
+}  // namespace
+
+void DashboardUIMessageHandler::HandleAgentAttachPanel(
+    const base::Value::List& args) {
+  const std::string cb =
+      (args.size() > 0 && args[0].is_string()) ? args[0].GetString()
+                                               : std::string();
+  glic::GlicWindowControllerImpl* window = SingleGlicWindow(profile_);
+  if (!window) {
+    base::Value::Dict out;
+    out.Set("ok", false);
+    out.Set("error", "glic unavailable");
+    ResolveCallback(cb, out);
+    return;
+  }
+  window->Attach();
+  base::Value::Dict out;
+  const bool detached = window->IsDetached();
+  out.Set("ok", !detached);
+  out.Set("detached", detached);
+  if (detached) {
+    out.Set("error", "attach failed");
+  }
+  ResolveCallback(cb, out);
+}
+
+void DashboardUIMessageHandler::HandleAgentDetachPanel(
+    const base::Value::List& args) {
+  const std::string cb =
+      (args.size() > 0 && args[0].is_string()) ? args[0].GetString()
+                                               : std::string();
+  glic::GlicWindowControllerImpl* window = SingleGlicWindow(profile_);
+  if (!window) {
+    base::Value::Dict out;
+    out.Set("ok", false);
+    out.Set("error", "glic unavailable");
+    ResolveCallback(cb, out);
+    return;
+  }
+  window->Detach();
+  base::Value::Dict out;
+  out.Set("ok", true);
+  out.Set("detached", window->IsDetached());
+  ResolveCallback(cb, out);
+}
+
+void DashboardUIMessageHandler::HandleAgentGetPanelState(
+    const base::Value::List& args) {
+  const std::string cb =
+      (args.size() > 0 && args[0].is_string()) ? args[0].GetString()
+                                               : std::string();
+  glic::GlicKeyedService* glic = glic::GlicKeyedService::Get(profile_);
+  base::Value::Dict out;
+  out.Set("ok", true);
+  out.Set("showing", glic && glic->IsWindowShowing());
+  out.Set("detached", glic && glic->IsWindowDetached());
+  ResolveCallback(cb, out);
+}
+
+void DashboardUIMessageHandler::HandleAgentOpenTab(
+    const base::Value::List& args) {
+  const std::string cb =
+      (args.size() > 0 && args[0].is_string()) ? args[0].GetString()
+                                               : std::string();
+  const base::Value::Dict* payload =
+      (args.size() > 1 && args[1].is_dict()) ? &args[1].GetDict() : nullptr;
+
+  std::string url_str;
+  if (payload) {
+    if (const std::string* url = payload->FindString("url")) {
+      url_str = *url;
+    }
+  }
+  base::TrimWhitespaceASCII(url_str, base::TRIM_ALL, &url_str);
+  GURL url(url_str.empty() ? "about:blank" : url_str);
+  base::Value::Dict out;
+  if (!url.is_valid() || IsDashboardOrInternalToolingUrl(url)) {
+    out.Set("ok", false);
+    out.Set("error", "invalid or internal url");
+    ResolveCallback(cb, out);
+    return;
+  }
+
+  // Same path the --glic-dev guest uses via browser.createTab(): open a
+  // foreground tab and do not touch the Glic panel. The panel is one
+  // floating instance for the whole browser.
+  NavigateParams np(profile_, url, ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
+  np.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
+  Navigate(&np);
+  content::WebContents* wc = np.navigated_or_inserted_contents;
+  if (!wc) {
+    out.Set("ok", false);
+    out.Set("error", "failed to open tab");
+    ResolveCallback(cb, out);
+    return;
+  }
+
+  const int tab_id = sessions::SessionTabHelper::IdForTab(wc).id();
+  out.Set("ok", true);
+  out.Set("url", wc->GetVisibleURL().spec());
+  if (tab_id > 0) {
+    out.Set("tab_id", tab_id);
+    out.Set("tabId", tab_id);
+  }
+  LOG(INFO) << "[Agent] Opened task tab id=" << tab_id
+            << " url=" << wc->GetVisibleURL().spec();
+  ResolveCallback(cb, out);
+}
+
 void DashboardUIMessageHandler::HandleAgentGetActivePageInfo(
     const base::Value::List& args) {
   const std::string cb =
@@ -401,6 +1215,248 @@ void DashboardUIMessageHandler::HandleAgentGetActivePageInfo(
     }
   }
   ResolveCallback(cb, out);
+}
+
+void DashboardUIMessageHandler::HandleAgentListTabs(
+    const base::Value::List& args) {
+  const std::string cb =
+      (args.size() > 0 && args[0].is_string()) ? args[0].GetString()
+                                               : std::string();
+  base::Value::Dict out;
+  out.Set("ok", true);
+  out.Set("tabs", BuildAgentTabList(profile_));
+  ResolveCallback(cb, std::move(out));
+}
+
+void DashboardUIMessageHandler::HandleAgentActivateTab(
+    const base::Value::List& args) {
+  const std::string cb =
+      (args.size() > 0 && args[0].is_string()) ? args[0].GetString()
+                                               : std::string();
+  const base::Value::Dict* payload =
+      (args.size() > 1 && args[1].is_dict()) ? &args[1].GetDict() : nullptr;
+  const std::optional<int> requested_tab_id =
+      payload ? ReadRequestedTabId(*payload) : std::nullopt;
+  base::Value::Dict out;
+  if (!requested_tab_id.has_value()) {
+    out.Set("ok", false);
+    out.Set("error", "missing tab_id");
+    ResolveCallback(cb, std::move(out));
+    return;
+  }
+  content::WebContents* wc =
+      FindWebContentsForTabId(profile_, *requested_tab_id);
+  if (!wc) {
+    out.Set("ok", false);
+    out.Set("error", base::StringPrintf("no tab found for tab_id=%d",
+                                        *requested_tab_id));
+    ResolveCallback(cb, std::move(out));
+    return;
+  }
+  ActivateWebContentsWindow(wc);
+  const GURL& visible = wc->GetVisibleURL().is_empty()
+                            ? wc->GetLastCommittedURL()
+                            : wc->GetVisibleURL();
+  out.Set("ok", true);
+  out.Set("tabId", *requested_tab_id);
+  out.Set("tab_id", *requested_tab_id);
+  out.Set("url", visible.spec());
+  out.Set("title", base::UTF16ToUTF8(wc->GetTitle()));
+  out.Set("isOauth", LooksLikeOauthLoginUrl(visible));
+  ResolveCallback(cb, std::move(out));
+}
+
+void DashboardUIMessageHandler::HandleAgentGetPageContext(
+    const base::Value::List& args) {
+  const std::string cb =
+      (args.size() > 0 && args[0].is_string()) ? args[0].GetString()
+                                               : std::string();
+  const base::Value::Dict* payload =
+      (args.size() > 1 && args[1].is_dict()) ? &args[1].GetDict() : nullptr;
+  const std::optional<int> requested_tab_id =
+      payload ? ReadRequestedTabId(*payload) : std::nullopt;
+  content::WebContents* wc = requested_tab_id.has_value()
+                                 ? FindWebContentsForTabId(profile_,
+                                                           *requested_tab_id)
+                                 : FindPreferredAgentTargetWebContents(profile_);
+  if (wc && IsDashboardOrInternalToolingUrl(wc->GetLastCommittedURL())) {
+    wc = FindPreferredAgentTargetWebContents(profile_);
+  }
+  if (!wc) {
+    base::Value::Dict out;
+    out.Set("ok", false);
+    out.Set("error", "no task tab");
+    ResolveCallback(cb, out);
+    return;
+  }
+  {
+    Browser* browser = chrome::FindBrowserWithTab(wc);
+    const bool popup = browser &&
+                       (browser->is_type_popup() || browser->is_type_app_popup());
+    if (popup || LooksLikeOauthLoginUrl(wc->GetVisibleURL()) ||
+        LooksLikeOauthLoginUrl(wc->GetLastCommittedURL())) {
+      ActivateWebContentsWindow(wc);
+    }
+  }
+
+  const int tab_id = sessions::SessionTabHelper::IdForTab(wc).id();
+  std::string url = wc->GetLastCommittedURL().spec();
+  if (url.empty() || url == "about:blank") {
+    const std::string visible = wc->GetVisibleURL().spec();
+    if (!visible.empty()) {
+      url = visible;
+    }
+  }
+  const std::string title = base::UTF16ToUTF8(wc->GetTitle());
+  content::RenderFrameHost* rfh = wc->GetPrimaryMainFrame();
+  if (!rfh) {
+    ResolveCallback(cb, BuildAgentPageContextDict(tab_id, std::move(url), title,
+                                                  base::Value::List(),
+                                                  base::Value()));
+    return;
+  }
+
+  // Scrape the live DOM instead of waiting on APC. Casino/SPA pages often
+  // never trip "document loaded" for FetchUnifiedPageMapSnapshot, and that
+  // helper is also a no-op unless an agent ExecutionRunContext is active.
+  rfh->ExecuteJavaScriptInIsolatedWorld(
+      base::UTF8ToUTF16(std::string_view(kScrapeAgentPageContextScript)),
+      base::BindOnce(
+          [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb_id,
+             int tab_id_value, std::string page_url, std::string page_title,
+             base::Value result) {
+            if (!self) {
+              return;
+            }
+            self->ResolveCallback(
+                cb_id, BuildAgentPageContextDict(
+                           tab_id_value, std::move(page_url),
+                           std::move(page_title), base::Value::List(),
+                           std::move(result)));
+          },
+          weak_ptr_factory_.GetWeakPtr(), cb, tab_id, std::move(url), title),
+      content::ISOLATED_WORLD_ID_CONTENT_END);
+}
+
+void DashboardUIMessageHandler::HandleAgentSaveScript(
+    const base::Value::List& args) {
+  const std::string cb =
+      (args.size() > 0 && args[0].is_string()) ? args[0].GetString()
+                                               : std::string();
+  const base::Value::Dict* payload =
+      (args.size() > 1 && args[1].is_dict()) ? &args[1].GetDict() : nullptr;
+  base::Value::Dict out;
+  if (!payload) {
+    out.Set("ok", false);
+    out.Set("error", "missing payload");
+    ResolveCallback(cb, out);
+    return;
+  }
+
+  const base::Value::List* actions = payload->FindList("actions");
+  if (!actions || actions->empty()) {
+    out.Set("ok", false);
+    out.Set("error", "No successful actions were recorded to save.");
+    ResolveCallback(cb, out);
+    return;
+  }
+
+  std::string script_id;
+  if (const std::string* requested_id = payload->FindString("script_id")) {
+    script_id = *requested_id;
+  } else if (const std::string* alt_id = payload->FindString("id")) {
+    script_id = *alt_id;
+  }
+  base::TrimWhitespaceASCII(script_id, base::TRIM_ALL, &script_id);
+  if (script_id.empty()) {
+    script_id = base::Uuid::GenerateRandomV4().AsLowercaseString();
+  }
+  if (script_id == "welcome_demo" ||
+      !dashboard::ScriptStore::IsValidScriptId(script_id)) {
+    out.Set("ok", false);
+    out.Set("error", "invalid_script_id");
+    ResolveCallback(cb, out);
+    return;
+  }
+
+  std::string name;
+  if (const std::string* requested = payload->FindString("name")) {
+    name = *requested;
+  } else if (const std::string* goal = payload->FindString("goal")) {
+    name = *goal;
+  }
+  base::TrimWhitespaceASCII(name, base::TRIM_ALL, &name);
+  if (name.empty()) {
+    name = "Saved Agent Script";
+  }
+  if (name.size() > 80u) {
+    name.resize(80u);
+  }
+
+  std::string source = "glic_panel_autosave";
+  if (const std::string* src = payload->FindString("source")) {
+    if (!src->empty()) {
+      source = *src;
+    }
+  }
+  std::string goal;
+  if (const std::string* requested_goal = payload->FindString("goal")) {
+    goal = *requested_goal;
+  } else if (const std::string* source_goal = payload->FindString("sourceGoal")) {
+    goal = *source_goal;
+  }
+  std::string start_url;
+  if (const std::string* url = payload->FindString("startUrl")) {
+    start_url = *url;
+  }
+
+  base::Value::Dict script;
+  script.Set("name", name);
+  script.Set("kind", "main");
+  script.Set("actions", actions->Clone());
+  if (!start_url.empty()) {
+    script.Set("startUrl", start_url);
+  }
+  script.Set("source", source);
+  if (!goal.empty()) {
+    script.Set("sourceGoal", goal);
+  }
+  script = dashboard::ScriptSchema::CanonicalizeForSave(std::move(script),
+                                                        script_id,
+                                                        base::Time::Now());
+  const int action_count = static_cast<int>(actions->size());
+  base::ThreadPool::PostTaskAndReplyWithResult(
+      FROM_HERE,
+      {base::MayBlock(), base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
+      base::BindOnce(
+          [](Profile* profile, std::string id, base::Value::Dict dict) {
+            return dashboard::ScriptStore::Write(profile, id, dict);
+          },
+          profile_, script_id, script.Clone()),
+      base::BindOnce(
+          [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb_id,
+             std::string id, std::string script_name, int count,
+             base::Value::Dict dict, bool ok) {
+            if (!self) {
+              return;
+            }
+            base::Value::Dict reply;
+            if (!ok) {
+              reply.Set("ok", false);
+              reply.Set("error", "Failed to auto-save generated script.");
+              self->ResolveCallback(cb_id, reply);
+              return;
+            }
+            DashboardUIMessageHandler::UpdateRuntimeScriptCache(
+                self->profile_, id, dict.Clone());
+            reply.Set("ok", true);
+            reply.Set("id", id);
+            reply.Set("name", script_name);
+            reply.Set("action_count", count);
+            self->ResolveCallback(cb_id, reply);
+          },
+          weak_ptr_factory_.GetWeakPtr(), cb, script_id, name, action_count,
+          script.Clone()));
 }
 
 void DashboardUIMessageHandler::HandlePerformAgentAction(
@@ -503,6 +1559,7 @@ void DashboardUIMessageHandler::HandlePerformAgentAction(
     ResolveCallback(cb, out);
     return;
   }
+  ActivateWebContentsWindow(target_wc);
 
   const int resolved_tab_id = sessions::SessionTabHelper::IdForTab(target_wc).id();
   LOG(INFO) << "[Agent] Starting timeline run"
@@ -577,8 +1634,10 @@ void DashboardUIMessageHandler::HandlePerformAgentAction(
                   IsDashboardOrInternalToolingUrl(wc->GetLastCommittedURL())) {
                 wc = EnsureAgentTargetWebContents(self->profile_);
               }
-              if (wc)
+              if (wc) {
+                ActivateWebContentsWindow(wc);
                 exec_service->StartAdHocRun(actions, wc);
+              }
             }
             base::Value::Dict res;
             res.Set("ok", true);
@@ -828,34 +1887,59 @@ void DashboardUIMessageHandler::HandleAgentScreenshot(
   const std::string cb =
       (args.size() > 0 && args[0].is_string()) ? args[0].GetString()
                                                : std::string();
-  base::Value::Dict out;
-  RecorderController* rc = RecorderController::GetActive();
-  if (!rc)
-    rc = recorder_.get();
-  if (!rc) {
+  const base::Value::Dict* payload =
+      (args.size() > 1 && args[1].is_dict()) ? &args[1].GetDict() : nullptr;
+  const std::optional<int> requested_tab_id =
+      payload ? ReadRequestedTabId(*payload) : std::nullopt;
+  content::WebContents* wc = requested_tab_id.has_value()
+                                 ? FindWebContentsForTabId(profile_,
+                                                           *requested_tab_id)
+                                 : FindPreferredAgentTargetWebContents(profile_);
+  if (wc && IsDashboardOrInternalToolingUrl(wc->GetLastCommittedURL())) {
+    wc = FindPreferredAgentTargetWebContents(profile_);
+  }
+  if (!wc) {
+    base::Value::Dict out;
     out.Set("ok", false);
-    out.Set("error", "recorder not active");
+    out.Set("error", "no task tab");
     ResolveCallback(cb, out);
     return;
   }
-  rc->CaptureScreenshot(base::BindOnce(
-      [](base::WeakPtr<DashboardUIMessageHandler> self,
-         std::string cb_id,
-         std::string base64_png) {
-        if (!self)
-          return;
-        base::Value::Dict res;
-        if (!base64_png.empty()) {
-          res.Set("ok", true);
-          res.Set("image",
-                  base::StrCat({"data:image/png;base64,", base64_png}));
-        } else {
-          res.Set("ok", false);
-          res.Set("error", "screenshot failed");
-        }
-        self->ResolveCallback(cb_id, res);
-      },
-      weak_ptr_factory_.GetWeakPtr(), cb));
+  CaptureWebContentsPngWithRetry(
+      wc->GetWeakPtr(), /*attempts_left=*/16,
+      base::BindOnce(
+          [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb_id,
+             std::string base64_png, int width, int height, int css_width,
+             int css_height, std::string error) {
+            if (!self) {
+              return;
+            }
+            base::Value::Dict res;
+            if (!base64_png.empty()) {
+              res.Set("ok", true);
+              res.Set("image",
+                      base::StrCat({"data:image/png;base64,", base64_png}));
+              res.Set("base64", base64_png);
+              res.Set("mimeType", "image/png");
+              if (width > 0) {
+                res.Set("widthPixels", width);
+              }
+              if (height > 0) {
+                res.Set("heightPixels", height);
+              }
+              if (css_width > 0) {
+                res.Set("cssWidth", css_width);
+              }
+              if (css_height > 0) {
+                res.Set("cssHeight", css_height);
+              }
+            } else {
+              res.Set("ok", false);
+              res.Set("error", error.empty() ? "screenshot failed" : error);
+            }
+            self->ResolveCallback(cb_id, res);
+          },
+          weak_ptr_factory_.GetWeakPtr(), cb));
 }
 
 void DashboardUIMessageHandler::HandleAgentOllamaChat(

@@ -365,7 +365,18 @@ bool GlicEnabling::IsShareImageEnabledForProfile(Profile* profile) {
   }
 }
 
+bool GlicEnabling::IsSinglePanelAcrossTabsEnabled() {
+  const auto* command_line = base::CommandLine::ForCurrentProcess();
+  return command_line->HasSwitch(::switches::kGlicDev) ||
+         command_line->HasSwitch("simulachrome-agent");
+}
+
 bool GlicEnabling::IsMultiInstanceEnabled() {
+  // One shared panel cannot coexist with per-tab Glic instances.
+  if (IsSinglePanelAcrossTabsEnabled()) {
+    return false;
+  }
+
   if (IsMultiInstanceEnabledByFlags()) {
     return true;
   }

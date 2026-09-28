@@ -4,25 +4,38 @@
   html, body {
     height: 100%;
     margin: 0;
+    box-sizing: border-box;
     font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
   }
+  *, *::before, *::after { box-sizing: inherit; }
   #root {
     height: 100%;
     display: flex;
     flex-direction: column;
+    padding: 10px 12px 12px;
+    gap: 8px;
   }
   #header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 8px 10px;
+    flex-wrap: wrap;
+    gap: 10px 12px;
+    padding: 10px 12px;
     background: #1f2937;
     color: #fff;
+    border-radius: 10px;
     -webkit-app-region: drag;
+  }
+  #header button {
+    min-height: 32px;
+    padding: 6px 12px;
+    border-radius: 8px;
   }
   #header .controls {
     display: flex;
-    gap: 8px;
+    flex-wrap: wrap;
+    gap: 10px;
     -webkit-app-region: no-drag;
     position: relative;
     align-items: center;
@@ -203,11 +216,20 @@
   #taskbar {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
-    padding: 8px 10px;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
     border-top: 1px solid #1f2937;
     background: #0b1020;
     color: #e5e7eb;
+  }
+  #taskbar button,
+  #composer button,
+  #composer select,
+  #composer input {
+    min-height: 34px;
+    padding: 6px 12px;
+    border-radius: 8px;
   }
   #taskInfo {
     padding: 6px 10px;
@@ -221,19 +243,34 @@
     color: #9ca3af;
     align-self: center;
   }
+  #taskbar label.max-steps {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #e5e7eb;
+    white-space: nowrap;
+  }
+  #maxSteps {
+    width: 72px;
+    min-height: 34px;
+    padding: 6px 8px;
+    border-radius: 8px;
+  }
   #csvPath {
-    flex: 1;
-    min-width: 280px;
+    flex: 1 1 160px;
+    min-width: 140px;
   }
   #csvText {
-    flex: 1;
-    min-width: 280px;
+    flex: 1 1 160px;
+    min-width: 140px;
     resize: vertical;
   }
   #composer {
     display: flex;
-    gap: 8px;
-    padding: 10px;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 12px;
     border-top: 1px solid #1f2937;
     background: #0b1020;
   }
@@ -298,6 +335,8 @@
           <div class="queue-widget-actions">
             <button id="queueResume">Resume</button>
             <button id="queuePause">Pause</button>
+            <button id="queueComplete" title="Mark the active task complete, then review and save the script">Complete</button>
+            <button id="queueSolvedCaptcha" hidden title="Resume after you solve the captcha in the page">I solved it</button>
             <button id="queueNext">Skip</button>
             <button id="queueClear">Clear</button>
           </div>
@@ -313,8 +352,13 @@
     <div id="taskbar">
       <input id="csvPath" type="text" value="/Users/matcauthon/notrainnogain/config.csv" placeholder="CSV path (e.g. /Users/matcauthon/notrainnogain/config.csv)" />
       <button id="loadPath">Load Path</button>
+      <label class="max-steps" for="maxSteps">Max steps
+        <input id="maxSteps" type="number" min="1" max="500" value="20" />
+      </label>
       <button id="startQueue">Start Queue</button>
       <button id="pauseQueue">Pause</button>
+      <button id="completeTask" title="Mark the active task complete, then review and save the script">Complete</button>
+      <button id="solvedCaptcha" hidden title="Resume after you solve the captcha in the page">I solved it</button>
       <button id="nextTask">Next Task</button>
       <span id="queueStatus">Queue: 0</span>
     </div>
@@ -341,9 +385,17 @@
         <input id="attachContextToggle" type="checkbox" />
         <span>Include page context</span>
       </label>
+      <label class="composer-toggle" title="While checked, Send adds this text to the running task's next step instead of starting a new task, interrupting, or queuing.">
+        <input id="guideCurrentTaskToggle" type="checkbox" />
+        <span>Guide current task</span>
+      </label>
       <label class="composer-toggle" title="Run a lightweight prompt optimization pass before sending the manual prompt.">
         <input id="promptOptimizerToggle" type="checkbox" />
         <span>Use prompt optimizer</span>
+      </label>
+      <label class="composer-toggle" title="When checked, a manual prompt that starts a task opens a new tab. Leave off to stay on the current tab.">
+        <input id="openPromptInNewTabToggle" type="checkbox" />
+        <span>Open prompt in new tab</span>
       </label>
     </div>
   </div>

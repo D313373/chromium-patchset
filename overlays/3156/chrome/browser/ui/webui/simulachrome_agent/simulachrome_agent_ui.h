@@ -5,9 +5,6 @@
 #ifndef CHROME_BROWSER_UI_WEBUI_SIMULACHROME_AGENT_SIMULACHROME_AGENT_UI_H_
 #define CHROME_BROWSER_UI_WEBUI_SIMULACHROME_AGENT_SIMULACHROME_AGENT_UI_H_
 
-#include <memory>
-
-#include "chrome/browser/ui/webui/dashboard/dashboard.h"
 #include "content/public/browser/web_ui_controller.h"
 #include "content/public/browser/webui_config.h"
 #include "content/public/common/url_constants.h"
@@ -39,9 +36,6 @@ class SimulachromeAgentUI : public content::WebUIController {
 
   SimulachromeAgentUI(const SimulachromeAgentUI&) = delete;
   SimulachromeAgentUI& operator=(const SimulachromeAgentUI&) = delete;
-
- private:
-  std::unique_ptr<dashboard::Dashboard> agent_chat_dashboard_;
 };
 
 #endif  // CHROME_BROWSER_UI_WEBUI_SIMULACHROME_AGENT_SIMULACHROME_AGENT_UI_H_

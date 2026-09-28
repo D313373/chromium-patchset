@@ -218,6 +218,10 @@ std::vector<ActionSpec> GetActionSpecs() {
        "Legacy optional focus locator bundle. Converted to a single focus area when loading older scripts"},
       {"prompt", "string", true,
        "Prompt text. Supports smart-input token expansion including listener match variables."},
+      {"stayOnCurrentTab", "bool", false,
+       "If true, refuse navigate/call_script/open-tab and keep using the script tab"},
+      {"skipAutoSave", "bool", false,
+       "If true, do not auto-save a nested script when this prompt finishes"},
     }
   });
   s.push_back({

@@ -49,6 +49,8 @@ class HeadlessListenerController {
   void ClearPendingTriggers(ResponseCallback done);
   // IPC: investigate_page — payload may include url / actions / probe.
   void InvestigatePage(base::Value::Dict payload, ResponseCallback done);
+  void RefreshListener(const std::string& script_id, ResponseCallback done);
+  void CaptureScreenshot(const std::string& script_id, ResponseCallback done);
 
  private:
   class Impl;

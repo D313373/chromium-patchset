@@ -124,6 +124,27 @@ void AppendSwitchASCIIIfMissing(base::CommandLine* cl,
   }
 }
 
+void AppendDisableFeatures(base::CommandLine* cl, const std::string& add) {
+  if (add.empty()) {
+    return;
+  }
+  if (!cl->HasSwitch("disable-features")) {
+    cl->AppendSwitchASCII("disable-features", add);
+    return;
+  }
+  std::string existing = cl->GetSwitchValueASCII("disable-features");
+  std::vector<std::string> parts = base::SplitString(
+      existing, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
+  for (const auto& piece : base::SplitString(add, ",", base::TRIM_WHITESPACE,
+                                             base::SPLIT_WANT_NONEMPTY)) {
+    if (std::find(parts.begin(), parts.end(), piece) == parts.end()) {
+      parts.push_back(piece);
+    }
+  }
+  cl->RemoveSwitch("disable-features");
+  cl->AppendSwitchASCII("disable-features", base::JoinString(parts, ","));
+}
+
 void ApplySettingsDerivedSwitches(base::CommandLine* cl) {
   const base::FilePath scripts_dir = ScriptsDirFromEnvOrDefault();
   if (scripts_dir.empty()) {
@@ -216,7 +237,14 @@ void ApplyBrowserCommandLineDefaults() {
     return;
   }
 
-  AppendEnableFeatures(cl, "Glic,GlicDefaultTabContextSetting");
+  // One Glic conversation for the whole window. Docking (attached side
+  // panel) is allowed; GlicMultiInstance stays off so that docked panel
+  // is not recreated per tab. GlicDetached is off so Pop out / Dock work.
+  AppendEnableFeatures(
+      cl,
+      "Glic:glic-initial-width/480/glic-initial-height/640,GlicUseNonClient,"
+      "GlicDefaultTabContextSetting");
+  AppendDisableFeatures(cl, "GlicMultiInstance,GlicDetached");
   AppendSwitchASCIIIfMissing(cl, switches::kGlicOpenOnStartup, "attached");
   AppendSwitchIfMissing(cl, "disable-backgrounding-occluded-windows");
   AppendSwitchIfMissing(cl, "disable-background-timer-throttling");

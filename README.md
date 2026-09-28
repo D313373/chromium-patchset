@@ -2,12 +2,16 @@
 
 Chromium integration patches for [Simulachrome](https://github.com/D313373/Simulachrome).
 
+**Demo:** [`docs/media/simulachrome_demo.mp4`](docs/media/simulachrome_demo.mp4): the agent signing in and filing a support request with Data-tab tokens, saving the run as a script, then replaying it from the dashboard with zero model calls.
+
+**Prebuilt macOS (Intel) binary:** see [Releases](https://github.com/D313373/chromium-patchset/releases).
+
 This repository intentionally does **not** vendor Chromium or the complete Simulachrome project. It records the Chromium revisions, ordered patch series, compatibility notes, and helper scripts needed to reproduce the Simulachrome-enabled Chromium integration in a separate Chromium checkout.
 
 ## What this repository contains
 
 - Ordered Chromium patch files under [`patches/`](patches/) (3147–3155)
-- Full-file overlays under [`overlays/`](overlays/) for patches 3154–3155
+- Full-file overlays under [`overlays/`](overlays/) for patches 3154–3156
 - The expected Chromium base and target revisions in [`BASE_COMMIT`](BASE_COMMIT) and [`HEAD_COMMIT`](HEAD_COMMIT)
 - A machine-readable patch inventory in [`patchset.json`](patchset.json)
 - Patch application and metadata validation scripts under [`scripts/`](scripts/)

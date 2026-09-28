@@ -45,7 +45,8 @@ function isSimulachromeAgentGuest(): boolean {
   }
   try {
     const guest = String(loadTimeData.getString('glicGuestURL') || '');
-    return guest.startsWith('chrome://simulachrome-agent');
+    return guest.startsWith('chrome://simulachrome-agent') ||
+        guest.includes('chrome://glic/agent/');
   } catch (_) {
     return false;
   }
@@ -285,8 +286,13 @@ export class GlicAppController implements WebviewDelegate, ApiHostEmbedder {
         this.lastWidth = 400;
         this.lastHeight = 800;
         this.cancelTimeout();
-        $.guestPanel.classList.toggle('show-header', true);
+        // Packaged agent has its own chrome; hide the Gemini login header strip.
+        $.guestPanel.classList.toggle(
+            'show-header', !isSimulachromeAgentGuest());
         this.showPanel('guestPanel');
+        if (isSimulachromeAgentGuest()) {
+          this.setState(WebUiState.kReady);
+        }
         break;
       case 'guestError':
         this.setState(WebUiState.kGuestError);
@@ -299,6 +305,14 @@ export class GlicAppController implements WebviewDelegate, ApiHostEmbedder {
         }
         break;
       case 'loadError':
+        // Packaged agent guest never speaks Gemini's protocol; chrome-error
+        // commits must not surface "Gemini isn't available".
+        if (isSimulachromeAgentGuest()) {
+          this.cancelTimeout();
+          this.showPanel('guestPanel');
+          this.setState(WebUiState.kReady);
+          break;
+        }
         this.lastErrorReason = 'WEBVIEW_PAGE_COMMIT:loadError';
         this.setState(WebUiState.kError);
         break;
@@ -453,6 +467,12 @@ export class GlicAppController implements WebviewDelegate, ApiHostEmbedder {
   }
 
   private beginLoad(): void {
+    // Packaged agent: don't park on the Gemini loading skeleton; the iframe
+    // is ready as soon as chrome://simulachrome-agent commits.
+    if (isSimulachromeAgentGuest()) {
+      this.load();
+      return;
+    }
     // Wait a moment before showing the loading panel.
     this.loadingTimer = setTimeout(() => {
       this.setState(WebUiState.kShowLoading);
@@ -544,6 +564,10 @@ export class GlicAppController implements WebviewDelegate, ApiHostEmbedder {
   }
 
   private showLoading(): void {
+    if (isSimulachromeAgentGuest()) {
+      this.setState(WebUiState.kReady);
+      return;
+    }
     this.showPanel('loadingPanel');
     // After kMinHoldLoadingTimeMs, transition to finish-loading or ready. Note
     // that we do not transition from show-loading to ready before the timeout.
@@ -554,6 +578,10 @@ export class GlicAppController implements WebviewDelegate, ApiHostEmbedder {
   }
 
   private holdLoading(): void {
+    if (isSimulachromeAgentGuest()) {
+      this.setState(WebUiState.kReady);
+      return;
+    }
     // The web client is ready, but we still wait for the remainder of
     // `kMinHoldLoadingTimeMs` before showing it, to allow the loading animation
     // to complete once.
@@ -691,6 +719,13 @@ export class GlicAppController implements WebviewDelegate, ApiHostEmbedder {
   // Called when the notifyPanelWillOpen promise resolves to open the panel
   // when triggered from the browser.
   webClientReady(): void {
+    // Packaged agent iframe is the product UI — skip Gemini loading holds.
+    if (isSimulachromeAgentGuest()) {
+      this.cancelTimeout();
+      this.trackLoadingStageEnd();
+      this.setState(WebUiState.kReady);
+      return;
+    }
     if (this.state === WebUiState.kBeginLoad ||
         this.state === WebUiState.kFinishLoading) {
       this.trackLoadingStageEnd();

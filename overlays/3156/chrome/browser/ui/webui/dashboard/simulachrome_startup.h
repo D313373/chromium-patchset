@@ -12,8 +12,8 @@ namespace simulachrome {
 // explicit switches win.
 //
 // Defaults (when unset):
-// - enable Glic features
-// - open Glic attached on startup
+// - enable Glic as one window-scoped panel (dockable, not per-tab)
+// - disable GlicMultiInstance (per-tab instances)
 // - disable occluded-window backgrounding / background timer throttling
 // - force visible widgets (automation reliability)
 // - guest URL chrome://simulachrome-agent/ollama.html (packaged agent UI)

@@ -9,4 +9,16 @@ Copies over Chromium after 3147–3155:
 - Resume/auto-heal prefers run-history URL; success-only contextUrl updates
 - investigate_page IPC contract on the control channel (automation TBD)
 
-Apply with: rsync -a overlays/3156/chrome/ $CHROMIUM_DIR/chrome/
+- One Glic panel across all tabs; task tabs open without tearing it down
+- Packaged-guest page context / screenshots at 1:1 viewport coordinates
+- Dashboard reload/close no longer leaves a dangling Dashboard pointer
+- Replay waits for a freshly opened target tab to load before step 1, and
+  focuses it whenever the native input path is configured
+- Glic panel hides task-loop context prompts; no empty-save message after
+  per-site save_script
+- Blink: line-clamp paragraph breaker allows a paragraph that ends exactly
+  on the last clamped line (DCHECK aborted the renderer on such sites)
+
+Apply with:
+  rsync -a overlays/3156/chrome/ $CHROMIUM_DIR/chrome/
+  rsync -a overlays/3156/third_party/ $CHROMIUM_DIR/third_party/

@@ -52,11 +52,19 @@ class DashboardUIMessageHandler : public content::WebUIMessageHandler {
   // Agent console aliases used by dashboard_app.js
   void HandleAgentCallAction(const base::Value::List& args);
   void HandleAgentRunTimeline(const base::Value::List& args);
+  void HandleAgentOpenTab(const base::Value::List& args);
+  void HandleAgentAttachPanel(const base::Value::List& args);
+  void HandleAgentDetachPanel(const base::Value::List& args);
+  void HandleAgentGetPanelState(const base::Value::List& args);
   void HandleAgentInvestigatePage(const base::Value::List& args);
   void HandleAgentRefreshPageMap(const base::Value::List& args);
   void HandleAgentReloadPage(const base::Value::List& args);
   void HandleAgentInspectElement(const base::Value::List& args);
   void HandleAgentGetActivePageInfo(const base::Value::List& args);
+  void HandleAgentListTabs(const base::Value::List& args);
+  void HandleAgentActivateTab(const base::Value::List& args);
+  void HandleAgentGetPageContext(const base::Value::List& args);
+  void HandleAgentSaveScript(const base::Value::List& args);
   void HandleInitialize(const base::Value::List& args);
   void HandleGetScripts(const base::Value::List& args);
   void HandleCreateNewScript(const base::Value::List& args);
@@ -95,6 +103,10 @@ class DashboardUIMessageHandler : public content::WebUIMessageHandler {
   void HandleToggleRecording(const base::Value::List& args);
   void HandleAgentScreenshot(const base::Value::List& args);
   void HandleAgentOllamaChat(const base::Value::List& args);
+
+  // Drop the raw Dashboard pointer before its owner destroys it.
+  // Otherwise the base raw_ptr Release() trips dangling-pointer detection.
+  void DetachDashboard();
 
  protected:
   void ResolveCallback(const std::string& cb_fn, const base::Value& payload);

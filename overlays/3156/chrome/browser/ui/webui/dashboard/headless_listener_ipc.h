@@ -12,29 +12,41 @@
 
 #include "base/files/file_path.h"
 #include "base/values.h"
+#include "build/build_config.h"
 
 namespace dashboard {
 
-// Env var: absolute path of the Unix domain control socket shared by the
-// headed controller and the --headless-listener agent process.
+// Env var: absolute path of the Unix domain control socket (POSIX) or named
+// pipe (Windows) shared by the headed controller and the --headless-listener
+// agent process.
 //
 // Transport notes:
 // - This is NOT Mojo between headed and headless (separate browser processes).
 // - This is NOT a Chrome Native Messaging Host (.json host manifest).
 // - Framing matches native-messaging style (uint32 LE length + JSON UTF-8) on a
-//   local IPC socket (Unix domain today; Windows named pipe planned).
+//   local IPC channel (Unix domain socket on POSIX; named pipe on Windows).
 inline constexpr char kHeadlessControlSocketEnv[] =
     "SIMULACHROME_HEADLESS_CONTROL_SOCKET";
 
-// Default socket under ~/Library/Application Support/Simulachrome/Headless/.
+#if BUILDFLAG(IS_WIN)
+using HeadlessIpcHandle = void*;
+#else
+using HeadlessIpcHandle = int;
+#endif
+
+// Default control path: Unix socket under
+// ~/Library/Application Support/Simulachrome/Headless/ on POSIX, or
+// \\.\pipe\Simulachrome.Headless.control on Windows.
 base::FilePath DefaultHeadlessControlSocketPath();
 
 // Length-prefixed (uint32 LE) JSON framing. Used on the headed↔headless
 // control channel.
-bool WriteFramedJsonMessage(int fd, const base::Value::Dict& message,
+bool WriteFramedJsonMessage(HeadlessIpcHandle handle,
+                            const base::Value::Dict& message,
                             std::string* error);
-std::optional<base::Value::Dict> ReadFramedJsonMessage(int fd,
-                                                       std::string* error);
+std::optional<base::Value::Dict> ReadFramedJsonMessage(
+    HeadlessIpcHandle handle,
+    std::string* error);
 
 // Helpers for building common envelope fields.
 base::Value::Dict MakeIpcRequest(std::string_view type,

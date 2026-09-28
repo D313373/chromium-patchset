@@ -73,6 +73,23 @@ constexpr int kAuthRecoveryRequiredConsecutiveFailures = 2;
 constexpr char kNestedActionPathPrefix[] = "[nested_action_path=";
 constexpr char kNestedActionPathSuffix = ']';
 
+bool IsHumanCaptchaPauseAction(const base::Value::Dict* action_dict) {
+  if (!action_dict) {
+    return false;
+  }
+  // Legacy wait markers only. New scripts use glic_prompt on the script tab.
+  const std::string* kind = action_dict->FindString("action");
+  if (!kind || *kind != "wait") {
+    return false;
+  }
+  const base::Value::Dict* params = action_dict->FindDict("params");
+  if (!params) {
+    return false;
+  }
+  return params->FindBool("__glic_human_captcha").value_or(false) ||
+         params->FindBool("humanCaptcha").value_or(false);
+}
+
 bool ShouldRefreshApcBeforeAction(std::string_view kind) {
   // Do not force APC cache invalidation before ordinary click/type. That path
   // was causing repeated heavy content extraction during form fills and page
@@ -1414,6 +1431,18 @@ std::string SerializeActionAsTimelineJson(const base::Value::Dict* action) {
   base::JSONWriter::Write(payload, &out);
   return out;
 }
+
+// Native input goes to the focused widget, so a background target tab would
+// silently drop the first step's keystrokes.
+bool RunMayUseNativeInput(bool force_native) {
+  if (force_native) {
+    return true;
+  }
+  const dashboard::ActionExecutionRouting routing =
+      dashboard::GetActionExecutionRouting();
+  return routing.primary == dashboard::ActionExecutionPath::kNative ||
+         routing.fallback == dashboard::ActionExecutionPath::kNative;
+}
 }  // namespace
 
 
@@ -1640,7 +1669,8 @@ void ScriptExecutor::ExecuteScript(const base::Value::List& timeline,
 
   Observe(target_web_contents_);
 
-  if (force_native_execution_for_run_ && target_web_contents_) {
+  if (target_web_contents_ &&
+      RunMayUseNativeInput(force_native_execution_for_run_)) {
     dashboard::ActivateWebContentsForNativeScriptRun(target_web_contents_);
   }
 
@@ -1730,8 +1760,9 @@ void ScriptExecutor::ExecuteScript(const base::Value::List& timeline,
   is_paused_ = false;
   task_runner_->PostTask(
       FROM_HERE,
-      base::BindOnce(&ScriptExecutor::ExecuteNextAction,
-                     weak_ptr_factory_.GetWeakPtr()));
+      base::BindOnce(&ScriptExecutor::WaitForTargetLoadThenExecute,
+                     weak_ptr_factory_.GetWeakPtr(),
+                     base::TimeTicks::Now() + base::Seconds(15)));
 }
 
 void ScriptExecutor::ExecuteScriptFromStep(const base::Value::List& timeline,
@@ -1789,7 +1820,8 @@ void ScriptExecutor::ExecuteScriptFromStep(const base::Value::List& timeline,
 
   Observe(target_web_contents_);
 
-  if (force_native_execution_for_run_ && target_web_contents_) {
+  if (target_web_contents_ &&
+      RunMayUseNativeInput(force_native_execution_for_run_)) {
     dashboard::ActivateWebContentsForNativeScriptRun(target_web_contents_);
   }
 
@@ -2025,6 +2057,35 @@ void ScriptExecutor::PollUntilLoadedThenStart(int start_step_index,
       base::Milliseconds(250));
 }
 
+// A run can target a tab that was just created for it; input sent before its
+// first document commits and finishes loading is dropped.
+void ScriptExecutor::WaitForTargetLoadThenExecute(base::TimeTicks deadline) {
+  if (!status_.is_running) {
+    return;
+  }
+  if (!target_web_contents_) {
+    ExecuteNextAction();
+    return;
+  }
+  const GURL committed = target_web_contents_->GetLastCommittedURL();
+  const bool ready = !target_web_contents_->IsLoading() &&
+                     committed.is_valid() && !committed.IsAboutBlank();
+  if (ready || base::TimeTicks::Now() >= deadline) {
+    if (!ready) {
+      LOG(WARNING) << "[Executor] Target not loaded before first step; "
+                      "starting anyway url="
+                   << committed.spec();
+    }
+    ExecuteNextAction();
+    return;
+  }
+  task_runner_->PostDelayedTask(
+      FROM_HERE,
+      base::BindOnce(&ScriptExecutor::WaitForTargetLoadThenExecute,
+                     weak_ptr_factory_.GetWeakPtr(), deadline),
+      base::Milliseconds(100));
+}
+
 void ScriptExecutor::ScheduleContinuationWithHumanizedDelay(
     base::OnceClosure continuation,
     bool skip_delay) {
@@ -2146,6 +2207,17 @@ void ScriptExecutor::AttemptAction(bool is_key_script,
     if (ShouldRefreshApcBeforeAction(kind)) {
       dashboard::InvalidateUnifiedPageMapCache(target_web_contents_);
     }
+  }
+  if (IsHumanCaptchaPauseAction(source_action_dict)) {
+    UpdatePlaybackOverlayProgress(
+        "Solve the captcha if shown, then press Resume");
+    if (is_key_script) {
+      key_step_ = static_cast<int>(index + 1);
+    } else {
+      current_step_ = static_cast<int>(index + 1);
+    }
+    PauseExecution();
+    return;
   }
   pending_url_before_ = target_web_contents_->GetLastCommittedURL().spec();
   pending_action_started_at_ = base::TimeTicks::Now();

@@ -55,7 +55,8 @@ function isSimulachromeAgentGuest(): boolean {
   }
   try {
     const guest = String(loadTimeData.getString('glicGuestURL') || '');
-    return guest.startsWith('chrome://simulachrome-agent');
+    return guest.startsWith('chrome://simulachrome-agent') ||
+        guest.includes('chrome://glic/agent/');
   } catch (_) {
     return false;
   }
@@ -127,9 +128,13 @@ type ChromeEventFunctionType<T> =
     T extends ChromeEvent<infer ListenerType>? ListenerType : never;
 
 // Creates and manages the <webview> element, and the GlicApiHost which
-// communicates with it.
+// communicates with it. For the packaged Simulachrome agent guest, uses an
+// <iframe> loaded from a blob: document whose module graph is also blob:
+// URLs (chrome:// cannot be a <webview> guest, chrome://glic cannot iframe
+// itself, and chrome://glic/agent scripts are not served to blob documents).
 export class WebviewController {
-  webview: chrome.webviewTag.WebView;
+  webview?: chrome.webviewTag.WebView;
+  private agentFrame?: HTMLIFrameElement;
   private host?: GlicApiHost;
   private communicator?: GlicApiCommunicator;
   private hostSubscriber?: Subscriber;
@@ -138,7 +143,7 @@ export class WebviewController {
   private webClientState =
       ObservableValue.withValue(WebClientState.UNINITIALIZED);
   private oneMinuteTimer = new OneShotTimer(1000 * 60);
-  private glicRequestHeaderInjector: GlicRequestHeaderInjector;
+  private glicRequestHeaderInjector?: GlicRequestHeaderInjector;
 
   constructor(
       private readonly container: HTMLElement,
@@ -147,6 +152,11 @@ export class WebviewController {
       private hostEmbedder: ApiHostEmbedder,
       private persistentState: WebviewPersistentState,
   ) {
+    if (isSimulachromeAgentGuest()) {
+      this.installAgentIframe();
+      return;
+    }
+
     this.webview =
         document.createElement('webview') as chrome.webviewTag.WebView;
 
@@ -165,7 +175,7 @@ export class WebviewController {
         },
         ['blocking']);
     this.onDestroy.push(() => {
-      this.webview.request.onBeforeRequest.removeListener(onBeforeRequest);
+      this.webview?.request.onBeforeRequest.removeListener(onBeforeRequest);
     });
 
     this.webview.id = 'guestFrame';
@@ -197,12 +207,144 @@ export class WebviewController {
     });
   }
 
+  private installAgentIframe() {
+    const url = this.persistentState.useLoadUrl();
+    const iframe = document.createElement('iframe');
+    iframe.id = 'guestFrame';
+    iframe.title = 'Simulachrome Agent';
+    iframe.setAttribute(
+        'allow', 'clipboard-read; clipboard-write; microphone; camera');
+    iframe.style.border = '0';
+    iframe.style.width = '100%';
+    iframe.style.height = '100%';
+    iframe.style.display = 'block';
+    iframe.style.background = '#0b1020';
+    this.agentFrame = iframe;
+    this.container.appendChild(iframe);
+
+    const markReady = () => {
+      this.browserProxy.handler.webviewCommitted({url});
+      this.webClientState.assignAndSignal(WebClientState.RESPONSIVE);
+      this.persistentState.onClientReady();
+      this.hostEmbedder.webClientReady();
+      this.delegate.webviewPageCommit('login');
+    };
+
+    // Do not navigate the iframe to chrome://glic/agent/* (frame-ancestors
+    // 'none' + nested GlicUI crash) or chrome://simulachrome-agent (blank
+    // gray host panel). Fetch packaged files in the parent and embed a blob:
+    // document whose scripts are also blob: URLs (script-src allows blob:
+    // for this guest). chrome://glic/agent/*.js is not served to blob
+    // documents, so the module graph cannot use those URLs.
+    const requestAgentFile = (relative: string): Promise<string> => {
+      return new Promise((resolve, reject) => {
+        const cb = `__sc_agent_file_${Date.now()}_${
+            Math.random().toString(36).slice(2)}`;
+        const timeout = window.setTimeout(() => {
+          try {
+            delete (window as unknown as Record<string, unknown>)[cb];
+          } catch (_) {
+          }
+          reject(new Error('dashboardGetAgentHtml timeout'));
+        }, 8000);
+        (window as unknown as Record<string, unknown>)[cb] = (result: {
+          ok?: boolean, html?: string, error?: string
+        }) => {
+          window.clearTimeout(timeout);
+          try {
+            delete (window as unknown as Record<string, unknown>)[cb];
+          } catch (_) {
+          }
+          if (result && result.ok && typeof result.html === 'string') {
+            resolve(result.html);
+          } else {
+            reject(new Error(result?.error || 'dashboardGetAgentHtml failed'));
+          }
+        };
+        try {
+          (chrome as unknown as {send: (m: string, a: unknown[]) => void})
+              .send('dashboardGetAgentHtml', [cb, relative]);
+        } catch (e) {
+          window.clearTimeout(timeout);
+          reject(e);
+        }
+      });
+    };
+
+    const blobUrl = (text: string, type: string): string => {
+      const url = URL.createObjectURL(new Blob([text], {type}));
+      this.onDestroy.push(() => URL.revokeObjectURL(url));
+      return url;
+    };
+
+    const parentBridgeJs =
+        `(function(){try{if(!window.chrome)window.chrome={};` +
+        `var _send=window.chrome.send;window.chrome.send=function(m,a){` +
+        `try{if(window.parent&&window.parent!==window&&` +
+        `window.parent.chrome&&typeof window.parent.chrome.send==='function'){` +
+        `var args=Array.prototype.slice.call(a||[]);` +
+        `var cb=args[0];if(typeof cb==='string'){` +
+        `var parentCb='__sc_bridge_'+cb;` +
+        `window.parent[parentCb]=function(){` +
+        `var fn=window[cb];if(typeof fn==='function')` +
+        `fn.apply(window,arguments);` +
+        `try{delete window.parent[parentCb];}catch(e){}};` +
+        `args[0]=parentCb;}` +
+        `return window.parent.chrome.send(m,args);}}catch(e){}` +
+        `if(typeof _send==='function')return _send.apply(this,arguments);` +
+        `};}catch(e){}})();`;
+
+    void (async () => {
+      try {
+        const [htmlRaw, clientJsRaw, apiBoot, glicApi] = await Promise.all([
+          requestAgentFile('ollama.html'),
+          requestAgentFile('ollama_client.js'),
+          requestAgentFile('api_boot.js'),
+          requestAgentFile('glic_api_stub.js'),
+        ]);
+        const apiBootUrl = blobUrl(apiBoot, 'text/javascript');
+        const glicApiUrl = blobUrl(glicApi, 'text/javascript');
+        let clientJs = clientJsRaw;
+        const importRewrites: Array<[string, string]> = [
+          ["from '/glic/glic_api/glic_api.js'", `from '${glicApiUrl}'`],
+          ['from "/glic/glic_api/glic_api.js"', `from '${glicApiUrl}'`],
+          ["from '../api_boot.js'", `from '${apiBootUrl}'`],
+          ['from "../api_boot.js"', `from '${apiBootUrl}'`],
+          ["from './glic_api_stub.js'", `from '${glicApiUrl}'`],
+          ["from './api_boot.js'", `from '${apiBootUrl}'`],
+        ];
+        for (const [from, to] of importRewrites) {
+          clientJs = clientJs.split(from).join(to);
+        }
+        const clientUrl = blobUrl(clientJs, 'text/javascript');
+        const bridgeUrl = blobUrl(parentBridgeJs, 'text/javascript');
+        let html = htmlRaw;
+        html = html.replace(
+            /<script src="chrome:\/\/glic\/agent\/parent_bridge\.js"><\/script>\s*/g,
+            '');
+        html = html.replace(
+            /\b(src)=["'](?:\.\/)?ollama_client\.js["']/g,
+            `src="${clientUrl}"`);
+        html = html.replace(
+            /\b(src)=["']chrome:\/\/glic\/agent\/ollama_client\.js["']/g,
+            `src="${clientUrl}"`);
+        html = `<script src="${bridgeUrl}"></script>\n` + html;
+        const pageUrl = blobUrl(html, 'text/html');
+        iframe.addEventListener('load', markReady, {once: true});
+        iframe.src = pageUrl;
+      } catch (err) {
+        console.warn('Failed to embed packaged agent UI', err);
+        this.delegate.webviewError('agent_blob_error');
+      }
+    })();
+  }
+
   getWebClientState(): ObservableValueReadOnly<WebClientState> {
     return this.webClientState;
   }
 
   destroy() {
-    this.glicRequestHeaderInjector.destroy();
+    this.glicRequestHeaderInjector?.destroy();
     this.oneMinuteTimer.reset();
     if (this.host) {
       chrome.metricsPrivate.recordEnumerationValue(
@@ -217,7 +359,10 @@ export class WebviewController {
     this.eventTracker.removeAll();
     this.onDestroy.forEach(f => f());
     this.onDestroy = [];
-    this.webview.remove();
+    this.agentFrame?.remove();
+    this.agentFrame = undefined;
+    this.webview?.remove();
+    this.webview = undefined;
   }
 
   private destroyHost(webClientState: WebClientState) {
@@ -254,7 +399,7 @@ export class WebviewController {
   }
 
   private onLoadStop(): void {
-    this.webview.focus();
+    this.webview?.focus();
   }
 
   private onNewWindow(e: Event): void {
@@ -323,10 +468,10 @@ export class WebviewController {
     this.destroyHost(WebClientState.UNINITIALIZED);
 
     // Local Simulachrome agent UI does not speak Gemini's Glic web-client
-    // protocol. Treat a successful chrome://simulachrome-agent commit as ready
-    // so the host never shows the "Gemini isn't available" error panel.
-    if (isSimulachromeAgentGuest() &&
-        url.startsWith('chrome://simulachrome-agent')) {
+    // protocol. Any top-level commit while configured for the packaged agent
+    // (including chrome-error:// after a WebUI hiccup) must not fall through
+    // to the Gemini "isn't available" panel.
+    if (isSimulachromeAgentGuest()) {
       this.browserProxy.handler.webviewCommitted({url});
       this.webClientState.assignAndSignal(WebClientState.RESPONSIVE);
       this.persistentState.onClientReady();
@@ -336,7 +481,7 @@ export class WebviewController {
     }
 
     const origin = new URL(url).origin;
-    if (this.webview.contentWindow && origin !== 'null') {
+    if (this.webview?.contentWindow && origin !== 'null') {
       this.communicator =
           new GlicApiCommunicator(origin, this.webview.contentWindow);
       this.host = new GlicApiHost(

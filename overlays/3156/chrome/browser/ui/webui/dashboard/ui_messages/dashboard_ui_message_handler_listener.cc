@@ -1249,16 +1249,16 @@ void ReapOrphanedHeadlessListenerProcessesBlocking() {
     return;
   }
 #if BUILDFLAG(IS_POSIX)
-  std::vector<std::string> argv = {"/usr/bin/pkill", "-f",
+  // BSD pkill treats a leading "--pattern" as flags unless "--" ends options.
+  // Do not WaitForExit: ThreadPool workers cannot wait on sync primitives
+  // without WithBaseSyncPrimitives, and this build has DCHECK_ALWAYS_ON.
+  std::vector<std::string> argv = {"/usr/bin/pkill", "-f", "--",
                                    "--headless-listener"};
   base::Process p = base::LaunchProcess(argv, base::LaunchOptions());
   if (p.IsValid()) {
-    int exit = 0;
-    p.WaitForExit(&exit);
-    if (exit == 0) {
-      LOG(WARNING) << "[Headless] Reaped orphaned --headless-listener "
-                      "process(es) so headed Chromium can show a window";
-    }
+    LOG(INFO) << "[Headless] Requested reap of orphaned --headless-listener "
+                 "process(es)";
+    p.Close();
   }
   const base::FilePath sock = DefaultHeadlessControlSocketPath();
   if (!sock.empty()) {
@@ -1733,12 +1733,32 @@ void DashboardUIMessageHandler::HandleRefreshHeadlessTab(
     }
   }
 
-  out.Set("success", false);
-  out.Set("owner_id", owner_id);
-  out.Set("ownerId", owner_id);
-  out.Set("error",
-          "Native headless refresh over the control channel is not wired yet.");
-  ResolveCallback(cb, out);
+  dashboard::HeadlessListenerController* controller =
+      dashboard::HeadlessListenerController::GetForProfile(profile_);
+  if (!controller) {
+    headless_listener_controller_ =
+        std::make_unique<dashboard::HeadlessListenerController>(profile_);
+    controller = headless_listener_controller_.get();
+  }
+  controller->RefreshListener(
+      owner_id,
+      base::BindOnce(
+          [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb,
+             std::string owner_id, bool ok, base::Value::Dict response) {
+            if (!self) {
+              return;
+            }
+            base::Value::Dict out = std::move(response);
+            out.Set("success", ok);
+            out.Set("owner_id", owner_id);
+            out.Set("ownerId", owner_id);
+            out.Set("mode", "headless");
+            if (!ok && !out.FindString("error")) {
+              out.Set("error", "Headless refresh failed.");
+            }
+            self->ResolveCallback(cb, out);
+          },
+          weak_ptr_factory_.GetWeakPtr(), cb, owner_id));
 }
 
 
@@ -2070,14 +2090,31 @@ void DashboardUIMessageHandler::HandleRequestHeadlessScreenshot(
   content::WebContents* wc =
       listener_manager_->GetListenerWebContents(script_id);
   if (!wc) {
-    base::Value::Dict res;
-    res.Set("script_id", script_id);
-    res.Set("scriptId", script_id);
-    res.Set("success", false);
-    res.Set("error",
-            "Listener is not active in this process. Isolated headless "
-            "screenshots over the control channel are not wired yet.");
-    ResolveCallback(cb, res);
+    dashboard::HeadlessListenerController* controller =
+        dashboard::HeadlessListenerController::GetForProfile(profile_);
+    if (!controller) {
+      headless_listener_controller_ =
+          std::make_unique<dashboard::HeadlessListenerController>(profile_);
+      controller = headless_listener_controller_.get();
+    }
+    controller->CaptureScreenshot(
+        script_id,
+        base::BindOnce(
+            [](base::WeakPtr<DashboardUIMessageHandler> self, std::string cb,
+               std::string script_id, bool ok, base::Value::Dict response) {
+              if (!self) {
+                return;
+              }
+              base::Value::Dict res = std::move(response);
+              res.Set("script_id", script_id);
+              res.Set("scriptId", script_id);
+              res.Set("success", ok && res.FindBool("success").value_or(ok));
+              if (!ok && !res.FindString("error")) {
+                res.Set("error", "Headless screenshot failed.");
+              }
+              self->ResolveCallback(cb, res);
+            },
+            weak_ptr_factory_.GetWeakPtr(), cb, script_id));
     return;
   }
   content::RenderWidgetHostView* view = wc->GetRenderWidgetHostView();

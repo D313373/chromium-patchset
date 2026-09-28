@@ -47,6 +47,8 @@ type ContextNode = {
   required?: boolean,
   disabled?: boolean,
   visible?: boolean,
+  overlay?: boolean,
+  cssClass?: string,
   bounds?: {x: number, y: number, width: number, height: number},
   locators?: LocatorCandidate[],
 };
@@ -58,6 +60,7 @@ type PageContextSummary = {
   title?: string,
   innerText?: string,
   documentId?: string,
+  hasOverlay?: boolean,
   /** CSS/DIP viewport size from APC (click coordinate space). */
   viewportCss?: {width: number, height: number},
   elements: ContextNode[],
@@ -249,6 +252,21 @@ function modelOptionLabel(provider: AgentProvider, option: ModelOption): string 
   return option.value;
 }
 
+
+// Task-loop prompts (goal + page context) and review prompts are model input;
+// they stay in `messages` but are not rendered in the chat.
+function isLoopContextMessage(m: ChatMessage): boolean {
+  const text = String(m.content || '');
+  if (m.role === 'system') {
+    return text.startsWith('[Simulachrome Context]');
+  }
+  if (m.role !== 'user') {
+    return false;
+  }
+  return /^\s*USER GOAL \(highest priority/.test(text) ||
+      /(Return|Provide) the next action JSON only\./.test(text) ||
+      text.startsWith('Task succeeded. Review the recorded steps');
+}
 
 function parseCsv(text: string): string[][] {
   const rows: string[][] = [];
@@ -650,6 +668,7 @@ type MinimalElementDescriptor = {
   text?: string,
   kind?: string,
   role?: string,
+  cls?: string,
   pos?: [number, number],
 };
 
@@ -723,6 +742,54 @@ function positionKey(bounds?: {x: number, y: number, width: number, height: numb
   const x = quantize(center.x, 20);
   const y = quantize(center.y, 20);
   return {key: `${x},${y}`, pos: [x, y]};
+}
+
+
+/** Visual tokens: one per 28x28 patch. Matches Anthropic vision-coordinates. */
+function countImageTokens(width: number, height: number): number {
+  return Math.ceil(width / 28) * Math.ceil(height / 28);
+}
+
+function roundTiesToEven(value: number): number {
+  const floor = Math.floor(value);
+  if (value - floor !== 0.5) {
+    return Math.round(value);
+  }
+  return floor % 2 === 0 ? floor : floor + 1;
+}
+
+/**
+ * Size Claude actually sees before padding. Standard tier = 1568 edge / 1568
+ * tokens (Sonnet 4.5). Sending a larger screenshot makes Claude downscale and
+ * return coordinates in that smaller space — which we were clicking as DIP.
+ */
+function claudeResizedSize(
+    width: number, height: number, maxEdge = 1568, maxTokens = 1568):
+    [number, number] {
+  const fits = (w: number, h: number): boolean =>
+      Math.ceil(w / 28) * 28 <= maxEdge &&
+      Math.ceil(h / 28) * 28 <= maxEdge &&
+      countImageTokens(w, h) <= maxTokens;
+  if (fits(width, height)) {
+    return [width, height];
+  }
+  if (height > width) {
+    const [resizedH, resizedW] =
+        claudeResizedSize(height, width, maxEdge, maxTokens);
+    return [resizedW, resizedH];
+  }
+  const aspectRatio = width / height;
+  let lo = 1;
+  let hi = width;
+  while (lo + 1 < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (fits(mid, Math.max(roundTiesToEven(mid / aspectRatio), 1))) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return [lo, Math.max(roundTiesToEven(lo / aspectRatio), 1)];
 }
 
 function countBy<T>(items: T[], keyFn: (item: T) => string|undefined): Map<string, number> {
@@ -1406,11 +1473,14 @@ class OllamaWebClient implements GlicWebClient {
   private taskLoopStopRequested = false;
   private taskCounter = 0;
   private queueStatusEl: HTMLElement|null = null;
+  private pauseQueueBtnEl: HTMLButtonElement|null = null;
   private taskInfoEl: HTMLElement|null = null;
+  private maxStepsInputEl: HTMLInputElement|null = null;
   private actorTaskId: number|null = null;
   private unifiedRunId: string|null = null;
   private warnedNoActorTask = false;
   private lastContextError: string|null = null;
+  private lastScreenshotError: string|null = null;
   private lastPageContext: PageContextSummary|null = null;
   private lastActionSummary: string|null = null;
   private maxStepsPerTask = 20;
@@ -1437,6 +1507,27 @@ class OllamaWebClient implements GlicWebClient {
   private hybridExecutionEnabled = true;
   private nonVisualContextMode = true;
   private attachContextForManualPrompts = false;
+  /** When set, Send appends to the running task instead of starting a new one. */
+  private guideCurrentTaskEnabled = false;
+  /** When set, a manual prompt that starts a task may open a new tab. */
+  private openPromptInNewTabEnabled = false;
+  /** User notes waiting to merge into the next runTaskLoop iteration. */
+  private pendingLoopGuidance: string[] = [];
+  /** Extra guidance currently attached to loop prompts (not part of the original goal). */
+  private activeLoopGuidance = '';
+  /** How many loop prompts have already included activeLoopGuidance. */
+  private loopGuidanceAppliedTurns = 0;
+  private captchaChallengeActive = false;
+  private captchaClicksThisChallenge = 0;
+  private captchaSeenThisTask = false;
+  /** At least one captcha checkbox/coordinate click this task. */
+  private captchaActuatedThisTask = false;
+  /** Extra puzzle/tiles were seen after the checkbox. */
+  private sawCaptchaFollowUpThisTask = false;
+  /** Captcha is finished; login/submit is allowed. */
+  private captchaClearedThisTask = false;
+  /** Loop yielded so the user can solve a hard captcha; task stays active. */
+  private humanCaptchaHold = false;
   private promptOptimizerEnabled = false;
   private promptHistory: string[] = [];
   /** -1 = live draft; 0 = most recent history entry. */
@@ -1445,10 +1536,20 @@ class OllamaWebClient implements GlicWebClient {
   private promptInputEl: HTMLInputElement|null = null;
   private contextLockMode: ContextLockMode = 'locked';
   private taskTabId: string|null = null;
+  private oauthTabId: string|null = null;
+  private oauthTabUrl: string|null = null;
+  private oauthWindowId: number|null = null;
+  private oauthFlowStartedAt = 0;
+  private oauthAnnounced = false;
+  private oauthPopupExpectedUntil = 0;
+  private knownBrowserTabIds: Set<string> = new Set();
   private workingTabId: string|null = null;
   private workingTabUrl: string|null = null;
   private workingTabTitle: string|null = null;
   private currentTaskStepIndex = 0;
+  private pausedResumeFromStep = 0;
+  private scriptSegmentStartedAtMs = 0;
+  private scriptSegmentIndex = 0;
   private queueWidgetToggleEl: HTMLButtonElement|null = null;
   private queueWidgetPanelEl: HTMLElement|null = null;
   private queueWidgetSubtitleEl: HTMLElement|null = null;
@@ -1459,6 +1560,8 @@ class OllamaWebClient implements GlicWebClient {
   private panelAttachToggleEl: HTMLButtonElement|null = null;
   private canAttachPanelNow = true;
   private attachContextToggleEl: HTMLInputElement|null = null;
+  private guideCurrentTaskToggleEl: HTMLInputElement|null = null;
+  private openPromptInNewTabToggleEl: HTMLInputElement|null = null;
   private promptOptimizerToggleEl: HTMLInputElement|null = null;
   private modeSelectEl: HTMLSelectElement|null = null;
   private providerSelectEl: HTMLSelectElement|null = null;
@@ -1484,8 +1587,16 @@ class OllamaWebClient implements GlicWebClient {
     mimeType: string,
     cssWidth?: number,
     cssHeight?: number,
+    imageWidth?: number,
+    imageHeight?: number,
     note?: string,
   }|null = null;
+  private lastScreenshotClickSpace: {clickW: number, clickH: number, imageW: number, imageH: number}|null = null;
+  /** Consecutive turns that only captured/requested screenshots (no click/type). */
+  private screenshotOnlyStreak = 0;
+  private capturedScreenshotThisTurn = false;
+  /** Extra request_screenshot calls after a live shot was already attached. */
+  private screenshotSpamStrikes = 0;
 
 
 
@@ -1654,7 +1765,7 @@ class OllamaWebClient implements GlicWebClient {
     const options = PROVIDER_MODEL_OPTIONS[provider] || [];
     const desired = sanitizeModelForProvider(
         provider, preferredModel || this.selectedModel || this.modelSelectEl.value);
-    this.modelSelectEl.innerHTML = '';
+    this.modelSelectEl.replaceChildren();
     for (const option of options) {
       const el = document.createElement('option');
       el.value = option.value;
@@ -2040,6 +2151,8 @@ class OllamaWebClient implements GlicWebClient {
     this.hybridExecutionEnabled = this.resolveHybridExecutionSetting();
     this.nonVisualContextMode = this.resolveNonVisualContextMode();
     this.attachContextForManualPrompts = this.resolveAttachContextMode();
+    this.guideCurrentTaskEnabled = this.resolveGuideCurrentTaskEnabled();
+    this.openPromptInNewTabEnabled = this.resolveOpenPromptInNewTabEnabled();
     this.promptOptimizerEnabled = this.resolvePromptOptimizerEnabled();
     this.keepWarmHeadlessInvestigationTab =
         this.resolveKeepWarmHeadlessInvestigationTab();
@@ -2060,20 +2173,19 @@ class OllamaWebClient implements GlicWebClient {
     this.panelModeEl = document.getElementById('panelMode');
     this.panelAttachToggleEl =
         document.getElementById('panelAttachToggle') as HTMLButtonElement | null;
-    if (!this.browser.attachPanel || !this.browser.detachPanel) {
+    if (!this.browser.attachPanel && !this.browser.detachPanel &&
+        !this.canUseChromeSend()) {
       this.panelAttachToggleEl?.setAttribute('hidden', 'hidden');
       if (this.panelModeEl) {
         this.panelModeEl.textContent = 'Attached';
       }
     }
     this.panelAttachToggleEl?.addEventListener('click', () => {
-      const label = (this.panelAttachToggleEl?.dataset['mode'] || '').toLowerCase();
-      if (label === 'detached') {
-        this.browser?.attachPanel?.();
-      } else {
-        this.browser?.detachPanel?.();
-      }
+      void this.togglePanelDockFromChrome();
     });
+    if (this.canUseChromeSend()) {
+      void this.refreshPanelChromeFromHost();
+    }
     this.browser.getPanelState?.()?.subscribe((state) => {
       this.updatePanelChrome(state);
     });
@@ -2095,6 +2207,10 @@ class OllamaWebClient implements GlicWebClient {
         document.getElementById('model') as HTMLSelectElement | null;
     const attachContextToggle =
         document.getElementById('attachContextToggle') as HTMLInputElement | null;
+    const guideCurrentTaskToggle =
+        document.getElementById('guideCurrentTaskToggle') as HTMLInputElement | null;
+    const openPromptInNewTabToggle =
+        document.getElementById('openPromptInNewTabToggle') as HTMLInputElement | null;
     const promptOptimizerToggle =
         document.getElementById('promptOptimizerToggle') as HTMLInputElement | null;
     this.sendBtnEl = send;
@@ -2103,13 +2219,19 @@ class OllamaWebClient implements GlicWebClient {
     this.providerSelectEl = providerSelect;
     this.modelSelectEl = modelSelect;
     this.attachContextToggleEl = attachContextToggle;
+    this.guideCurrentTaskToggleEl = guideCurrentTaskToggle;
+    this.openPromptInNewTabToggleEl = openPromptInNewTabToggle;
     this.promptOptimizerToggleEl = promptOptimizerToggle;
     {
       const initialProvider = this.resolveConfiguredProvider();
       const initialModel = this.resolveConfiguredModel(initialProvider);
       // localStorage / window only — do not POST yet or a fresh DevProfile
       // would overwrite disk prefs with the Ollama default before restore.
-      this.applyProviderModelSelection(initialProvider, initialModel, false);
+      try {
+        this.applyProviderModelSelection(initialProvider, initialModel, false);
+      } catch (e) {
+        console.warn('applyProviderModelSelection failed', e);
+      }
       window.__DASH_PROVIDER = this.selectedProvider;
       window.__DASH_MODEL = this.selectedModel;
       if (this.selectedProvider === 'local') {
@@ -2155,6 +2277,30 @@ class OllamaWebClient implements GlicWebClient {
             this.attachContextForManualPrompts ? '1' : '0');
       } catch (_) {}
     });
+    if (this.guideCurrentTaskToggleEl) {
+      this.guideCurrentTaskToggleEl.checked = this.guideCurrentTaskEnabled;
+    }
+    this.guideCurrentTaskToggleEl?.addEventListener('change', () => {
+      this.guideCurrentTaskEnabled = !!this.guideCurrentTaskToggleEl?.checked;
+      try {
+        localStorage.setItem(
+            'glic.guide_current_task',
+            this.guideCurrentTaskEnabled ? '1' : '0');
+      } catch (_) {}
+      this.syncPromptPlaceholder();
+    });
+    if (this.openPromptInNewTabToggleEl) {
+      this.openPromptInNewTabToggleEl.checked = this.openPromptInNewTabEnabled;
+    }
+    this.openPromptInNewTabToggleEl?.addEventListener('change', () => {
+      this.openPromptInNewTabEnabled = !!this.openPromptInNewTabToggleEl?.checked;
+      try {
+        localStorage.setItem(
+            'glic.open_prompt_new_tab',
+            this.openPromptInNewTabEnabled ? '1' : '0');
+      } catch (_) {}
+    });
+    this.syncPromptPlaceholder();
     if (this.promptOptimizerToggleEl) {
       this.promptOptimizerToggleEl.checked = this.promptOptimizerEnabled;
     }
@@ -2223,7 +2369,11 @@ class OllamaWebClient implements GlicWebClient {
     const csvText = document.getElementById('csvText') as HTMLTextAreaElement | null;
     const loadText = document.getElementById('loadText') as HTMLButtonElement | null;
     const startQueue = document.getElementById('startQueue') as HTMLButtonElement | null;
+    this.maxStepsInputEl = document.getElementById('maxSteps') as HTMLInputElement | null;
     const pauseQueue = document.getElementById('pauseQueue') as HTMLButtonElement | null;
+    this.pauseQueueBtnEl = pauseQueue;
+    const completeTask = document.getElementById('completeTask') as HTMLButtonElement | null;
+    const solvedCaptcha = document.getElementById('solvedCaptcha') as HTMLButtonElement | null;
     const nextTask = document.getElementById('nextTask') as HTMLButtonElement | null;
     const queueWidgetClose =
         document.getElementById('queueWidgetClose') as HTMLButtonElement | null;
@@ -2231,6 +2381,10 @@ class OllamaWebClient implements GlicWebClient {
         document.getElementById('queueResume') as HTMLButtonElement | null;
     const queuePause =
         document.getElementById('queuePause') as HTMLButtonElement | null;
+    const queueComplete =
+        document.getElementById('queueComplete') as HTMLButtonElement | null;
+    const queueSolvedCaptcha =
+        document.getElementById('queueSolvedCaptcha') as HTMLButtonElement | null;
     const queueNext = document.getElementById('queueNext') as HTMLButtonElement | null;
     const queueClear = document.getElementById('queueClear') as HTMLButtonElement | null;
 
@@ -2299,14 +2453,29 @@ class OllamaWebClient implements GlicWebClient {
     loadPath?.addEventListener('click', () => void loadFromPath());
     loadText?.addEventListener('click', () => void loadFromText());
     startQueue?.addEventListener('click', () => void this.startQueue());
-    pauseQueue?.addEventListener('click', () => this.pauseQueue());
+    this.maxStepsInputEl?.addEventListener('blur', () => {
+      void this.applyMaxStepsFromInput({persist: true});
+    });
+    this.maxStepsInputEl?.addEventListener('change', () => {
+      void this.applyMaxStepsFromInput({persist: true});
+    });
+    this.maxStepsInputEl?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        (e.currentTarget as HTMLInputElement).blur();
+      }
+    });
+    pauseQueue?.addEventListener('click', () => this.togglePauseResume());
+    completeTask?.addEventListener('click', () => void this.markTaskCompleteByUser());
+    solvedCaptcha?.addEventListener('click', () => void this.startQueue());
     nextTask?.addEventListener('click', () => void this.skipToNextTask());
     this.queueWidgetToggleEl?.addEventListener('click', () => {
       this.toggleQueueWidget();
     });
     queueWidgetClose?.addEventListener('click', () => this.toggleQueueWidget(false));
-    queueResume?.addEventListener('click', () => void this.startQueue());
+    queueResume?.addEventListener('click', () => this.resumePausedTask());
     queuePause?.addEventListener('click', () => this.pauseQueue());
+    queueComplete?.addEventListener('click', () => void this.markTaskCompleteByUser());
+    queueSolvedCaptcha?.addEventListener('click', () => void this.startQueue());
     queueNext?.addEventListener('click', () => void this.skipToNextTask());
     queueClear?.addEventListener('click', () => this.clearQueuedTasks());
 
@@ -2314,6 +2483,7 @@ class OllamaWebClient implements GlicWebClient {
     this.updateQueueStatus();
     this.updateTaskInfo();
     this.renderQueueWidget();
+    void this.syncMaxStepsInputFromSettings();
   }
 
   private updatePanelChrome(state: PanelState|undefined) {
@@ -2343,13 +2513,54 @@ class OllamaWebClient implements GlicWebClient {
     this.updatePanelAttachability(this.canAttachPanelNow);
   }
 
+
+  private async togglePanelDockFromChrome() {
+    const label = (this.panelAttachToggleEl?.dataset['mode'] || '').toLowerCase();
+    const wantDock = label === 'detached';
+    // Packaged guest still has Glic host attachPanel, but AlwaysDetached
+    // used to ReportBadMessage. Prefer chrome.send so Dock always hits
+    // the dashboard attach path.
+    if (this.canUseChromeSend()) {
+      const res = await this.sendWithPromise(
+          wantDock ? 'dashboardAgentAttachPanel' : 'dashboardAgentDetachPanel');
+      if (res && res.ok === false) {
+        this.addSystemMessage(
+            `Panel ${wantDock ? 'dock' : 'pop out'} failed: ${
+                res.error || 'unknown'}`);
+      }
+    } else if (wantDock) {
+      this.browser?.attachPanel?.();
+    } else {
+      this.browser?.detachPanel?.();
+    }
+    await this.refreshPanelChromeFromHost();
+  }
+
+  private async refreshPanelChromeFromHost() {
+    if (!this.canUseChromeSend()) {
+      return;
+    }
+    const res = await this.sendWithPromise('dashboardAgentGetPanelState');
+    if (!res || res.ok === false) {
+      return;
+    }
+    this.updatePanelChrome({
+      kind: res.detached ? PanelStateKind.DETACHED : PanelStateKind.ATTACHED,
+    } as any);
+  }
+
   private updatePanelAttachability(canAttach: boolean) {
     this.canAttachPanelNow = canAttach;
     if (!this.panelAttachToggleEl) {
       return;
     }
     const mode = this.panelAttachToggleEl.dataset['mode'] || 'attached';
-    // Detaching should always remain available when the API is exposed.
+    // chrome.send attach works even when the Glic host reports canAttach=false
+    // (AlwaysDetached). Never grey out Dock in the packaged guest.
+    if (this.canUseChromeSend()) {
+      this.panelAttachToggleEl.disabled = false;
+      return;
+    }
     this.panelAttachToggleEl.disabled = mode === 'detached' ? !canAttach : false;
   }
 
@@ -2409,6 +2620,44 @@ class OllamaWebClient implements GlicWebClient {
       }
     } catch (_) {}
     // Default to detached context for normal chat unless user enables it.
+    return false;
+  }
+
+  private resolveGuideCurrentTaskEnabled(): boolean {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const fromQuery = params.get('guideCurrentTask');
+      if (fromQuery !== null) {
+        const v = fromQuery.trim().toLowerCase();
+        return v === '1' || v === 'true' || v === 'on';
+      }
+    } catch (_) {}
+    try {
+      const fromStorage = localStorage.getItem('glic.guide_current_task');
+      if (typeof fromStorage === 'string' && fromStorage.trim()) {
+        const v = fromStorage.trim().toLowerCase();
+        return v === '1' || v === 'true' || v === 'on';
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  private resolveOpenPromptInNewTabEnabled(): boolean {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const fromQuery = params.get('openPromptInNewTab');
+      if (fromQuery !== null) {
+        const v = fromQuery.trim().toLowerCase();
+        return v === '1' || v === 'true' || v === 'on';
+      }
+    } catch (_) {}
+    try {
+      const fromStorage = localStorage.getItem('glic.open_prompt_new_tab');
+      if (typeof fromStorage === 'string' && fromStorage.trim()) {
+        const v = fromStorage.trim().toLowerCase();
+        return v === '1' || v === 'true' || v === 'on';
+      }
+    } catch (_) {}
     return false;
   }
 
@@ -2572,10 +2821,37 @@ class OllamaWebClient implements GlicWebClient {
     return this.getSelectedProviderAndModel().provider === 'anthropic';
   }
 
+  private hasLiveScreenshot(): boolean {
+    return !!(this.pendingScreenshot && this.supportsScreenshotAction());
+  }
+
+  private liveScreenshotMustClickHint(): string {
+    const spam = this.screenshotSpamStrikes > 0 ?
+        ' Extra request_screenshot calls are ignored while this image is attached.' :
+        '';
+    return (
+      'A 1:1 viewport screenshot is already attached. request_screenshot is disabled. ' +
+      'You may still scroll, type, wait, use target_id, or click ' +
+      '{"coordinate":[x,y]} on this picture. After a scroll/navigation the shot is stale — ' +
+      'then request_screenshot is allowed again (or the host will recapture).' + spam
+    );
+  }
+
   /** Anthropic: capture viewport for the next model turn (used by request_screenshot
    *  and temporarily also by request_context to verify the vision path). */
   private async captureScreenshotForNextTurn(reason: string): Promise<boolean> {
     if (!this.supportsScreenshotAction()) {
+      return false;
+    }
+    if (this.pendingScreenshot && reason !== 'captcha multi-step vision') {
+      this.addSystemMessage(
+          `Skipped extra screenshot (${reason}): already have a fresh 1:1 viewport image. Click {"coordinate":[x,y]} on that picture.`);
+      return true;
+    }
+    if (this.screenshotOnlyStreak >= 2 && reason !== 'captcha multi-step vision') {
+      this.addSystemMessage(
+          `Skipped screenshot (${reason}): ${this.screenshotOnlyStreak} screenshot-only turns already. ` +
+          'Click {"coordinate":[x,y]} on the existing image, or use target_id.');
       return false;
     }
     // Skip quietly when this guest has no actuable tab binding (common for a
@@ -2589,19 +2865,33 @@ class OllamaWebClient implements GlicWebClient {
           (hasTabHint && !String(reason).startsWith('hotspot-test'))) {
         this.addSystemMessage(
             `request_screenshot failed (${reason}): could not capture a viewport image` +
+            (this.lastScreenshotError ? ` (${this.lastScreenshotError})` : '') +
             (hasTabHint ? '.' : ' (no task tab bound in this Glic guest).'));
       }
       return false;
     }
-    const annotated = await this.annotateScreenshotForCoordinateClicks(shot);
-    this.pendingScreenshot = annotated || shot;
+    const prepared = await this.prepareOneToOneScreenshot(shot);
+    this.pendingScreenshot = prepared || shot;
+    this.screenshotSpamStrikes = 0;
     const ready = this.pendingScreenshot;
+    const clickW = Number(ready.cssWidth || 0);
+    const clickH = Number(ready.cssHeight || 0);
+    const imageW = Number((ready as any).imageWidth || clickW);
+    const imageH = Number((ready as any).imageHeight || clickH);
+    if (clickW > 0 && clickH > 0) {
+      this.lastScreenshotClickSpace = {
+        clickW,
+        clickH,
+        imageW: imageW || clickW,
+        imageH: imageH || clickH,
+      };
+    }
     const kb = Math.max(1, Math.round(ready.base64.length / 1024));
-    const dim = (ready.cssWidth && ready.cssHeight) ?
-        ` ${ready.cssWidth}x${ready.cssHeight} CSS px + grid` :
-        '';
+    this.capturedScreenshotThisTurn = true;
+    this.screenshotOnlyStreak += 1;
     this.addSystemMessage(
-        `Captured viewport screenshot (${ready.mimeType}, ~${kb}KB${dim}) for the next Anthropic turn (${reason}).`);
+        `Screenshot ${imageW}x${imageH} (viewport ${clickW}x${clickH}) ` +
+        `(~${kb}KB). Click {"coordinate":[x,y]} on the picture (${reason}).`);
     return true;
   }
 
@@ -2765,6 +3055,12 @@ class OllamaWebClient implements GlicWebClient {
     };
   }
 
+  async notifyPanelWasClosed(): Promise<void> {
+    if (this.currentTask && !this.isTaskPaused()) {
+      this.pauseQueue('glic panel closed');
+    }
+  }
+
   private async autoSubmitPromptLikeUser(text: string): Promise<void> {
     const trimmed = String(text || '').trim();
     if (!trimmed) {
@@ -2790,13 +3086,40 @@ class OllamaWebClient implements GlicWebClient {
       return;
     }
     messagesEl.textContent = '';
+    const showContextStream =
+        localStorage.getItem('glic.show_context_stream') === '1';
     for (const m of this.messages) {
+      if (!showContextStream && isLoopContextMessage(m)) {
+        continue;
+      }
       const div = document.createElement('div');
       div.className = `msg ${m.role}`;
       div.textContent = m.content;
       messagesEl.appendChild(div);
     }
     messagesEl.scrollTop = messagesEl.scrollHeight;
+    this.persistLastRunTranscript();
+  }
+
+  private persistLastRunTranscript() {
+    try {
+      const compact = this.messages.slice(-60).map((m) => {
+        const raw = String(m.content || '');
+        return {
+          role: m.role,
+          content: raw.length > 800 ? raw.slice(0, 800) + '…' : raw,
+        };
+      });
+      localStorage.setItem('glic.last_run_transcript', JSON.stringify({
+        savedAt: Date.now(),
+        screenshotOnlyStreak: this.screenshotOnlyStreak,
+        captchaChallengeActive: this.captchaChallengeActive,
+        lastAction: this.lastActionSummary,
+        url: this.workingTabUrl || this.lastPageContext?.url || '',
+        messages: compact,
+      }));
+    } catch (_) {
+    }
   }
 
   private updateQueueStatus() {
@@ -2804,6 +3127,7 @@ class OllamaWebClient implements GlicWebClient {
       const running = this.queueRunning ? 'running' : 'paused';
       this.queueStatusEl.textContent = `Queue: ${this.taskQueue.length} (${running})`;
     }
+    this.syncPauseResumeButton();
     this.renderQueueWidget();
   }
 
@@ -2834,7 +3158,7 @@ class OllamaWebClient implements GlicWebClient {
     lines.push('{"action":"request_context"}');
     lines.push('{"action":"request_console_logs","level":"error|warning|all","limit":20}');
     lines.push('{"action":"delegate_profile","target_profile":"browser_operator|script_builder|script_debugger|auto_heal","reason":"..."}');
-    if (this.supportsScreenshotAction()) {
+    if (this.supportsScreenshotAction() && !this.hasLiveScreenshot()) {
       lines.push('{"action":"request_screenshot"}');
     }
     if (this.supportsDashboardInvestigation()) {
@@ -2852,10 +3176,13 @@ class OllamaWebClient implements GlicWebClient {
     lines.push('{"action":"hover","target_id":123}');
     lines.push('{"action":"type","target_id":123,"text":"..."}');
     lines.push('{"action":"type","coordinate":[x,y],"text":"..."}');
-    lines.push('{"action":"scroll","target_id":123,"distance":600}');
+    lines.push('{"action":"scroll","distance":600}');
+    lines.push('{"action":"scroll","scope":"page","distance":600}');
+    lines.push('{"action":"scroll","scope":"iframe","target_id":123,"distance":600}');
     lines.push('{"action":"scroll_to","target_id":123}');
     lines.push('{"action":"key_press","key":"Enter"}');
     lines.push('{"action":"wait","timeout":2}');
+    lines.push('{"action":"save_script","name":"site-name daily"}');
     lines.push('{"action":"complete"}');
     lines.push('');
     lines.push('Profile guidance: browser_operator=site interaction, script_builder=script/settings/data editing, script_debugger=investigation/failure diagnosis, auto_heal=healing workflows.');
@@ -2864,7 +3191,7 @@ class OllamaWebClient implements GlicWebClient {
     lines.push('');
     lines.push('For clickable/editable actions, prefer target_id from current context elements[].id.');
     lines.push(
-        'If a visible control is missing from elements[] (canvas/image overlay/popup), use click/type with {"coordinate":[x,y]} (viewport CSS pixels from a screenshot).');
+        'Use screenshot coordinates only for captchas/canvas after {"action":"request_screenshot"}. Email, password, and buttons use target_id.');
     if (this.supportsDashboardInvestigation()) {
       lines.push(
           'For persistent headless handoff, call investigate_page with closeTarget:false; then reuse task_id on later investigate_page calls.');
@@ -2874,9 +3201,9 @@ class OllamaWebClient implements GlicWebClient {
     lines.push('If page context is sparse/empty, request_context or investigate_page before making locator claims.');
     if (this.supportsScreenshotAction()) {
       lines.push(
-          'If a click/type does not produce a noticeable page change, use request_screenshot to inspect the viewport.');
+          'request_screenshot at most once, then click {"coordinate":[x,y]} on that picture. Do not request another screenshot.');
       lines.push(
-          'For screenshot-visible controls absent from elements[], use {"action":"click","coordinate":[x,y]} from the cyan CSS-pixel grid on the screenshot.');
+          'A screenshot is for captcha/canvas hits. Do not use coordinates to click normal inputs or buttons.');
     }
     lines.push('If there is no active queued task and the user asks to create a script, return one Simulachrome script JSON object (not action JSON, and not framework code).');
     lines.push('');
@@ -2991,7 +3318,11 @@ class OllamaWebClient implements GlicWebClient {
       return false;
     }
 
-    const url = this.resolveManualTaskExecutionUrl(userText, context);
+    const live = await this.resolveLivePageTab(context);
+    const destFromPrompt = this.promptDestinationUrl(userText);
+    const url = destFromPrompt ||
+        (live && this.isWebNavigableUrl(live.url) ? live.url : '') ||
+        this.resolveManualTaskExecutionUrl(userText, context);
     const temporaryTask: TaskItem = {
       id: `manual-${Date.now()}`,
       url,
@@ -3008,7 +3339,11 @@ class OllamaWebClient implements GlicWebClient {
     this.requestContextNextTurn = false;
     this.lastTaskElementIds = [];
     this.lastTaskLabeledElements = [];
+    this.clearLoopGuidanceState();
+    this.clearCaptchaChallengeState();
     this.currentTaskStepIndex = 0;
+    this.scriptSegmentStartedAtMs = Date.now();
+    this.scriptSegmentIndex = 0;
     this.clearTaskTabBinding();
     this.currentTabId = null;
     this.setWorkingContext(null, temporaryTask.url, temporaryTask.goal);
@@ -3029,21 +3364,47 @@ class OllamaWebClient implements GlicWebClient {
     if (!this.supportsUnifiedAgentOrchestrator()) {
       await this.ensureActorTask();
     }
-    const contextTabId = String(context?.tabId || '').trim();
-    const contextUrl = String(context?.url || '').trim();
     if (!this.shouldEnforceHeadlessOnlyForCurrentTask()) {
-      if (this.isWebNavigableUrl(url)) {
-        const alreadyThere = contextTabId && this.isWebNavigableUrl(contextUrl) &&
-            !this.isNonActuableBrowserUrl(contextUrl) &&
-            this.resolveManualTaskExecutionUrl('', context) === url;
-        if (alreadyThere) {
-          this.bindTaskTab(contextTabId, url, temporaryTask.goal);
+      if (this.openPromptInNewTabEnabled) {
+        const openUrl = destFromPrompt ||
+            (live && this.isWebNavigableUrl(live.url) ? live.url : '') ||
+            (this.isWebNavigableUrl(url) ? url : '');
+        if (this.isWebNavigableUrl(openUrl)) {
+          this.addSystemMessage(`Opening a new tab for ${openUrl}`);
+          await this.openTaskUrl(openUrl, {forceNew: true});
+          temporaryTask.url = openUrl;
         } else {
-          await this.openTaskUrl(url, {forceNew: !contextTabId});
+          this.addSystemMessage(
+              'Open prompt in new tab is on, but the prompt has no URL to open.');
         }
-      } else if (contextTabId) {
-        this.bindTaskTab(
-            contextTabId, contextUrl || url, temporaryTask.goal);
+      } else if (live?.tabId) {
+        this.bindTaskTab(live.tabId, live.url || url, temporaryTask.goal);
+        if (destFromPrompt &&
+            (!live.url || !this.sameSite(live.url, destFromPrompt) ||
+             String(live.url).replace(/\/$/, '') !==
+                 destFromPrompt.replace(/\/$/, ''))) {
+          this.addSystemMessage(
+              `Using the current tab; navigating it to ${destFromPrompt}`);
+          const ok = await this.navigateCurrentTab(destFromPrompt);
+          if (ok) {
+            temporaryTask.url = destFromPrompt;
+          } else {
+            this.addSystemMessage(
+                `Current-tab navigate failed; staying on ${live.url || 'this tab'}.`);
+          }
+        } else {
+          this.addSystemMessage(
+              `Using the current tab ${live.tabId}` +
+              (live.url ? ` (${live.url})` : '') + '.');
+        }
+      } else if (this.isWebNavigableUrl(destFromPrompt)) {
+        this.addSystemMessage(
+            `No live tab bound; opening ${destFromPrompt} so the task can run.`);
+        await this.openTaskUrl(destFromPrompt, {forceNew: true});
+        temporaryTask.url = destFromPrompt;
+      } else {
+        this.addSystemMessage(
+            'No page tab is bound and the prompt has no URL; the model has nothing to act on.');
       }
     } else if (this.supportsDashboardInvestigation()) {
       await this.requestHeadlessInvestigation({url});
@@ -3326,12 +3687,10 @@ class OllamaWebClient implements GlicWebClient {
     if (!pending || !this.supportsScreenshotAction()) {
       return wire;
     }
-    this.pendingScreenshot = null;
     const dataUrl = `data:${pending.mimeType};base64,${pending.base64}`;
     const note = pending.note ||
-        ('[Attached viewport screenshot. Click with ' +
-         '{"action":"click","coordinate":[x,y]} using CSS pixels; origin ' +
-         'top-left (0,0), x right, y down.]');
+        ('[Attached 1:1 viewport screenshot. Click {"action":"click","coordinate":[x,y]} ' +
+         'using pixels on this image. (0,0)=top-left.]');
     for (let i = wire.length - 1; i >= 0; --i) {
       const msg = wire[i];
       if (!msg || msg.role !== 'user') {
@@ -3382,6 +3741,26 @@ class OllamaWebClient implements GlicWebClient {
     });
   }
 
+  private canUseChromeSend(): boolean {
+    return !!(window as any).chrome &&
+        typeof (window as any).chrome.send === 'function';
+  }
+
+  private async runDashboardExecutorAction(
+      action: string, params: any,
+      options?: {waitForCompletion?: boolean, tabId?: number}):
+      Promise<any> {
+    const opts: Record<string, unknown> = {
+      wait_for_completion: options?.waitForCompletion !== false,
+      is_agent_mode: true,
+    };
+    if (Number.isFinite(options?.tabId as number)) {
+      opts['tab_id'] = options!.tabId;
+    }
+    return this.sendWithPromise(
+        'dashboardAgentCallAction', action, params || {}, opts);
+  }
+
   private extractAssistantTextFromProviderBody(
       provider: AgentProvider, bodyText: string): string {
     try {
@@ -3423,8 +3802,7 @@ class OllamaWebClient implements GlicWebClient {
     const wireMessages = this.buildWireMessages(messagesPayload);
     const canUseChromeSend =
         !!(window as any).chrome &&
-        typeof (window as any).chrome.send === 'function' &&
-        String(window.location?.protocol || '') === 'chrome:';
+        typeof (window as any).chrome.send === 'function';
 
     if (canUseChromeSend) {
       try {
@@ -3643,12 +4021,23 @@ class OllamaWebClient implements GlicWebClient {
         const {url, goal, username} = this.currentTask;
         const userText = username ? ` | user: ${username}` : '';
         const stepText =
-            this.currentTaskStepIndex > 0 ? ` | step ${this.currentTaskStepIndex}` : '';
+            this.currentTaskStepIndex > 0 ?
+                ` | step ${this.currentTaskStepIndex}/${this.maxStepsPerTask}` :
+                ` | max ${this.maxStepsPerTask} steps`;
         const tabText = this.getAuthoritativeTaskTabId() ?
             ` | tab ${this.getAuthoritativeTaskTabId()}` :
             '';
+        const guidanceText = this.activeLoopGuidance ?
+            (this.loopGuidanceAppliedTurns > 0 ?
+                 ' | +guidance (may be stale)' :
+                 ' | +guidance') :
+            (this.pendingLoopGuidance.length ? ' | +guidance (queued)' : '');
+        const captchaText = this.humanCaptchaHold ?
+            ' | waiting for captcha solve' :
+            (this.captchaChallengeActive ? ' | captcha challenge' : '');
+        const pauseText = this.isTaskPaused() ? ' | paused' : '';
         this.taskInfoEl.textContent =
-            `Task: ${goal} | ${url}${userText}${stepText}${tabText}`;
+            `Task: ${goal} | ${url}${userText}${stepText}${tabText}${guidanceText}${captchaText}${pauseText}`;
       }
     }
     this.renderQueueWidget();
@@ -3670,13 +4059,82 @@ class OllamaWebClient implements GlicWebClient {
     this.renderQueueWidget();
   }
 
+  private clampMaxSteps(value: number): number {
+    if (!Number.isFinite(value)) {
+      return this.maxStepsPerTask;
+    }
+    return Math.max(1, Math.min(500, Math.round(value)));
+  }
+
+  private syncMaxStepsInput() {
+    if (this.maxStepsInputEl) {
+      this.maxStepsInputEl.value = String(this.maxStepsPerTask);
+    }
+  }
+
+  private async syncMaxStepsInputFromSettings() {
+    if (this.canUseChromeSend()) {
+      try {
+        const res = await this.sendWithPromise('dashboardGetEffectiveSettings');
+        const raw = Number(res?.settings?.agent?.maxAutonomousSteps);
+        if (Number.isFinite(raw) && raw > 0) {
+          this.maxStepsPerTask = this.clampMaxSteps(raw);
+        }
+      } catch (_) {
+      }
+    }
+    this.syncMaxStepsInput();
+    this.updateTaskInfo();
+  }
+
+  private async applyMaxStepsFromInput(options?: {persist?: boolean}):
+      Promise<void> {
+    const raw = Number.parseInt(this.maxStepsInputEl?.value ?? '', 10);
+    const next = this.clampMaxSteps(raw);
+    const changed = next !== this.maxStepsPerTask;
+    this.maxStepsPerTask = next;
+    this.syncMaxStepsInput();
+    this.updateTaskInfo();
+    if (!changed || options?.persist === false || !this.canUseChromeSend()) {
+      return;
+    }
+    try {
+      const res = await this.sendWithPromise('dashboardGetEffectiveSettings');
+      const settings = (res?.settings && typeof res.settings === 'object') ?
+          {...res.settings} :
+          {};
+      const agent = (settings.agent && typeof settings.agent === 'object') ?
+          {...settings.agent} :
+          {};
+      agent.maxAutonomousSteps = next;
+      settings.agent = agent;
+      await this.sendWithPromise('dashboardSetGlobalSettings', settings);
+    } catch (e) {
+      this.addSystemMessage(`Max steps saved locally only (${e}).`);
+    }
+  }
+
   private async startQueue() {
+    await this.applyMaxStepsFromInput({persist: false});
     this.taskLoopStopRequested = false;
     this.queueRunning = true;
+    this.currentTaskStepIndex = 0;
+    this.pausedResumeFromStep = 0;
     this.updateQueueStatus();
-    // Resume a paused-but-still-present task loop if needed.
+    this.updateTaskInfo();
+    // Resume a paused or max-steps-exhausted task with a fresh step budget.
     if (this.currentTask && !this.taskLoopRunning) {
-      this.addSystemMessage('Resuming agent task loop.');
+      if (this.humanCaptchaHold) {
+        this.humanCaptchaHold = false;
+        this.captchaChallengeActive = false;
+        this.captchaClicksThisChallenge = 0;
+        this.syncSolvedCaptchaButtons();
+        this.addSystemMessage(
+            'Captcha marked solved. Resuming with a fresh screenshot, then the next step.');
+      } else {
+        this.addSystemMessage(
+            `Resuming agent task loop with a fresh ${this.maxStepsPerTask}-step budget.`);
+      }
       void this.runTaskLoop();
       return;
     }
@@ -3685,23 +4143,86 @@ class OllamaWebClient implements GlicWebClient {
     }
   }
 
+  private async markTaskCompleteByUser(): Promise<void> {
+    if (!this.currentTask) {
+      this.addSystemMessage('No active task to mark complete.');
+      return;
+    }
+    this.taskLoopStopRequested = true;
+    this.cancelModelRequest('task marked complete');
+    void this.abortActiveTooling('task marked complete');
+    this.clearPendingTaskStart();
+    this.addSystemMessage(
+        'Task marked complete. Reviewing the recorded script, then saving.');
+    await this.finishTask('success', 'Marked complete by user');
+  }
+
+  private isTaskPaused(): boolean {
+    return !!(this.currentTask &&
+        (this.taskLoopStopRequested || !this.queueRunning || this.humanCaptchaHold));
+  }
+
+  private syncPauseResumeButton(): void {
+    if (!this.pauseQueueBtnEl) {
+      return;
+    }
+    const showResume = !!(this.currentTask &&
+        (this.taskLoopStopRequested || !this.queueRunning || this.humanCaptchaHold));
+    this.pauseQueueBtnEl.textContent = showResume ? 'Resume' : 'Pause';
+    this.pauseQueueBtnEl.title = showResume ?
+        'Resume the paused task from this step' :
+        'Pause the current task. Guided prompts still apply. Resume to continue.';
+  }
+
+  private togglePauseResume(): void {
+    const showResume = !!(this.currentTask &&
+        (this.taskLoopStopRequested || !this.queueRunning || this.humanCaptchaHold));
+    if (showResume) {
+      this.resumePausedTask();
+      return;
+    }
+    this.pauseQueue();
+  }
+
+  private resumePausedTask(): void {
+    if (!this.currentTask) {
+      this.addSystemMessage('No paused task to resume.');
+      return;
+    }
+    this.taskLoopStopRequested = false;
+    this.queueRunning = true;
+    if (this.humanCaptchaHold) {
+      this.humanCaptchaHold = false;
+      this.syncSolvedCaptchaButtons();
+    }
+    this.updateQueueStatus();
+    this.updateTaskInfo();
+    if (this.taskLoopRunning) {
+      this.addSystemMessage(
+          'Resumed. The current step will finish, then the loop continues.');
+      return;
+    }
+    this.addSystemMessage('Resumed the paused task from the current step.');
+    void this.runTaskLoop();
+  }
+
   private pauseQueue(reason: string = 'queue paused') {
+    if (!this.currentTask && !this.taskLoopRunning && !this.queueRunning) {
+      this.addSystemMessage('Nothing to pause.');
+      this.syncPauseResumeButton();
+      return;
+    }
+    // Hold the task. Do not finish/clear it — guided prompts still apply.
     this.taskLoopStopRequested = true;
     this.queueRunning = false;
+    this.pausedResumeFromStep = this.currentTaskStepIndex;
     this.clearPendingTaskStart();
-    const canceledLlm = this.cancelModelRequest(reason);
-    void this.abortActiveTooling(reason);
     this.updateQueueStatus();
     this.updateTaskInfo();
     this.addSystemMessage(
-        canceledLlm ?
-            `Paused: canceled in-flight model request and stopping the agent loop (${reason}).` :
-            `Paused: stopping the agent loop (${reason}).`);
-    // If the loop isn't currently on-stack (stuck between turns / already
-    // exited), clear the active task immediately so it can't keep spending.
-    if (this.currentTask && !this.taskLoopRunning) {
-      void this.finishTask('paused', reason);
-    }
+        this.taskLoopRunning ?
+            `Paused. This step can finish; no further loop turns until Resume (${reason}).` :
+            `Paused. Task is still active — guide it, then press Resume (${reason}).`);
   }
 
   private async abortActiveTooling(reason: string): Promise<void> {
@@ -3732,6 +4253,8 @@ class OllamaWebClient implements GlicWebClient {
       const skipped = this.currentTask;
       this.currentTask = null;
       this.currentTaskStepIndex = 0;
+      this.clearLoopGuidanceState();
+    this.clearCaptchaChallengeState();
       this.clearTaskTabBinding();
       this.clearWorkingContext();
       this.updateTaskInfo();
@@ -3792,6 +4315,8 @@ class OllamaWebClient implements GlicWebClient {
     this.warnedExtraMetaKeys = false;
     this.typedUsername = false;
     this.requestContextNextTurn = false;
+    this.clearLoopGuidanceState();
+    this.clearCaptchaChallengeState();
     this.currentTaskStepIndex = 0;
     this.clearTaskTabBinding();
     this.currentTabId = null;
@@ -3828,7 +4353,7 @@ class OllamaWebClient implements GlicWebClient {
 
   private getCurrentTabIdInt(): number|undefined {
     const parsed = Number.parseInt(
-        String(this.getAuthoritativeTaskTabId() ?? this.currentTabId ?? ''), 10);
+        String(this.getActuationTabId() ?? this.currentTabId ?? ''), 10);
     if (Number.isFinite(parsed)) {
       return parsed;
     }
@@ -3977,6 +4502,25 @@ class OllamaWebClient implements GlicWebClient {
       }
       return ACTION_RESULT.OK;
     }
+    if (this.canUseChromeSend()) {
+      const timelineAction = action?.action === 'navigate' ? {
+        action: 'navigate',
+        params: {url: action.url},
+      } : {
+        action: String(action?.action || 'unknown'),
+        params: action?.params || {},
+      };
+      const result = await this.runDashboardExecutorAction(
+          String(timelineAction.action), timelineAction.params,
+          {waitForCompletion: true, tabId});
+      if (!result || result.ok === false || result.success === false ||
+          result.error) {
+        this.addSystemMessage(
+            `Tab action execution failed: ${result?.error || result?.message || 'script executor'}`);
+        return undefined;
+      }
+      return ACTION_RESULT.OK;
+    }
     if (!this.browser?.performActions) {
       return undefined;
     }
@@ -4039,11 +4583,13 @@ class OllamaWebClient implements GlicWebClient {
     if (!Number.isFinite(tabId)) {
       return false;
     }
-    if (!this.supportsUnifiedAgentOrchestrator() && !this.actorTaskId) {
-      await this.ensureActorTask();
-    }
-    if (!this.supportsUnifiedAgentOrchestrator() && !this.actorTaskId) {
-      return false;
+    if (!this.supportsUnifiedAgentOrchestrator() && !this.canUseChromeSend()) {
+      if (!this.actorTaskId) {
+        await this.ensureActorTask();
+      }
+      if (!this.actorTaskId) {
+        return false;
+      }
     }
     this.browser?.activateTab?.(authoritativeTabId);
     const code = await this.performTabControlAction(
@@ -4062,6 +4608,43 @@ class OllamaWebClient implements GlicWebClient {
     return false;
   }
 
+  private async resolveLivePageTab(context?: PageContextSummary):
+      Promise<{tabId: string, url: string}|null> {
+    const fromContextId = String(context?.tabId || '').trim();
+    const fromContextUrl = String(context?.url || '').trim();
+    if (fromContextId) {
+      return {tabId: fromContextId, url: fromContextUrl};
+    }
+    const hinted = String(
+        this.focusedTabId || this.candidateTabId || this.currentTabId ||
+        this.workingTabId || '').trim();
+    let hintedUrl = String(this.workingTabUrl || '');
+    if (hinted) {
+      try {
+        const tab = this.browser?.getTabById?.(hinted)?.getCurrentValue?.();
+        if (tab?.url) {
+          hintedUrl = String(tab.url);
+        }
+      } catch (_) {}
+      return {tabId: hinted, url: hintedUrl};
+    }
+    try {
+      const tabs = await this.listBrowserTabs() || [];
+      const active = (tabs || []).find(
+          (t) => t?.isActiveInWindow || t?.isWindowActive) || (tabs || [])[0];
+      const tabId = String(active?.tabId ?? '').trim();
+      if (tabId) {
+        return {tabId, url: String(active?.url || '')};
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  private promptDestinationUrl(userText: string): string {
+    const fromPrompt = this.inferUrlFromPrompt(userText);
+    return this.isWebNavigableUrl(fromPrompt) ? fromPrompt : '';
+  }
+
   private async openTaskUrl(url: string, options?: {forceNew?: boolean}) {
     if (!options?.forceNew && this.getAuthoritativeTaskTabId()) {
       if (await this.navigateCurrentTab(url)) {
@@ -4072,6 +4655,17 @@ class OllamaWebClient implements GlicWebClient {
         return;
       }
       this.addSystemMessage('Opening a fresh tab because tab reuse failed.');
+    }
+    if (this.canUseChromeSend()) {
+      const res = await this.sendWithPromise('dashboardAgentOpenTab', {url});
+      if (res && res.ok !== false && (res.tab_id || res.tabId)) {
+        const tabId = String(res.tab_id ?? res.tabId);
+        this.bindTaskTab(tabId, String(res.url || url), this.currentTask?.goal ?? null);
+        this.addSystemMessage(`Opened task tab ${tabId} for ${url}`);
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        return;
+      }
+      throw new Error(String(res?.error || 'dashboardAgentOpenTab failed'));
     }
     if (this.browser?.createTab) {
       try {
@@ -4105,6 +4699,8 @@ class OllamaWebClient implements GlicWebClient {
     lines.push(`Current unified profile: ${this.unifiedProfile}.`);
     lines.push(
         'This task owns a dedicated working tab for click/type/navigate. Stay bound to that task tab for actuation; use list_tabs/peek_tab/request_context(tab_id, reload) to read helper tabs (e.g. Gmail for 2FA) without opening fresh tabs.');
+    lines.push(
+        'If Google/Apple/OAuth opens a short-lived login popup, that window is scraped into page context and must be finished first (account picker / email / consent). Resume the original site only after it closes.');
     lines.push(
         'If the live task context URL is about:blank, chrome://, a New Tab page, or any host that is not the task destination, your FIRST action must be navigate to the task URL (or the goal destination).');
     lines.push(
@@ -4179,13 +4775,15 @@ class OllamaWebClient implements GlicWebClient {
     lines.push(
         'DEFAULT habits (lower priority than USER GOAL — skip or invert when the goal says otherwise):');
     lines.push(
-        '- Login: if fields look empty, type username/email then password then Enter/Log In; if already filled or the goal says not to type, just submit.');
+        '- Login: type username/email then password with target_id. If a captcha/checkbox ("verify you are human") is on the form, solve that NEXT — do not press Enter or click Log In/Claim/Collect until the captcha is done.');
     lines.push(
         '- Search: after typing a query, prefer Enter over clicking a search button.');
     lines.push(
         '- Prefer acting with current element ids; request_context when UI changed (incl. same-URL popup/modal) or needed ids are missing.');
     lines.push(
-        '- Canvas/image popups often omit buttons from elements[]; after request_screenshot, click with coordinate [x,y] instead of looping request_context.');
+        '- Login fields and buttons: always target_id. Do not click them with screenshot coordinates.');
+    lines.push(
+        '- Captcha on a login form: after credentials, {"action":"request_screenshot"} then {"action":"click","coordinate":[x,y]} on the checkbox. Then Log In. Never skip the captcha.');
     lines.push('Do NOT include action results (e.g., success=true/false, status, reason) in click/hover/type/scroll/key_press JSON.');
     lines.push('Respond with a single JSON object only, using EXACTLY one of the following shapes (no extra keys):');
     lines.push('{"action":"navigate","url":"https://example.com/"}');
@@ -4196,10 +4794,15 @@ class OllamaWebClient implements GlicWebClient {
     lines.push('{"action":"type","coordinate":[x,y],"text":"..."}');
     lines.push(
         'Do not use element kind names as actions (input_text/input_email). Typing is always {"action":"type",...}.');
-    lines.push('{"action":"scroll","target_id":123,"distance":600}');
+    lines.push('{"action":"scroll","distance":600}');
+    lines.push('{"action":"scroll","scope":"page","distance":600}');
+    lines.push('{"action":"scroll","scope":"iframe","target_id":123,"distance":600}');
     lines.push('{"action":"key_press","key":"Enter"}');
+    lines.push('{"action":"save_script","name":"site-name daily"}');
     lines.push('{"action":"complete"}');
     lines.push('{"action":"complete","success":false,"reason":"..."}');
+    lines.push('{"action":"ignore_guidance"}');
+    lines.push('{"action":"click","target_id":123,"ignore_guidance":true}');
     lines.push('{"action":"request_context"}');
     lines.push('{"action":"request_context","tab_id":"<id>","reload":true}');
     lines.push('{"action":"list_tabs"}');
@@ -4225,12 +4828,16 @@ class OllamaWebClient implements GlicWebClient {
     lines.push(
         'peek_tab / cross-tab request_context do NOT move the task binding; click/type still target the authoritative task tab.');
     lines.push('Use {"action":"request_console_logs"} when page warnings/errors may explain a failure.');
-    if (this.supportsScreenshotAction()) {
+    if (this.hasLiveScreenshot()) {
+      lines.push(this.liveScreenshotMustClickHint());
+    } else if (this.supportsScreenshotAction()) {
       lines.push(
-          'If a click/type does not produce a noticeable page change, use {"action":"request_screenshot"} to inspect the viewport (overlays/popups APC may miss).');
+          'request_screenshot at most once per challenge, then click {"coordinate":[x,y]} on that picture. Do not spam screenshots.');
       lines.push(
-          'For screenshot-visible controls absent from elements[], use {"action":"click","coordinate":[x,y]} reading the cyan CSS-pixel grid on the screenshot (1 image px ≈ 1 CSS px).');
+          'Screenshot coordinates are only for an active captcha/canvas. Normal fields use target_id.');
     }
+    lines.push(
+        'If extra USER GUIDANCE is marked possibly stale, ignore it when it no longer applies and set "ignore_guidance":true (or {"action":"ignore_guidance"}).');
     lines.push('Use {"action":"delegate_profile",...} only when another unified profile is clearly better for the next step. Only one switch is allowed per task.');
     if (this.supportsDashboardInvestigation()) {
       lines.push(
@@ -4245,8 +4852,17 @@ class OllamaWebClient implements GlicWebClient {
       }
     }
     lines.push(
-        'When finished, use the same JSON action shape as other steps: {"action":"complete"} ' +
-        '(same field name as click/type; aliases mark_task_complete/task_complete/done also accepted).');
+        'Page scroll: {"action":"scroll","scope":"page","distance":600} moves the MAIN document. ' +
+        'It does not use the cursor/hover target, so a centered iframe will not steal the scroll. ' +
+        'Iframe/element scroll: {"action":"scroll","scope":"iframe","target_id":123,"distance":600}.');
+    lines.push(
+        'Multi-site tasks: when ONE website is finished (account made / daily collected), ' +
+        '{"action":"save_script","name":"<site> daily"} saves the recorded timeline so far as its own script, ' +
+        'clips that segment, and continues the same task on the next site. ' +
+        'Do NOT {"action":"complete"} until every site in the user goal is done.');
+    lines.push(
+        'When the ENTIRE user task is finished, {"action":"complete"} ' +
+        '(aliases mark_task_complete/task_complete/done).');
     lines.push(
         'Optional: {"action":"complete","reason":"..."}. On failure: {"action":"complete","success":false,"reason":"..."}.');
     if (looksLikeTokenPlaceholder(task.username) ||
@@ -4274,6 +4890,175 @@ class OllamaWebClient implements GlicWebClient {
     this.candidateTabId = state.hasNoFocus?.tabFocusCandidateData?.tabId || null;
   }
 
+  private getActuationTabId(): string|null {
+    const oauth = String(this.oauthTabId || '').trim();
+    if (oauth) {
+      return oauth;
+    }
+    return this.getAuthoritativeTaskTabId();
+  }
+
+  private isOauthLoginUrl(url?: string|null): boolean {
+    const raw = String(url || '').trim().toLowerCase();
+    if (!raw) {
+      return false;
+    }
+    try {
+      const parsed = new URL(raw);
+      const host = parsed.hostname;
+      const path = parsed.pathname || '';
+      if (host === 'accounts.google.com' || host === 'accounts.youtube.com' ||
+          host === 'appleid.apple.com' || host === 'idmsa.apple.com' ||
+          host === 'login.microsoftonline.com' || host === 'login.live.com' ||
+          host === 'login.yahoo.com' || host === 'facebook.com' ||
+          host === 'www.facebook.com' || host === 'm.facebook.com' ||
+          host === 'twitter.com' || host === 'api.twitter.com' ||
+          host === 'x.com') {
+        return true;
+      }
+      if (host.endsWith('.google.com') &&
+          (host.includes('accounts') || host.includes('oauth'))) {
+        return true;
+      }
+      return path.includes('/o/oauth2') || path.includes('/oauth2') ||
+          path.includes('/signin/oauth');
+    } catch (_) {
+      return /accounts\.google|appleid\.apple|idmsa\.apple|login\.microsoft|oauth2/i.test(raw);
+    }
+  }
+
+  private clearOauthFlow(): void {
+    this.oauthTabId = null;
+    this.oauthTabUrl = null;
+    this.oauthWindowId = null;
+    this.oauthFlowStartedAt = 0;
+    this.oauthAnnounced = false;
+    this.oauthPopupExpectedUntil = 0;
+  }
+
+  private async activateBrowserTab(tabId: string|null): Promise<boolean> {
+    const parsed = Number.parseInt(String(tabId || ''), 10);
+    if (!Number.isFinite(parsed) || parsed <= 0 || !this.canUseChromeSend()) {
+      return false;
+    }
+    try {
+      const res = await this.sendWithPromise(
+          'dashboardAgentActivateTab', {tab_id: parsed});
+      return !!res && res.ok !== false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  private async snapshotKnownBrowserTabs(): Promise<void> {
+    try {
+      const tabs = await this.listBrowserTabs();
+      this.knownBrowserTabIds = new Set(
+          tabs.map((tab) => String(tab.tabId || '').trim()).filter(Boolean));
+    } catch (_) {
+    }
+  }
+
+  private looksLikeOauthProviderClick(action: any, context: PageContextSummary):
+      boolean {
+    if (String(action?.action || '') !== 'click') {
+      return false;
+    }
+    if (this.isOauthLoginUrl(context.url)) {
+      return false;
+    }
+    const target = (context.elements ?? []).find(
+        (el) => typeof action?.target_id === 'number' && el.id === action.target_id);
+    const blob = [
+      target?.cssClass,
+      target?.label,
+      target?.fieldName,
+      target?.placeholder,
+      target ? bestContextNodeText(target) : '',
+    ].map((part) => String(part || '')).join(' ').toLowerCase();
+    return /google-btn|apple-btn|continue with google|continue with apple|sign in with (google|apple|facebook|microsoft)|oauth/.test(blob);
+  }
+
+  private async syncOauthFlow(options?: {expectPopup?: boolean}):
+      Promise<boolean> {
+    const expectPopup = !!options?.expectPopup ||
+        (this.oauthPopupExpectedUntil > 0 && Date.now() < this.oauthPopupExpectedUntil);
+    const taskId = String(this.getAuthoritativeTaskTabId() || '').trim();
+    let tabs: Array<{
+      tabId: string,
+      title: string,
+      url: string,
+      isPopup?: boolean,
+      isOauth?: boolean,
+      windowId?: number,
+    }> = [];
+    try {
+      tabs = await this.listBrowserTabs();
+    } catch (_) {
+      tabs = [];
+    }
+    if (this.oauthTabId) {
+      const stillOpen = tabs.find((tab) => tab.tabId === this.oauthTabId);
+      if (!stillOpen) {
+        this.addSystemMessage(
+            'OAuth login window closed — resuming the original task tab.');
+        this.clearOauthFlow();
+        await this.snapshotKnownBrowserTabs();
+        return false;
+      }
+      this.oauthTabUrl = stillOpen.url || this.oauthTabUrl;
+      if (typeof stillOpen.windowId === 'number') {
+        this.oauthWindowId = stillOpen.windowId;
+      }
+      await this.activateBrowserTab(this.oauthTabId);
+      return true;
+    }
+    const unknown = tabs.filter(
+        (tab) => tab.tabId && tab.tabId !== taskId &&
+            !this.knownBrowserTabIds.has(tab.tabId));
+    const oauthish = tabs.filter(
+        (tab) => tab.tabId && tab.tabId !== taskId &&
+            (tab.isOauth || this.isOauthLoginUrl(tab.url)));
+    let chosen = oauthish[0] ||
+        (expectPopup ? unknown.find((tab) => tab.isPopup) : undefined) ||
+        (expectPopup ? unknown[0] : undefined) ||
+        null;
+    if (!chosen && expectPopup) {
+      await sleep(700);
+      try {
+        tabs = await this.listBrowserTabs();
+      } catch (_) {
+        tabs = [];
+      }
+      const retryUnknown = tabs.filter(
+          (tab) => tab.tabId && tab.tabId !== taskId &&
+              !this.knownBrowserTabIds.has(tab.tabId));
+      chosen = tabs.find(
+          (tab) => tab.tabId && tab.tabId !== taskId &&
+              (tab.isOauth || this.isOauthLoginUrl(tab.url))) ||
+          retryUnknown.find((tab) => tab.isPopup) || retryUnknown[0] || null;
+    }
+    if (!chosen) {
+      return false;
+    }
+    this.oauthTabId = chosen.tabId;
+    this.oauthTabUrl = chosen.url || null;
+    this.oauthWindowId =
+        typeof chosen.windowId === 'number' ? chosen.windowId : null;
+    this.oauthFlowStartedAt = Date.now();
+    this.oauthPopupExpectedUntil = 0;
+    if (!this.oauthAnnounced) {
+      this.oauthAnnounced = true;
+      this.addSystemMessage(
+          `OAuth login window detected (tab ${chosen.tabId}` +
+          (chosen.url ? `, ${chosen.url}` : '') +
+          '). Completing login there first; the original task is paused until this window closes.');
+    }
+    await sleep(400);
+    await this.activateBrowserTab(chosen.tabId);
+    return true;
+  }
+
   private getAuthoritativeTaskTabId(): string|null {
     const taskBound = String(this.taskTabId || '').trim();
     if (this.currentTask && taskBound) {
@@ -4295,6 +5080,9 @@ class OllamaWebClient implements GlicWebClient {
 
   private bindTaskTab(tabId: string|null, url?: string|null, title?: string|null): void {
     const trimmed = String(tabId || '').trim();
+    if (this.oauthTabId && trimmed && trimmed === String(this.oauthTabId)) {
+      return;
+    }
     if (trimmed) {
       this.taskTabId = trimmed;
       this.currentTabId = trimmed;
@@ -4307,9 +5095,14 @@ class OllamaWebClient implements GlicWebClient {
 
   private clearTaskTabBinding(): void {
     this.taskTabId = null;
+    this.clearOauthFlow();
+    this.knownBrowserTabIds = new Set();
   }
 
   private getContextTabCandidates(): string[] {
+    if (this.oauthTabId) {
+      return [this.oauthTabId];
+    }
     const ordered: Array<string|null> =
         (this.currentTask && !this.shouldEnforceHeadlessOnlyForCurrentTask())
         ? [
@@ -4428,6 +5221,8 @@ class OllamaWebClient implements GlicWebClient {
     const completed = this.currentTask;
     this.currentTask = null;
     this.currentTaskStepIndex = 0;
+    this.clearLoopGuidanceState();
+    this.clearCaptchaChallengeState();
     this.clearTaskTabBinding();
     this.clearWorkingContext();
     this.updateTaskInfo();
@@ -4655,6 +5450,9 @@ class OllamaWebClient implements GlicWebClient {
     url: string,
     isActiveInWindow?: boolean,
     isWindowActive?: boolean,
+    isPopup?: boolean,
+    isOauth?: boolean,
+    windowId?: number,
     source: string,
   }>> {
     const q = String(query || '').trim().toLowerCase();
@@ -4664,6 +5462,9 @@ class OllamaWebClient implements GlicWebClient {
       url: string,
       isActiveInWindow?: boolean,
       isWindowActive?: boolean,
+      isPopup?: boolean,
+      isOauth?: boolean,
+      windowId?: number,
       source: string,
     }>();
     const upsert = (tab: TabData|undefined|null, source: string) => {
@@ -4696,6 +5497,40 @@ class OllamaWebClient implements GlicWebClient {
         existing.source = `${existing.source}+${source}`;
       }
     };
+
+    if (this.canUseChromeSend()) {
+      try {
+        const res = await this.sendWithPromise('dashboardAgentListTabs', {});
+        const listed = Array.isArray(res?.tabs) ? res.tabs : [];
+        for (const raw of listed) {
+          const tabId = String(raw?.tabId ?? raw?.tab_id ?? '').trim();
+          if (!tabId) {
+            continue;
+          }
+          const url = String(raw?.url || '');
+          const title = String(raw?.title || '');
+          if (q) {
+            const hay = `${title} ${url}`.toLowerCase();
+            if (!hay.includes(q)) {
+              continue;
+            }
+          }
+          byId.set(tabId, {
+            tabId,
+            title,
+            url,
+            isActiveInWindow: !!raw?.isActiveInWindow,
+            isWindowActive: !!raw?.isWindowActive,
+            isPopup: !!raw?.isPopup,
+            isOauth: !!(raw?.isOauth || this.isOauthLoginUrl(url)),
+            windowId: Number.isFinite(Number(raw?.windowId)) ? Number(raw.windowId) :
+                                                             undefined,
+            source: 'dashboard',
+          });
+        }
+      } catch (_) {
+      }
+    }
 
     const taskTabId = this.getAuthoritativeTaskTabId();
     if (taskTabId) {
@@ -4779,6 +5614,11 @@ class OllamaWebClient implements GlicWebClient {
     }
 
     return Array.from(byId.values()).sort((a, b) => {
+      const aOauth = (a.isOauth || a.tabId === this.oauthTabId) ? 0 : 1;
+      const bOauth = (b.isOauth || b.tabId === this.oauthTabId) ? 0 : 1;
+      if (aOauth !== bOauth) {
+        return aOauth - bOauth;
+      }
       const aTask = a.tabId === taskTabId ? 0 : 1;
       const bTask = b.tabId === taskTabId ? 0 : 1;
       if (aTask !== bTask) {
@@ -5002,6 +5842,7 @@ class OllamaWebClient implements GlicWebClient {
           'Open tabs (use tabId with peek_tab / request_context):\n' +
           JSON.stringify({
             taskTabId,
+            oauthTabId: this.oauthTabId || undefined,
             tabs,
             priorTaskElementIds: priorIds.length ? priorIds : undefined,
             hint:
@@ -5069,144 +5910,38 @@ class OllamaWebClient implements GlicWebClient {
     return {handled: true, requestContext: !!this.currentTask};
   }
 
-  private resolveScreenshotCssSize(
+  private resolveScreenshotClickSpace(
       imageWidth: number,
       imageHeight: number,
-  ): {width: number, height: number, scale: number} {
-    const fromContext = this.lastPageContext?.viewportCss;
-    if (fromContext && fromContext.width > 0 && fromContext.height > 0) {
-      const scaleX = imageWidth / fromContext.width;
-      const scaleY = imageHeight / fromContext.height;
-      const scale = (scaleX + scaleY) / 2;
-      if (Number.isFinite(scale) && scale > 0.5 && scale < 5) {
-        return {
-          width: fromContext.width,
-          height: fromContext.height,
-          scale,
-        };
-      }
-    }
-    // Retina captures are typically exact 2x/3x device pixels.
-    for (const candidate of [2, 3, 1.5, 1]) {
-      const w = imageWidth / candidate;
-      const h = imageHeight / candidate;
-      if (Math.abs(w - Math.round(w)) < 0.51 &&
-          Math.abs(h - Math.round(h)) < 0.51 && w >= 320 && h >= 240) {
-        return {
-          width: Math.round(w),
-          height: Math.round(h),
-          scale: candidate,
-        };
-      }
-    }
-    return {width: imageWidth, height: imageHeight, scale: 1};
+      captureCss?: {width?: number, height?: number},
+  ): {clickW: number, clickH: number} {
+    // Size of the photographed viewport only. Not page context or elements.
+    const capW = Number(captureCss?.width || 0);
+    const capH = Number(captureCss?.height || 0);
+    const clickW = (Number.isFinite(capW) && capW > 0) ? Math.round(capW) : imageWidth;
+    const clickH = (Number.isFinite(capH) && capH > 0) ? Math.round(capH) : imageHeight;
+    return {clickW, clickH};
   }
 
   /**
-   * Find large saturated CTA-like regions (e.g. green COLLECT bars) and return
-   * their CSS-pixel centers for painting exact click labels on the screenshot.
+   * Make the picture the model sees have exactly one pixel per viewport DIP.
+   * No grid. If the capture is already that size, send the raw PNG.
    */
-  private findScreenshotClickHotspots(
-      ctx: CanvasRenderingContext2D,
-      cssW: number,
-      cssH: number,
-  ): Array<{x: number, y: number, w: number, h: number, kind: string}> {
-    let data: ImageData;
-    try {
-      data = ctx.getImageData(0, 0, cssW, cssH);
-    } catch (_) {
-      return [];
-    }
-    const px = data.data;
-    const step = 2;
-    // Row runs of "CTA green" pixels → merge into blobs.
-    type Blob = {minX: number, maxX: number, minY: number, maxY: number, n: number};
-    const blobs: Blob[] = [];
-    const isCta = (i: number): boolean => {
-      const r = px[i] ?? 0;
-      const g = px[i + 1] ?? 0;
-      const b = px[i + 2] ?? 0;
-      const a = px[i + 3] ?? 0;
-      if (a < 200) {
-        return false;
-      }
-      // Bright green / teal CTAs (Lonestar COLLECT, etc.). JPEG+downsample
-      // washes these out, so keep thresholds loose.
-      return g > 115 && g >= r + 12 && g >= b + 8 && r < 220 && b < 180;
-    };
-    for (let y = 0; y < cssH; y += step) {
-      let runStart = -1;
-      for (let x = 0; x <= cssW; x += step) {
-        const inside = x < cssW && isCta(((y * cssW) + x) * 4);
-        if (inside && runStart < 0) {
-          runStart = x;
-        } else if (!inside && runStart >= 0) {
-          const runEnd = x - step;
-          const runW = runEnd - runStart;
-          if (runW >= 60) {
-            // Merge with nearby blob
-            let merged = false;
-            for (const b of blobs) {
-              if (Math.abs(y - b.maxY) <= 14 &&
-                  !(runEnd < b.minX - 12 || runStart > b.maxX + 12)) {
-                b.minX = Math.min(b.minX, runStart);
-                b.maxX = Math.max(b.maxX, runEnd);
-                b.maxY = y;
-                b.n += runW;
-                merged = true;
-                break;
-              }
-            }
-            if (!merged) {
-              blobs.push({
-                minX: runStart,
-                maxX: runEnd,
-                minY: y,
-                maxY: y,
-                n: runW,
-              });
-            }
-          }
-          runStart = -1;
-        }
-      }
-    }
-    const out: Array<{x: number, y: number, w: number, h: number, kind: string}> =
-        [];
-    for (const b of blobs) {
-      const w = b.maxX - b.minX + 1;
-      const h = b.maxY - b.minY + 1;
-      // Prefer wide button-like bars; skip tiny noise / tall side chrome.
-      if (w < 120 || h < 6 || h > 140 || w * h < 1200) {
-        continue;
-      }
-      out.push({
-        x: Math.round((b.minX + b.maxX) / 2),
-        y: Math.round((b.minY + b.maxY) / 2),
-        w,
-        h,
-        kind: 'green_cta',
-      });
-    }
-    // Largest first; keep a few so the note stays short.
-    out.sort((a, b) => (b.w * b.h) - (a.w * a.h));
-    return out.slice(0, 5);
-  }
-
-  /**
-   * Resample the screenshot to CSS/DIP pixels, draw a labeled grid, and paint
-   * exact [x,y] markers on detected CTA hotspots for coordinate clicks.
-   */
-  private async annotateScreenshotForCoordinateClicks(shot: {
+  private async prepareOneToOneScreenshot(shot: {
     base64: string,
     mimeType: string,
     widthPixels?: number,
     heightPixels?: number,
+    cssWidth?: number,
+    cssHeight?: number,
+    note?: string,
   }): Promise<{
     base64: string,
     mimeType: string,
     cssWidth: number,
     cssHeight: number,
+    imageWidth: number,
+    imageHeight: number,
     note: string,
   }|null> {
     try {
@@ -5222,130 +5957,56 @@ class OllamaWebClient implements GlicWebClient {
       if (!imageWidth || !imageHeight) {
         return null;
       }
-      const css = this.resolveScreenshotCssSize(imageWidth, imageHeight);
-      const cssW = css.width;
-      const cssH = css.height;
+      const map = this.resolveScreenshotClickSpace(imageWidth, imageHeight, {
+        width: shot.cssWidth,
+        height: shot.cssHeight,
+      });
+      const {clickW, clickH} = map;
+      // Pre-resize to the pixels Claude will see. Otherwise it downscales
+      // (token budget) and [x,y] is in the small image, which lands left/up.
+      const [sentW, sentH] = claudeResizedSize(clickW, clickH);
+      const note =
+          `[Screenshot ${sentW}×${sentH} px. (0,0)=top-left. ` +
+          `Send {"coordinate":[x,y]} in THESE image pixels — not the browser window.]`;
+      const alreadyClaudeSize = imageWidth === sentW && imageHeight === sentH;
+      if (alreadyClaudeSize) {
+        return {
+          base64: shot.base64,
+          mimeType: shot.mimeType || 'image/png',
+          cssWidth: clickW,
+          cssHeight: clickH,
+          imageWidth: sentW,
+          imageHeight: sentH,
+          note,
+        };
+      }
       const canvas = document.createElement('canvas');
-      canvas.width = cssW;
-      canvas.height = cssH;
+      canvas.width = sentW;
+      canvas.height = sentH;
       const ctx = canvas.getContext('2d');
       if (!ctx) {
         return null;
       }
-      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingEnabled = sentW !== imageWidth || sentH !== imageHeight;
       ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(img, 0, 0, cssW, cssH);
-
-      // Detect large CTA-colored hotspots BEFORE drawing the grid so labels
-      // sit on top. These give the model exact readable click coords.
-      const hotspots = this.findScreenshotClickHotspots(ctx, cssW, cssH);
-
-      // Dim edges slightly so grid labels stay readable on busy UIs.
-      const step = cssW >= 1600 ? 100 : (cssW >= 900 ? 50 : 25);
-      ctx.save();
-      ctx.lineWidth = 1;
-      ctx.font = `${Math.max(11, Math.round(step / 6))}px monospace`;
-      ctx.textBaseline = 'top';
-
-      for (let x = 0; x <= cssW; x += step) {
-        ctx.beginPath();
-        ctx.moveTo(x + 0.5, 0);
-        ctx.lineTo(x + 0.5, cssH);
-        ctx.strokeStyle = x % (step * 2) === 0 ? 'rgba(0, 255, 255, 0.55)' :
-                                                'rgba(0, 220, 255, 0.22)';
-        ctx.stroke();
-        if (x > 0 && x < cssW) {
-          const label = String(x);
-          const tw = ctx.measureText(label).width;
-          ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-          ctx.fillRect(x + 2, 2, tw + 6, 14);
-          ctx.fillStyle = 'rgba(0, 255, 255, 0.95)';
-          ctx.fillText(label, x + 5, 4);
-        }
-      }
-      for (let y = 0; y <= cssH; y += step) {
-        ctx.beginPath();
-        ctx.moveTo(0, y + 0.5);
-        ctx.lineTo(cssW, y + 0.5);
-        ctx.strokeStyle = y % (step * 2) === 0 ? 'rgba(0, 255, 255, 0.55)' :
-                                                'rgba(0, 220, 255, 0.22)';
-        ctx.stroke();
-        if (y > 0 && y < cssH) {
-          const label = String(y);
-          const tw = ctx.measureText(label).width;
-          ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-          ctx.fillRect(2, y + 2, tw + 6, 14);
-          ctx.fillStyle = 'rgba(0, 255, 255, 0.95)';
-          ctx.fillText(label, 5, y + 4);
-        }
-      }
-
-      // Paint hotspot markers with EXACT click coordinates on the image.
-      ctx.font = 'bold 16px monospace';
-      ctx.textBaseline = 'middle';
-      hotspots.forEach((h, i) => {
-        const tag = `#${i + 1} [${h.x},${h.y}]`;
-        const tw = ctx.measureText(tag).width;
-        // Magenta crosshair at exact click point.
-        ctx.strokeStyle = 'rgba(255, 0, 200, 0.95)';
-        ctx.lineWidth = 3;
-        ctx.beginPath();
-        ctx.moveTo(h.x - 22, h.y);
-        ctx.lineTo(h.x + 22, h.y);
-        ctx.moveTo(h.x, h.y - 22);
-        ctx.lineTo(h.x, h.y + 22);
-        ctx.stroke();
-        ctx.strokeRect(h.x - h.w / 2, h.y - h.h / 2, h.w, h.h);
-        const labelX = Math.min(cssW - tw - 12, Math.max(8, h.x - tw / 2));
-        const labelY = Math.max(18, h.y - h.h / 2 - 18);
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.78)';
-        ctx.fillRect(labelX - 4, labelY - 12, tw + 8, 24);
-        ctx.fillStyle = 'rgba(255, 80, 220, 1)';
-        ctx.fillText(tag, labelX, labelY);
-      });
-
-      // Origin / size legend.
-      const legend =
-          `CSS click px (0,0) top-left → (${cssW},${cssH}) grid=${step}px ` +
-          `scale=${css.scale.toFixed(2)} | tab viewport ONLY (Glic panel not in image)`;
-      ctx.font = '13px monospace';
-      ctx.textBaseline = 'top';
-      const lw = ctx.measureText(legend).width;
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.72)';
-      ctx.fillRect(8, cssH - 28, Math.min(cssW - 16, lw + 16), 22);
-      ctx.fillStyle = 'rgba(0, 255, 180, 0.98)';
-      ctx.fillText(legend, 16, cssH - 23);
-      ctx.restore();
-
-      const mimeType = 'image/jpeg';
-      const dataUrl = canvas.toDataURL(mimeType, 0.82);
+      ctx.drawImage(img, 0, 0, sentW, sentH);
+      const mimeType = 'image/png';
+      const dataUrl = canvas.toDataURL(mimeType);
       const comma = dataUrl.indexOf(',');
       if (comma < 0) {
         return null;
       }
-      const base64 = dataUrl.slice(comma + 1);
-      const hotspotLines = hotspots.length ?
-          hotspots
-              .map(
-                  (h, i) =>
-                      `  #${i + 1} ${h.kind} → {"action":"click","coordinate":[${h.x},${h.y}]} ` +
-                      `(~${h.w}x${h.h}px)`)
-              .join('\n') :
-          '  (no large CTA-colored hotspots auto-detected)';
-      const note =
-          `[Viewport screenshot — CSS click coordinates]\n` +
-          `- This image is the TASK TAB viewport only. The Glic side panel is NOT ` +
-          `in the image and must not be used when estimating positions.\n` +
-          `- Coordinate space: CSS/DIP pixels matching executor clicks. ` +
-          `Origin (0,0)=top-left of this image; x→right, y→down.\n` +
-          `- Image resampled to ${cssW}x${cssH} (1 image pixel ≈ 1 click CSS pixel).\n` +
-          `- Magenta markers (#N [x,y]) are EXACT click coordinates painted on ` +
-          `detected CTA/hotspot regions — prefer copying those numbers.\n` +
-          `- Cyan grid every ${step}px is a secondary ruler if no marker fits.\n` +
-          `Painted hotspots:\n${hotspotLines}`;
-      return {base64, mimeType, cssWidth: cssW, cssHeight: cssH, note};
+      return {
+        base64: dataUrl.slice(comma + 1),
+        mimeType,
+        cssWidth: clickW,
+        cssHeight: clickH,
+        imageWidth: sentW,
+        imageHeight: sentH,
+        note,
+      };
     } catch (e) {
-      console.warn('[glic] annotateScreenshotForCoordinateClicks failed', e);
+      console.warn('[glic] prepareOneToOneScreenshot failed', e);
       return null;
     }
   }
@@ -5356,7 +6017,34 @@ class OllamaWebClient implements GlicWebClient {
         mimeType: string,
         widthPixels?: number,
         heightPixels?: number,
+        cssWidth?: number,
+        cssHeight?: number,
       }|null> {
+    if (this.canUseChromeSend()) {
+      const parsed = Number.parseInt(
+          String(this.getAuthoritativeTaskTabId() || this.currentTabId || ''), 10);
+      const payload: Record<string, unknown> = {};
+      if (Number.isFinite(parsed)) {
+        payload['tab_id'] = parsed;
+      }
+      const res = await this.sendWithPromise('dashboardAgentScreenshot', payload);
+      const dataUrl = String(res?.image || '');
+      const base64 = String(res?.base64 ||
+          (dataUrl.includes(',') ? dataUrl.split(',')[1] : ''));
+      if (res && res.ok !== false && base64) {
+        this.lastScreenshotError = null;
+        return {
+          base64,
+          mimeType: String(res.mimeType || 'image/png'),
+          widthPixels: Number(res.widthPixels || 0) || undefined,
+          heightPixels: Number(res.heightPixels || 0) || undefined,
+          cssWidth: Number(res.cssWidth || 0) || undefined,
+          cssHeight: Number(res.cssHeight || 0) || undefined,
+        };
+      }
+      this.lastScreenshotError = String(res?.error || 'dashboardAgentScreenshot failed');
+      return null;
+    }
     if (!this.browser) {
       return null;
     }
@@ -5429,7 +6117,65 @@ class OllamaWebClient implements GlicWebClient {
     };
   }
 
+  private async collectContextFromDashboard(tabId?: string):
+      Promise<PageContextSummary|null> {
+    if (!this.canUseChromeSend()) {
+      return null;
+    }
+    const parsed = Number.parseInt(
+        String(tabId || this.getActuationTabId() || ''), 10);
+    if (this.oauthTabId && Number.isFinite(parsed) &&
+        String(parsed) === this.oauthTabId) {
+      await this.activateBrowserTab(this.oauthTabId);
+    }
+    const payload: Record<string, unknown> = {};
+    if (Number.isFinite(parsed)) {
+      payload['tab_id'] = parsed;
+    }
+    let res: any = null;
+    try {
+      res = await this.sendWithPromise('dashboardAgentGetPageContext', payload);
+    } catch (e) {
+      this.lastContextError = String(e || 'dashboardAgentGetPageContext failed');
+      return null;
+    }
+    if (!res || res.ok === false) {
+      this.lastContextError = String(res?.error || 'dashboardAgentGetPageContext failed');
+      return null;
+    }
+    const elements = Array.isArray(res.elements) ? res.elements : [];
+    const summary: PageContextSummary = {
+      elements,
+      tabId: String(res.tabId ?? res.tab_id ?? parsed ?? ''),
+      tabIdInt: Number(res.tabId ?? res.tab_id ?? parsed),
+      url: String(res.url || ''),
+      title: String(res.title || ''),
+      innerText: String(res.innerText || ''),
+      documentId: String(res.documentId || ''),
+      hasOverlay: !!(res.hasOverlay ||
+          elements.some((el: any) => el && el.overlay)),
+    };
+    const vp = res.viewportCss || {};
+    const cssW = Number(vp.width || res.viewportWidth || 0);
+    const cssH = Number(vp.height || res.viewportHeight || 0);
+    if (Number.isFinite(cssW) && cssW > 0 && Number.isFinite(cssH) && cssH > 0) {
+      summary.viewportCss = {width: Math.round(cssW), height: Math.round(cssH)};
+    }
+    this.lastContextError = null;
+    if (summary.tabId &&
+        !(this.oauthTabId && summary.tabId === this.oauthTabId)) {
+      this.bindTaskTab(summary.tabId, summary.url, summary.title);
+    }
+    this.lastPageContext = summary;
+    return summary;
+  }
+
   private async collectContext(): Promise<PageContextSummary> {
+    await this.syncOauthFlow();
+    const dashboardContext = await this.collectContextFromDashboard();
+    if (dashboardContext) {
+      return dashboardContext;
+    }
     const summary: PageContextSummary = {elements: []};
     if (!this.browser) {
       return summary;
@@ -5582,32 +6328,30 @@ class OllamaWebClient implements GlicWebClient {
   }
 
   private isContextReady(summary: PageContextSummary): boolean {
-    const inner = (summary.innerText ?? '').trim();
-    if (!summary.url && !inner && summary.elements.length === 0) {
-      return false;
-    }
-    if (!summary.documentId) {
-      return false;
-    }
     if (!summary.tabId && !summary.tabIdInt) {
       return false;
     }
-    if (summary.elements.length === 0 && inner.length < 10) {
+    const url = String(summary.url || '');
+    const httpUrl = /^https?:/i.test(url);
+    if (!httpUrl || /about:blank/i.test(url)) {
       return false;
     }
+    const inner = (summary.innerText ?? '').trim();
+    const title = String(summary.title || '').trim();
     const labels = summary.elements.map((el) => (el.label || '').trim().toUpperCase())
         .filter((label) => label);
     const onlyLoading = labels.length > 0 &&
         labels.every((label) => label === 'LOADING...' || label === 'LOADING');
-    if (onlyLoading) {
+    if (onlyLoading && summary.elements.length <= 1 && inner.length < 10 && !title) {
       return false;
     }
-    if (inner && inner.toUpperCase() === 'LOADING...') {
-      return summary.elements.length > 1;
-    }
-    if (summary.elements.length < 3 && inner.length < 30) {
+    if (inner && inner.toUpperCase() === 'LOADING...' &&
+        summary.elements.length <= 1 && !title) {
       return false;
     }
+    // A committed http(s) task tab is enough to send the model a snapshot.
+    // Casino/SPA pages may keep a spinner forever; waiting for 3+ APC nodes
+    // never completes.
     return true;
   }
 
@@ -5615,7 +6359,7 @@ class OllamaWebClient implements GlicWebClient {
     let last: PageContextSummary = {elements: []};
     // Avoid hammering APC/screenshot pipelines while the SPA is still booting.
     // Repeated GetContext* during load is a major paint-starvation source.
-    let delayMs = 8000;
+    let delayMs = 800;
     let readyStreak = 0;
     let loadNoticeShown = false;
     const start = Date.now();
@@ -5624,7 +6368,7 @@ class OllamaWebClient implements GlicWebClient {
       last = await this.collectContext();
       if (this.isContextReady(last)) {
         readyStreak++;
-        if (readyStreak >= 2) {
+        if (readyStreak >= 1) {
           return last;
         }
       } else {
@@ -5648,7 +6392,7 @@ class OllamaWebClient implements GlicWebClient {
       }
 
       await sleep(delayMs);
-      delayMs = Math.min(Math.floor(delayMs * 1.5), 8000);
+      delayMs = Math.min(Math.floor(delayMs * 1.5), 2500);
     }
 
     this.addSystemMessage('Timed out waiting for page load; using the latest context.');
@@ -5764,10 +6508,14 @@ class OllamaWebClient implements GlicWebClient {
           /BUTTON/i.test(String(m.el.formType || '')));
 
       // Always surface button/clickable label text — cheap and high-signal.
+      const cls = String(m.el.cssClass || '').trim();
       if (m.text && isButtonLike) {
         desc.text = m.text;
         if (m.kind) {
           desc.kind = m.kind;
+        }
+        if (cls) {
+          desc.cls = cls;
         }
         return desc;
       }
@@ -5845,6 +6593,46 @@ class OllamaWebClient implements GlicWebClient {
                        /(log in|login|sign in|signin)/i.test(m.text || ''))
         .map((m) => m.el.id)))
         .sort((a, b) => a - b);
+    const overlayIds = Array.from(new Set(meta
+        .filter((m) => m.el.overlay)
+        .map((m) => m.el.id)))
+        .sort((a, b) => a - b);
+    const goalText = String(this.currentTask?.goal || '').toLowerCase();
+    const wantsGoogle = /google-btn|continue with google|google oauth|google sign[- ]?in/.test(goalText);
+    const wantsApple = /apple-btn|continue with apple|apple (id|oauth|sign[- ]?in)/.test(goalText) &&
+        !/not apple|not use apple|don't use apple|do not use apple/.test(goalText);
+    const googleIds = meta
+        .filter((m) => /google/i.test(String(m.el.cssClass || '')) ||
+                       /continue with google/i.test(m.text || ''))
+        .map((m) => m.el.id);
+    const appleIds = meta
+        .filter((m) => /apple/i.test(String(m.el.cssClass || '')) ||
+                       /continue with apple/i.test(m.text || ''))
+        .map((m) => m.el.id);
+    let oauthHint = '';
+    if (this.oauthTabId) {
+      oauthHint =
+          `\nPRIORITY: An OAuth login popup is open (tab ${this.oauthTabId}` +
+          (this.oauthTabUrl ? `, ${this.oauthTabUrl}` : '') +
+          `). Finish account selection / email / consent on THIS window first. ` +
+          `It typically lasts ~15 seconds. Do not switch back to the original site ` +
+          `(task tab ${this.getAuthoritativeTaskTabId() || '?'}) until this popup closes. ` +
+          `The elements below are from the OAuth window.`;
+    } else if (this.isOauthLoginUrl(context.url)) {
+      oauthHint =
+          '\nPRIORITY: This page is the OAuth login flow. Complete account selection / email / consent now before any other task steps.';
+    } else if (wantsGoogle && googleIds.length) {
+      oauthHint =
+          `\nHint: USER GOAL names Google OAuth / .google-btn — click id ${
+              googleIds.join(', ')}. ` +
+          `Do not click Apple${appleIds.length ? ` (id ${appleIds.join(', ')})` : ''} ` +
+          `or the email/code path unless that Google control is missing. ` +
+          `If a Google click reports success but the page does not change, retry that id or ` +
+          `request_screenshot and click the Google button by coordinate.`;
+    } else if (wantsApple && appleIds.length) {
+      oauthHint =
+          `\nHint: USER GOAL names Apple sign-in — click id ${appleIds.join(', ')}.`;
+    }
 
     const elements = meta.map((m, i) => {
       const entry: Record<string, unknown> = {id: m.el.id};
@@ -5883,11 +6671,25 @@ class OllamaWebClient implements GlicWebClient {
       if (m.el.disabled) {
         entry['disabled'] = true;
       }
+      if (m.el.overlay) {
+        entry['overlay'] = true;
+      }
+      if (m.el.cssClass && desc) {
+        desc.cls = m.el.cssClass;
+        entry['desc'] = desc;
+      }
 
       return entry;
     });
     const payload = {
       taskTabId: this.currentTask ? this.getAuthoritativeTaskTabId() : undefined,
+      oauthTabId: this.oauthTabId || undefined,
+      oauthWindowId: this.oauthWindowId || undefined,
+      oauthUrl: this.oauthTabUrl || undefined,
+      oauthAgeSec: this.oauthFlowStartedAt ?
+          Math.max(0, Math.round((Date.now() - this.oauthFlowStartedAt) / 1000)) :
+          undefined,
+      actuationTabId: this.getActuationTabId() || undefined,
       taskStep: this.currentTask ? this.currentTaskStepIndex : undefined,
       tabId: context.tabId,
       tabIdInt: context.tabIdInt,
@@ -5897,6 +6699,8 @@ class OllamaWebClient implements GlicWebClient {
       element_count: elements.length,
       elements,
       innerText: context.innerText?.slice(0, 2000) ?? '',
+      hasOverlay: !!(context.hasOverlay ||
+          (context.elements ?? []).some((el) => el.overlay)),
       last_action: this.lastActionSummary ?? undefined,
     };
     return (
@@ -5921,6 +6725,17 @@ class OllamaWebClient implements GlicWebClient {
       (loginButtonCandidateIds.length
           ? `\nHint: Log In/Sign In button candidate ids: ${loginButtonCandidateIds.join(', ')}`
           : '') +
+      (overlayIds.length
+          ? `\nHint: a popup/overlay is open (ids ${overlayIds.join(', ')}). ` +
+            `These block the page — dismiss or use them before background controls. ` +
+            `Zero-size, aria-hidden, pointer-events, and disabled flags are often decoys; prefer overlay:true targets.`
+          : '') +
+      (oauthHint || '') +
+      (this.mustSolveCaptchaBeforeSubmit(context)
+          ? '\n' + this.captchaMustSolveBeforeSubmitHint()
+          : '') +
+      (this.captchaChallengeActive ? '\n' + this.captchaSolverHint() : '') +
+      (this.hasLiveScreenshot() ? '\n' + this.liveScreenshotMustClickHint() : '') +
       '\nProvide the next action JSON only.'
     );
   }
@@ -5944,6 +6759,12 @@ class OllamaWebClient implements GlicWebClient {
       return lines.join('\n');
     }
     const pageUnchanged = !!options?.pageUnchanged;
+    if (this.oauthTabId) {
+      lines.push(
+          `PRIORITY: OAuth login popup is still open (tab ${this.oauthTabId}` +
+          (this.oauthTabUrl ? `, ${this.oauthTabUrl}` : '') +
+          '). Finish that login now before resuming the original task.');
+    }
     lines.push(
         `Continue from prior context on task step ${this.currentTaskStepIndex || 1}; do not assume a fresh element list this turn.`);
     if (pageUnchanged) {
@@ -5976,6 +6797,31 @@ class OllamaWebClient implements GlicWebClient {
         'Return {"action":"request_context"} when needed ids are missing or the UI changed ' +
         '(including same-URL modal/dialog/popup/overlay).');
     lines.push('For another open tab (2FA/email), use list_tabs / peek_tab / request_context with tab_id and reload:true if the inbox may be stale.');
+    if (this.mustSolveCaptchaBeforeSubmit(context)) {
+      lines.push(this.captchaMustSolveBeforeSubmitHint());
+    }
+    if (this.captchaChallengeActive) {
+      lines.push(this.captchaSolverHint());
+    }
+    if (this.hasLiveScreenshot()) {
+      lines.push(this.liveScreenshotMustClickHint());
+    }
+    const goalText = String(this.currentTask?.goal || '').toLowerCase();
+    if (/google-btn|continue with google|google oauth/.test(goalText)) {
+      const labeledGoogle = this.lastTaskLabeledElements
+                                .filter((el) => /google/i.test(el.text || ''))
+                                .map((el) => el.id);
+      if (labeledGoogle.length) {
+        lines.push(
+            `USER GOAL requires Continue with Google (.google-btn). Use id ${
+                labeledGoogle.join(', ')}. Do not use Apple or email login as a substitute.`);
+      }
+      if (pageUnchanged && /click target_id=/.test(this.lastActionSummary || '')) {
+        lines.push(
+            'Last click did not change the page. If that click was not the Google OAuth button, click the Google id. ' +
+            'If it was, retry it or request_screenshot and click the Google button by coordinate — do not switch to Apple/email.');
+      }
+    }
     return lines.join('\n');
   }
 
@@ -6000,17 +6846,29 @@ class OllamaWebClient implements GlicWebClient {
     this.taskLoopRunning = true;
     this.taskLoopStopRequested = false;
     this.updateLlmUiState();
+    await this.snapshotKnownBrowserTabs();
     let previousUrl = '';
     let forceContextPrompt = true;
     let previousContextSignature = '';
     let repeatedFreshContextCount = 0;
     try {
-    for (let step = 0; step < this.maxStepsPerTask; step++) {
+    const startStep = Math.max(
+        0,
+        Math.min(
+            this.pausedResumeFromStep > 0 ?
+                this.pausedResumeFromStep - 1 :
+                0,
+            Math.max(0, this.maxStepsPerTask - 1)));
+    this.pausedResumeFromStep = 0;
+    for (let step = startStep; step < this.maxStepsPerTask; step++) {
       if (this.taskLoopStopRequested || !this.currentTask) {
         break;
       }
       this.currentTaskStepIndex = step + 1;
       this.updateTaskInfo();
+      if (await this.syncOauthFlow()) {
+        forceContextPrompt = true;
+      }
       if (this.shouldEnforceHeadlessOnlyForCurrentTask() &&
           (step === 0 || forceContextPrompt) &&
           this.supportsDashboardInvestigation()) {
@@ -6062,7 +6920,8 @@ class OllamaWebClient implements GlicWebClient {
       const pageUnchanged = Boolean(
           previousContextSignature &&
           contextSignature === previousContextSignature && !urlChanged);
-      const shouldSendFullContext = forceContextPrompt || step === 0 || urlChanged;
+      const shouldSendFullContext =
+          forceContextPrompt || step === 0 || urlChanged || !!this.oauthTabId;
       if (forceContextPrompt) {
         if (contextSignature === previousContextSignature) {
           repeatedFreshContextCount += 1;
@@ -6072,10 +6931,21 @@ class OllamaWebClient implements GlicWebClient {
       } else {
         repeatedFreshContextCount = 0;
       }
+      this.applyPendingLoopGuidance();
       let prompt = this.prependUserGoalPriority(
           shouldSendFullContext
               ? this.buildContextPrompt(context)
               : this.buildContinuationPrompt(context, {pageUnchanged}));
+      const guidanceBlock = this.formatActiveLoopGuidanceForPrompt();
+      if (guidanceBlock) {
+        prompt = guidanceBlock + prompt;
+      }
+      if (this.mustSolveCaptchaBeforeSubmit(context)) {
+        prompt += '\n' + this.captchaMustSolveBeforeSubmitHint();
+      }
+      if (this.captchaChallengeActive) {
+        prompt += '\n' + this.captchaSolverHint();
+      }
       if (shouldSendFullContext && repeatedFreshContextCount > 0) {
         prompt +=
             '\nFresh context snapshot note: signature matches the last one ' +
@@ -6091,27 +6961,35 @@ class OllamaWebClient implements GlicWebClient {
       }
       this.trimMessages();
       this.requestContextNextTurn = false;
+      if (this.hasLiveScreenshot()) {
+        prompt += '\n' + this.liveScreenshotMustClickHint();
+      }
       if (this.taskLoopStopRequested || !this.currentTask) {
         break;
       }
-      // First full context drop: attach a gridded CSS-pixel screenshot so the
-      // model can click overlays immediately without an extra request_context.
-      if (step === 0 && shouldSendFullContext &&
-          this.supportsScreenshotAction() &&
-          !this.shouldEnforceHeadlessOnlyForCurrentTask()) {
-        await this.captureScreenshotForNextTurn('with initial context');
+      this.capturedScreenshotThisTurn = false;
+      // One screenshot is enough. Do not reshoot every turn — that burns the
+      // step budget (20 shots, no clicks). Only capture when we do not already
+      // have a pending/recent shot and the model has not been screenshot-spinning.
+      if (this.captchaChallengeActive && this.supportsScreenshotAction() &&
+          !this.shouldEnforceHeadlessOnlyForCurrentTask() &&
+          !this.pendingScreenshot && this.screenshotOnlyStreak === 0) {
+        await this.captureScreenshotForNextTurn('captcha visual challenge');
       }
       const assistantText = await this.sendUserMessage(
           prompt,
           {context, handleActions: true},
       );
-      if (this.taskLoopStopRequested || !this.currentTask) {
+      if (!this.currentTask) {
         break;
       }
       if (assistantText === MODEL_BUSY_MESSAGE) {
         step -= 1;
         await sleep(500);
         continue;
+      }
+      if (guidanceBlock) {
+        this.loopGuidanceAppliedTurns += 1;
       }
       const canceled = !assistantText ||
           assistantText === '[Canceled]' ||
@@ -6126,12 +7004,26 @@ class OllamaWebClient implements GlicWebClient {
       previousContextSignature = contextSignature;
       forceContextPrompt = this.requestContextNextTurn;
     }
-    if (this.taskLoopStopRequested && this.currentTask) {
-      this.addSystemMessage('Agent task loop paused.');
-      await this.finishTask('paused', 'Paused by user');
+    if (this.humanCaptchaHold && this.currentTask) {
+      this.queueRunning = false;
+      this.addSystemMessage(
+          'Waiting for you to solve the captcha. Press "I solved it" or Resume when done.');
+      this.updateQueueStatus();
+      this.updateTaskInfo();
+      this.syncSolvedCaptchaButtons();
+    } else if (this.taskLoopStopRequested && this.currentTask) {
+      this.queueRunning = false;
+      this.addSystemMessage(
+          'Task paused. Guide current task still works. Press Resume to continue from here.');
+      this.updateQueueStatus();
+      this.updateTaskInfo();
     } else if (this.currentTask) {
-      this.addSystemMessage('Stopping task loop (no action or max steps).');
-      await this.finishTask('stalled', 'No actionable response from model');
+      // Keep the task so Start Queue can reset the step budget and continue.
+      this.queueRunning = false;
+      this.addSystemMessage(
+          `Max steps (${this.maxStepsPerTask}) reached. Increase Max steps if needed, then press Start Queue to continue.`);
+      this.updateQueueStatus();
+      this.updateTaskInfo();
     }
     } finally {
       this.taskLoopRunning = false;
@@ -6185,6 +7077,20 @@ class OllamaWebClient implements GlicWebClient {
       raw = cleaned;
     }
     const actionType = raw.action.toLowerCase().trim();
+    if (actionType === 'save_script' || actionType === 'complete_site' ||
+        actionType === 'complete_script' || actionType === 'site_complete' ||
+        actionType === 'clip_script' || actionType === 'save_site_script') {
+      const out: any = {action: 'save_script'};
+      if (typeof raw.name === 'string' && raw.name.trim()) {
+        out.name = raw.name.trim();
+      }
+      if (typeof raw.reason === 'string' && raw.reason.trim()) {
+        out.reason = raw.reason.trim();
+      } else if (typeof raw.message === 'string' && raw.message.trim()) {
+        out.reason = raw.message.trim();
+      }
+      return out;
+    }
     if (actionType === 'complete' || actionType === 'task_complete' ||
         actionType === 'mark_task_complete' || actionType === 'mark_complete' ||
         actionType === 'task_done' || actionType === 'finish_task' ||
@@ -6251,6 +7157,16 @@ class OllamaWebClient implements GlicWebClient {
         normalized.query = query;
       }
       return normalized;
+    }
+    if (actionType === 'ignore_guidance' ||
+        actionType === 'drop_guidance' ||
+        actionType === 'guidance_stale') {
+      return {action: 'ignore_guidance'};
+    }
+    if (actionType === 'human_solve_captcha' ||
+        actionType === 'pause_for_human' ||
+        actionType === 'solve_captcha') {
+      return {action: 'human_solve_captcha'};
     }
     if (actionType === 'request_screenshot' ||
         actionType === 'screenshot' ||
@@ -6356,19 +7272,34 @@ class OllamaWebClient implements GlicWebClient {
       const allowedKeysByAction: Record<string, Set<string>> = {
         click: new Set([
           'action', 'target_id', 'targetId', 'element', 'coordinate',
-          'coordinates', 'x', 'y',
+          'coordinates', 'cell', 'x', 'y', 'ignore_guidance', 'ignoreGuidance',
+          'guidance_stale', 'guidanceStale', 'drop_guidance', 'dropGuidance',
         ]),
         hover: new Set([
           'action', 'target_id', 'targetId', 'element', 'coordinate',
-          'coordinates', 'x', 'y',
+          'coordinates', 'cell', 'x', 'y', 'ignore_guidance', 'ignoreGuidance',
+          'guidance_stale', 'guidanceStale', 'drop_guidance', 'dropGuidance',
         ]),
         type: new Set([
           'action', 'target_id', 'targetId', 'element', 'text', 'value',
-          'coordinate', 'coordinates', 'x', 'y',
+          'coordinate', 'coordinates', 'cell', 'x', 'y', 'ignore_guidance',
+          'ignoreGuidance', 'guidance_stale', 'guidanceStale', 'drop_guidance',
+          'dropGuidance',
         ]),
-        key_press: new Set(['action', 'key', 'value', 'count']),
-        scroll: new Set(['action', 'target_id', 'targetId', 'element', 'distance']),
-        scroll_to: new Set(['action', 'target_id', 'targetId', 'element']),
+        key_press: new Set([
+          'action', 'key', 'value', 'count', 'ignore_guidance', 'ignoreGuidance',
+          'guidance_stale', 'guidanceStale', 'drop_guidance', 'dropGuidance',
+        ]),
+        scroll: new Set([
+          'action', 'target_id', 'targetId', 'element', 'distance',
+          'ignore_guidance', 'ignoreGuidance', 'guidance_stale', 'guidanceStale',
+          'drop_guidance', 'dropGuidance',
+        ]),
+        scroll_to: new Set([
+          'action', 'target_id', 'targetId', 'element', 'ignore_guidance',
+          'ignoreGuidance', 'guidance_stale', 'guidanceStale', 'drop_guidance',
+          'dropGuidance',
+        ]),
       };
       const allowed = allowedKeysByAction[raw.action];
       if (allowed) {
@@ -6378,6 +7309,8 @@ class OllamaWebClient implements GlicWebClient {
             'success', 'reason', 'status', 'ok', 'error', 'message',
             'action_type', 'actionType', 'description', 'desc', 'comment',
             'thought', 'thinking',
+            'ignore_guidance', 'ignoreGuidance', 'guidance_stale',
+            'guidanceStale', 'drop_guidance', 'dropGuidance',
           ]);
           const nonMeta = extras.filter((k) => !ignorableMetaKeys.has(k));
           if (nonMeta.length) {
@@ -6410,7 +7343,12 @@ class OllamaWebClient implements GlicWebClient {
           raw.element?.contentNodeId ??
           raw.element?.id;
       const targetId = Number.parseInt(String(candidate ?? ''), 10);
-      const hasTarget = Number.isFinite(targetId) && targetId > 0;
+      let hasTarget = Number.isFinite(targetId) && targetId > 0;
+      if (point && hasTarget) {
+        this.addSystemMessage(
+            `Keeping target_id ${targetId}; ignoring screenshot coordinate.`);
+        // Form fields must stay on locators. Coordinates are captcha-only.
+      }
       if (!hasTarget &&
           !(point &&
             (raw.action === 'click' || raw.action === 'hover' ||
@@ -6447,14 +7385,27 @@ class OllamaWebClient implements GlicWebClient {
         if (hasTarget) {
           out.target_id = targetId;
         }
-        if (point) {
+        if (point && !hasTarget) {
           out.coordinate = point;
         }
         return out;
       }
       if (raw.action === 'scroll') {
         const distance = Number(raw.distance ?? 600);
-        return {action: 'scroll', target_id: targetId, distance};
+        const scopeRaw = String(raw.scope || raw.element || '').toLowerCase();
+        const scope =
+            (scopeRaw === 'iframe' || scopeRaw === 'frame' ||
+             scopeRaw === 'element') ?
+                'iframe' :
+                ((scopeRaw === 'page' || scopeRaw === 'window' ||
+                  scopeRaw === 'document' || !hasTarget) ?
+                     'page' :
+                     'iframe');
+        const out: any = {action: 'scroll', distance, scope};
+        if (hasTarget && scope === 'iframe') {
+          out.target_id = targetId;
+        }
+        return out;
       }
       if (raw.action === 'scroll_to') {
         return {action: 'scroll_to', target_id: targetId};
@@ -6464,7 +7415,7 @@ class OllamaWebClient implements GlicWebClient {
         if (hasTarget) {
           out.target_id = targetId;
         }
-        if (point) {
+        if (point && !hasTarget) {
           out.coordinate = point;
         }
         return out;
@@ -6474,7 +7425,7 @@ class OllamaWebClient implements GlicWebClient {
         if (hasTarget) {
           out.target_id = targetId;
         }
-        if (point) {
+        if (point && !hasTarget) {
           out.coordinate = point;
         }
         return out;
@@ -6670,6 +7621,9 @@ class OllamaWebClient implements GlicWebClient {
     }
     const haystack = `${el.label} ${el.placeholder ?? ''} ${el.fieldName ?? ''}`.toLowerCase();
     if (el.formType?.includes('INPUT_PASSWORD') || haystack.includes('password')) {
+      if (this.mustSolveCaptchaBeforeSubmit(context)) {
+        return false;
+      }
       return true;
     }
     return false;
@@ -6894,6 +7848,14 @@ class OllamaWebClient implements GlicWebClient {
     if (!raw || typeof raw !== 'object') {
       return null;
     }
+    const cellToken = raw.cell ?? (
+        typeof raw.coordinate === 'string' ? raw.coordinate :
+        (typeof raw.coordinates === 'string' ? raw.coordinates : ''));
+    if (typeof cellToken === 'string' && cellToken.trim()) {
+      this.addSystemMessage(
+          `Coordinates must be {"coordinate":[x,y]} image pixels, not "${cellToken.trim()}".`);
+      return null;
+    }
     const fromPair = (value: any): {x: number, y: number}|null => {
       if (Array.isArray(value) && value.length >= 2) {
         const x = Number(value[0]);
@@ -6913,15 +7875,36 @@ class OllamaWebClient implements GlicWebClient {
       return null;
     };
     const fromNamed = fromPair(raw.coordinate ?? raw.coordinates);
-    if (fromNamed) {
-      return fromNamed;
-    }
-    if (raw.x != null && raw.y != null) {
+    const fromXY = (!fromNamed && raw.x != null && raw.y != null) ? (() => {
       const x = Number(raw.x);
       const y = Number(raw.y);
       if (Number.isFinite(x) && Number.isFinite(y)) {
         return {x: Math.round(x), y: Math.round(y)};
       }
+      return null;
+    })() : null;
+    const pixel = fromNamed || fromXY;
+    if (pixel) {
+      const space = this.lastScreenshotClickSpace;
+      let x = Math.round(pixel.x);
+      let y = Math.round(pixel.y);
+      if (space && space.clickW > 0 && space.clickH > 0 &&
+          space.imageW > 0 && space.imageH > 0) {
+        const rawX = x;
+        const rawY = y;
+        x = Math.round(rawX * space.clickW / space.imageW);
+        y = Math.round(rawY * space.clickH / space.imageH);
+        x = Math.max(0, Math.min(space.clickW - 1, x));
+        y = Math.max(0, Math.min(space.clickH - 1, y));
+        this.addSystemMessage(
+            `Click image (${rawX},${rawY}) on ${space.imageW}x${space.imageH} ` +
+            `→ viewport (${x},${y}) of ${space.clickW}x${space.clickH}.`);
+      } else {
+        x = Math.max(0, x);
+        y = Math.max(0, y);
+        this.addSystemMessage(`Click (${x},${y}).`);
+      }
+      return {x, y};
     }
     return null;
   }
@@ -6961,10 +7944,14 @@ class OllamaWebClient implements GlicWebClient {
         if (target.formType) {
           timelineAction.params.__glic_target_form_type = target.formType;
         }
-        // Click/hover/type all need locators or coordinates for schema
-        // preflight. Prefer locators whenever the page context has them;
-        // coordinates are a secondary targeting signal.
-        const locators = this.getTargetLocators(context, action.target_id);
+        // Screenshot pixels are the click. Do not attach wrapper
+        // locators — #captcha_container / `.class button` retargets to Claim.
+        const hasScreenshotCell = !!(action?.coordinate &&
+            typeof action.coordinate.x === 'number' &&
+            typeof action.coordinate.y === 'number');
+        const locators = hasScreenshotCell ?
+            [] :
+            this.getTargetLocators(context, action.target_id);
         if (locators.length) {
           timelineAction.params.locators = locators;
         } else if (kind === 'click' || kind === 'hover' || kind === 'type') {
@@ -6980,12 +7967,14 @@ class OllamaWebClient implements GlicWebClient {
             }];
           }
         }
-        const point = getActionablePoint(target);
-        if (point) {
-          timelineAction.params.coordinates = {
-            x: Math.round(point.x),
-            y: Math.round(point.y),
-          };
+        if (!hasScreenshotCell) {
+          const point = getActionablePoint(target);
+          if (point) {
+            timelineAction.params.coordinates = {
+              x: Math.round(point.x),
+              y: Math.round(point.y),
+            };
+          }
         }
       }
     }
@@ -7010,8 +7999,27 @@ class OllamaWebClient implements GlicWebClient {
         timelineAction.params.url = navUrl;
       }
     }
-    if (action?.coordinate && typeof action.coordinate === 'object') {
-      timelineAction.params.coordinates = action.coordinate;
+    if (action?.coordinate && typeof action.coordinate === 'object' &&
+        typeof action.coordinate.x === 'number' &&
+        typeof action.coordinate.y === 'number') {
+      delete timelineAction.params.locators;
+      timelineAction.params.coordinates = {
+        x: action.coordinate.x,
+        y: action.coordinate.y,
+      };
+      timelineAction.params.humanOffset = false;
+    }
+    if (kind === 'scroll' || kind === 'scroll_to') {
+      const scope = String(action?.scope || '').toLowerCase();
+      const pageScroll = scope === 'page' || scope === 'window' ||
+          (kind === 'scroll' && !action?.target_id && scope !== 'iframe');
+      if (pageScroll) {
+        timelineAction.params.element = 'window';
+        delete timelineAction.params.locators;
+        delete timelineAction.params.coordinates;
+      } else {
+        timelineAction.params.element = 'element';
+      }
     }
     if (action?.action === 'scroll_to' && typeof action?.target_id === 'number') {
       timelineAction.action = 'scroll';
@@ -7019,6 +8027,7 @@ class OllamaWebClient implements GlicWebClient {
         ...timelineAction.params,
         percentY: 50,
         percentX: 50,
+        element: timelineAction.params.element || 'element',
       };
     }
     return timelineAction;
@@ -7062,7 +8071,7 @@ class OllamaWebClient implements GlicWebClient {
     }
     // Skip internal pre-type / autofill plumbing — not part of the reusable script.
     if (src.__pre_type_focus || src.__pre_type_select_all || src.__pre_type_clear ||
-        src.__login_autofill_bypass) {
+        src.__login_autofill_bypass || src.__glic_captcha) {
       return false;
     }
     const kind = String(src.action || ev.timelineAction?.action || '').toLowerCase();
@@ -7107,6 +8116,9 @@ class OllamaWebClient implements GlicWebClient {
       }));
     } catch (_) {}
 
+    if (sourceAction?.__glic_captcha) {
+      return;
+    }
     const bridge = window.__dashboardGlicRecorderBridge;
     if (bridge && typeof bridge.recordAction === 'function') {
       try {
@@ -7147,7 +8159,8 @@ class OllamaWebClient implements GlicWebClient {
     const reviewPrompt =
         'Task succeeded. Review the recorded steps below (same compact id/desc ' +
         'style as page context). Prune retries, mistakes, and dead-ends. Keep the ' +
-        'minimal ordered steps that still achieve the USER GOAL.\n' +
+        'minimal ordered steps that still achieve the USER GOAL. ' +
+        'Omit captcha/visual-challenge clicks; those are one-shot and replaced by a glic_prompt on this tab.\n' +
         `USER GOAL: ${task.goal}\n` +
         `Steps:\n${JSON.stringify(steps, null, 2)}\n` +
         'Respond with ONE JSON object only, same action field as other tools:\n' +
@@ -7220,31 +8233,241 @@ class OllamaWebClient implements GlicWebClient {
     }
   }
 
-  private async flushRecorderScaffoldForTask(
-      status: string, task?: TaskItem|null): Promise<void> {
-    if (status !== 'success') {
+  private async loadAgentScriptSaveSettings():
+      Promise<{autoSave: boolean, review: boolean}> {
+    const defaults = {autoSave: true, review: true};
+    if (!this.canUseChromeSend()) {
+      return defaults;
+    }
+    try {
+      const res = await this.sendWithPromise('dashboardGetEffectiveSettings');
+      const agent = res?.settings?.agent || res?.agent || {};
+      return {
+        autoSave: agent.autoSaveScriptOnComplete !== false,
+        review: agent.reviewScriptAfterComplete !== false,
+      };
+    } catch (_) {
+      return defaults;
+    }
+  }
+
+  private async saveAgentScriptToDashboard(payload: {
+    script_id?: string,
+    name: string,
+    goal?: string,
+    startUrl?: string,
+    source?: string,
+    actions: any[],
+  }): Promise<{ok: boolean, id?: string, name?: string, error?: string,
+               action_count?: number}> {
+    if (this.canUseChromeSend()) {
+      const res = await this.sendWithPromise('dashboardAgentSaveScript', {
+        script_id: payload.script_id,
+        name: payload.name,
+        goal: payload.goal || '',
+        startUrl: payload.startUrl || '',
+        source: payload.source || 'glic_panel_autosave',
+        actions: payload.actions,
+      });
+      if (res && res.ok !== false) {
+        return {
+          ok: true,
+          id: String(res.id || payload.script_id || ''),
+          name: String(res.name || payload.name),
+          action_count: Number(res.action_count || payload.actions.length),
+        };
+      }
+      return {
+        ok: false,
+        error: String(res?.error || 'dashboardAgentSaveScript failed'),
+      };
+    }
+    try {
+      const res = await fetch('/task/save_script', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          task_id: payload.script_id || `manual-${Date.now()}`,
+          goal: payload.goal || '',
+          name: payload.name,
+          status: 'success',
+          actions: payload.actions,
+        }),
+      });
+      if (!res.ok) {
+        return {ok: false, error: `HTTP ${res.status} ${await res.text()}`};
+      }
+      const data = await res.json();
+      return {
+        ok: true,
+        id: String(data?.id || payload.script_id || ''),
+        name: payload.name,
+        action_count: payload.actions.length,
+      };
+    } catch (e) {
+      return {ok: false, error: String(e)};
+    }
+  }
+
+  private hostnameFromUrl(url: string|null|undefined): string {
+    const raw = String(url || '').trim();
+    if (!raw) {
+      return '';
+    }
+    try {
+      return new URL(raw).hostname.replace(/^www\./, '');
+    } catch (_) {
+      return raw.replace(/^https?:\/\//, '').split('/')[0] || '';
+    }
+  }
+
+  private async saveCurrentSiteScriptAndContinue(action: any): Promise<void> {
+    if (!this.currentTask) {
+      this.addSystemMessage('No active task — cannot save a site script.');
       return;
     }
-    const completed = task || null;
+    this.scriptSegmentIndex += 1;
+    const host = this.hostnameFromUrl(this.workingTabUrl || this.currentTask.url);
+    const nameHint = String(action?.name || '').trim() ||
+        (`Agent: ${host || 'site'} ${this.scriptSegmentIndex}`).slice(0, 80);
+    const saved = await this.saveRecorderSegment({
+      task: this.currentTask,
+      sinceMs: this.scriptSegmentStartedAtMs,
+      nameHint,
+      source: 'glic_panel_site_segment',
+      clip: true,
+      requireAutoSave: false,
+      review: true,
+      reason: String(action?.reason || '').trim(),
+    });
+    this.scriptSegmentStartedAtMs = Date.now();
+    this.clearCaptchaChallengeState();
+    this.pendingScreenshot = null;
+    this.screenshotSpamStrikes = 0;
+    this.requestContextNextTurn = true;
+    this.addSystemMessage(
+        saved ?
+            `Saved and clipped site script "${nameHint}". ` +
+                'The overall task is still running — go to the next website.' :
+            `No recorded steps to save for this site (${nameHint}). ` +
+                'Continuing the same task.');
+  }
+
+  private async saveRecorderSegment(options: {
+    task?: TaskItem|null,
+    sinceMs?: number,
+    nameHint?: string,
+    source?: string,
+    clip: boolean,
+    requireAutoSave: boolean,
+    review: boolean,
+    reason?: string,
+    quietIfEmpty?: boolean,
+  }): Promise<boolean> {
+    const completed = options.task || this.currentTask || null;
     const buffer = Array.isArray(window.__glicRecorderScaffoldBuffer) ?
         window.__glicRecorderScaffoldBuffer :
         [];
     const taskId = completed?.id || '';
+    const sinceMs = Number(options.sinceMs || 0);
     const relevant = buffer.filter((ev) => {
       if (!ev || typeof ev !== 'object') {
         return false;
       }
-      if (!taskId) {
-        return true;
+      if (taskId && ev.taskId && ev.taskId !== taskId) {
+        return false;
       }
-      return !ev.taskId || ev.taskId === taskId;
+      if (sinceMs && Number(ev.timestampMs || 0) < sinceMs) {
+        return false;
+      }
+      return true;
     });
+    const saveOk = await this.persistRecorderEventsAsScript(
+        relevant, completed, options);
+    if (options.clip) {
+      try {
+        if (Array.isArray(window.__glicRecorderScaffoldBuffer)) {
+          const drop = new Set(relevant);
+          window.__glicRecorderScaffoldBuffer =
+              window.__glicRecorderScaffoldBuffer.filter((ev) => !drop.has(ev));
+        }
+      } catch (_) {
+      }
+    }
+    return saveOk;
+  }
+
+  private async persistRecorderEventsAsScript(
+      relevant: GlicRecorderScaffoldEvent[],
+      completed: TaskItem|null,
+      options: {
+        nameHint?: string,
+        source?: string,
+        requireAutoSave: boolean,
+        review: boolean,
+        reason?: string,
+        quietIfEmpty?: boolean,
+      }): Promise<boolean> {
+    const captchaEvents = relevant.filter((ev) => this.isCaptchaScaffoldEvent(ev));
     const candidates = relevant.filter((ev) => this.isScaffoldReviewCandidate(ev));
-    let selected = candidates;
-    if (completed && candidates.length > 0) {
+    const captchaTs = captchaEvents[0]?.timestampMs;
+    const shouldInsertCaptchaPause =
+        this.captchaSeenThisTask || captchaEvents.length > 0;
+    const settings = await this.loadAgentScriptSaveSettings();
+    if (options.requireAutoSave && !settings.autoSave) {
+      this.addSystemMessage(
+          'autoSaveScriptOnComplete is off; not saving a dashboard script.');
+      return false;
+    }
+
+    const toTimeline = (events: GlicRecorderScaffoldEvent[]) => events
+        .map((ev) => ({
+          ...ev.timelineAction,
+          params: {
+            ...(ev.timelineAction?.params || {}),
+            __glic_brief: ev.brief || null,
+          },
+        }))
+        .filter((a) => a && typeof a === 'object' &&
+                    String(a.action || '') !== 'complete' &&
+                    String(a.action || '') !== 'save_script');
+    let draftActions = toTimeline(candidates);
+    if (shouldInsertCaptchaPause) {
+      draftActions = this.withHumanCaptchaPause(
+          draftActions, this.captchaInsertIndex(candidates, captchaTs));
+    }
+    if (!draftActions.length) {
+      if (!options.quietIfEmpty) {
+        this.addSystemMessage('No successful actions were recorded to save.');
+      }
+      return false;
+    }
+
+    const host = this.hostnameFromUrl(
+        this.workingTabUrl || relevant[0]?.url || completed?.url || '');
+    const draftName = (options.nameHint ||
+        (`Agent: ${host || completed?.goal || 'Agent task'}`)).slice(0, 80);
+    const startUrl = relevant[0]?.url || completed?.url || this.workingTabUrl || '';
+    const draft = await this.saveAgentScriptToDashboard({
+      name: draftName,
+      goal: completed?.goal || '',
+      startUrl,
+      source: options.source || 'glic_panel_autosave',
+      actions: draftActions,
+    });
+    if (!draft.ok) {
+      this.addSystemMessage(
+          `Script save failed.${draft.error ? ' ' + draft.error : ''}`);
+      return false;
+    }
+    this.addSystemMessage(
+        `Saved draft script: ${draft.name || draftName} (${draftActions.length} steps).`);
+
+    if (options.review && settings.review && completed && candidates.length > 0) {
       this.addSystemMessage(
           `Reviewing ${candidates.length} recorded step(s) for script prune/edit…`);
       const keep = await this.reviewScaffoldStepsWithModel(completed, candidates);
+      let selected = candidates;
       if (keep && keep.length) {
         selected = keep.map((i) => candidates[i]!).filter(Boolean);
         this.addSystemMessage(
@@ -7253,86 +8476,55 @@ class OllamaWebClient implements GlicWebClient {
         this.addSystemMessage(
             'Model kept 0 steps; falling back to full candidate timeline.');
         selected = candidates;
+      } else {
+        this.addSystemMessage('Review kept the draft as-is.');
       }
-    }
-
-    const actions = selected
-                        .map((ev) => ev.timelineAction)
-                        .filter((a) => a && typeof a === 'object' &&
-                                    String(a.action || '') !== 'complete');
-    // Attach compact brief alongside each enriched timeline action for debugging.
-    const actionsWithBrief = selected.map((ev) => ({
-      ...ev.timelineAction,
-      params: {
-        ...(ev.timelineAction?.params || {}),
-        __glic_brief: ev.brief || null,
-      },
-    }));
-    const toSave = actionsWithBrief.length ? actionsWithBrief : actions;
-
-    if (toSave.length) {
-      try {
-        const res = await fetch('/task/save_script', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({
-            task_id: taskId || `manual-${Date.now()}`,
-            goal: completed?.goal || '',
-            name: (completed?.goal || 'Agent task').slice(0, 80),
-            status,
-            actions: toSave,
-            brief_steps: selected.map((ev, i) => ({index: i, ...(ev.brief || {})})),
-          }),
+      let reviewedActions = toTimeline(selected);
+      if (shouldInsertCaptchaPause) {
+        reviewedActions = this.withHumanCaptchaPause(
+            reviewedActions, this.captchaInsertIndex(selected, captchaTs));
+      }
+      if (keep && keep.length && reviewedActions.length &&
+          reviewedActions.length !== draftActions.length) {
+        const pruned = await this.saveAgentScriptToDashboard({
+          script_id: draft.id,
+          name: draft.name || draftName,
+          goal: completed?.goal || '',
+          startUrl,
+          source: 'glic_panel_review',
+          actions: reviewedActions,
         });
-        if (res.ok) {
-          const data = await res.json();
+        if (pruned.ok) {
           this.addSystemMessage(
-              `Saved agent script (${toSave.length} steps, enriched locators) → ${
-                  data?.path || 'scripts/'}`);
+              `Reviewed script: ${pruned.name || draft.name} (${
+                  reviewedActions.length} steps).`);
         } else {
           this.addSystemMessage(
-              `Script save failed: HTTP ${res.status} ${await res.text()}`);
+              `Review rewrite failed; kept draft.${
+                  pruned.error ? ' ' + pruned.error : ''}`);
         }
-      } catch (e) {
-        this.addSystemMessage(`Script save error: ${e}`);
       }
-    } else {
-      this.addSystemMessage(
-          'Task succeeded but no scaffolded actions were buffered to save as a script.');
     }
 
-    const bridge = window.__dashboardGlicRecorderBridge;
-    if (bridge && typeof bridge.recordAction === 'function') {
-      for (const action of toSave) {
-        try {
-          await Promise.resolve(bridge.recordAction({
-            action,
-            save: false,
-            source: 'glic_task_complete',
-          }));
-        } catch (e) {
-          console.warn('[GlicRecorder] bridge recordAction failed', e);
-        }
-      }
+    return true;
+  }
+
+  private async flushRecorderScaffoldForTask(
+      status: string, task?: TaskItem|null): Promise<void> {
+    if (status !== 'success') {
+      return;
     }
-    if (bridge && typeof bridge.saveCurrentScript === 'function') {
-      try {
-        await Promise.resolve(bridge.saveCurrentScript());
-        this.addSystemMessage('Also saved via dashboard recorder bridge.');
-      } catch (e) {
-        console.warn('[GlicRecorder] bridge saveCurrentScript failed', e);
-      }
-    }
-    try {
-      if (taskId && Array.isArray(window.__glicRecorderScaffoldBuffer)) {
-        window.__glicRecorderScaffoldBuffer =
-            window.__glicRecorderScaffoldBuffer.filter(
-                (ev) => ev?.taskId && ev.taskId !== taskId);
-      } else if (!taskId) {
-        window.__glicRecorderScaffoldBuffer = [];
-      }
-    } catch (_) {
-    }
+    await this.saveRecorderSegment({
+      task: task || null,
+      sinceMs: 0,
+      nameHint: '',
+      source: 'glic_panel_autosave',
+      clip: true,
+      requireAutoSave: true,
+      review: true,
+      // save_script already clipped every step into per-site scripts.
+      quietIfEmpty: this.scriptSegmentIndex > 0,
+    });
   }
 
   private shouldTryHybridFallback(action: any, resultCode: number): boolean {
@@ -7371,18 +8563,22 @@ class OllamaWebClient implements GlicWebClient {
       return false;
     }
 
-    if (action?.coordinate && typeof action.coordinate.x === 'number' &&
+    if (action?.coordinate &&
+        typeof action.coordinate.x === 'number' &&
         typeof action.coordinate.y === 'number') {
+      delete timelineAction.params.locators;
       timelineAction.params.coordinates = {
         x: action.coordinate.x,
         y: action.coordinate.y,
       };
-    } else if ((!Array.isArray(timelineAction.params.locators) ||
-                timelineAction.params.locators.length === 0) &&
-               typeof action?.target_id === 'number') {
+      timelineAction.params.humanOffset = false;
+    } else if (typeof action?.target_id === 'number' &&
+               !(Array.isArray(timelineAction.params.locators) &&
+                 timelineAction.params.locators.length)) {
       const coordinateFallback = this.buildCoordinateFallbackAction(action, context);
       if (coordinateFallback?.coordinate) {
         timelineAction.params.coordinates = coordinateFallback.coordinate;
+        timelineAction.params.humanOffset = false;
       }
     }
 
@@ -7429,7 +8625,7 @@ class OllamaWebClient implements GlicWebClient {
 
   private async performActionOnce(action: any, context: PageContextSummary):
       Promise<{resultCode?: number}|null> {
-    if (this.taskLoopStopRequested) {
+    if (!this.currentTask) {
       return null;
     }
     const actionForLogging = this.buildActionForLogging(action, context);
@@ -7459,19 +8655,24 @@ class OllamaWebClient implements GlicWebClient {
             context.url ?? this.workingTabUrl ?? null,
             context.title ?? this.workingTabTitle ?? null);
       }
-      if (action?.coordinate && typeof action.coordinate.x === 'number' &&
+      if (action?.coordinate &&
+          typeof action.coordinate.x === 'number' &&
           typeof action.coordinate.y === 'number') {
+        delete timelineAction.params.locators;
         timelineAction.params.coordinates = {
           x: action.coordinate.x,
           y: action.coordinate.y,
         };
-      } else if ((!Array.isArray(timelineAction.params?.locators) ||
-                  timelineAction.params.locators.length === 0) &&
-                 typeof action?.target_id === 'number') {
+        timelineAction.params.humanOffset = false;
+      } else if (typeof action?.target_id === 'number' &&
+                 !(Array.isArray(timelineAction.params?.locators) &&
+                   timelineAction.params.locators.length)) {
         const coordinateFallback = this.buildCoordinateFallbackAction(
             action, context);
         if (coordinateFallback?.coordinate) {
           timelineAction.params.coordinates = coordinateFallback.coordinate;
+          timelineAction.params.humanOffset = false;
+        timelineAction.params.humanOffset = false;
         }
       }
       void this.logTaskAction('requested', {
@@ -7510,6 +8711,62 @@ class OllamaWebClient implements GlicWebClient {
       }
       await this.emitRecorderScaffoldAction(action, context, ACTION_RESULT.OK);
       return {resultCode: ACTION_RESULT.OK};
+    }
+    if (this.canUseChromeSend()) {
+      let tabId = this.currentTask ? this.getCurrentTabIdInt() : context.tabIdInt;
+      if (!Number.isFinite(tabId)) {
+        const parsed = Number.parseInt(
+            String(
+                (this.currentTask ? this.getAuthoritativeTaskTabId() : null) ??
+                context.tabId ?? this.currentTabId ?? ''), 10);
+        tabId = Number.isFinite(parsed) ? parsed : undefined;
+      }
+      if (this.currentTask && Number.isFinite(tabId)) {
+        this.bindTaskTab(
+            String(tabId),
+            context.url ?? this.workingTabUrl ?? null,
+            context.title ?? this.workingTabTitle ?? this.currentTask?.goal ?? null);
+      }
+      void this.logTaskAction('requested', {
+        engine: 'dashboard_script_executor',
+        tab_id: tabId,
+        action: actionForLogging,
+        timeline_action: timelineAction,
+      });
+      try {
+        const result = await this.runDashboardExecutorAction(
+            String(timelineAction?.action || action?.action || ''),
+            timelineAction?.params || {},
+            {waitForCompletion: true, tabId: Number.isFinite(tabId) ? tabId : undefined});
+        const ok = !!result && result.ok !== false && result.success !== false &&
+            !result.error;
+        await this.logTaskAction(ok ? 'result' : 'error', {
+          engine: 'dashboard_script_executor',
+          tab_id: tabId,
+          action: actionForLogging,
+          timeline_action: timelineAction,
+          response: result || null,
+        });
+        if (!ok) {
+          this.addSystemMessage(
+              `Action execution failed: ${result?.error || result?.message || 'script executor'}`);
+          return null;
+        }
+        if (action?.action === 'navigate' && typeof action?.url === 'string' &&
+            action.url.trim()) {
+          this.setWorkingContext(
+              this.currentTabId,
+              action.url.trim(),
+              this.currentTask?.goal ?? this.workingTabTitle);
+        }
+        this.lastActionSummary =
+            `${action.action} target_id=${action.target_id ?? ''} -> executor_completed`;
+        await this.emitRecorderScaffoldAction(action, context, ACTION_RESULT.OK);
+        return {resultCode: ACTION_RESULT.OK};
+      } catch (e) {
+        this.addSystemMessage(`Action execution failed: ${e}`);
+        return null;
+      }
     }
     if (!this.browser?.performActions) {
       this.addSystemMessage('performActions unavailable in host.');
@@ -7640,6 +8897,12 @@ class OllamaWebClient implements GlicWebClient {
         this.looksLikeLoginPage(context) &&
         this.isCredentialFieldTarget(context, action.target_id)) {
       const loginButtonId = this.findLoginButtonId(context);
+      if (this.mustSolveCaptchaBeforeSubmit(context)) {
+        this.addSystemMessage(
+            'Goal says credentials are autofilled, but a captcha is still unchecked. ' +
+            'Do not submit. request_screenshot and click the captcha checkbox first.');
+        return true;
+      }
       this.addSystemMessage(
           'Goal says credentials are autofilled; skipping type and submitting login.');
       if (loginButtonId !== null) {
@@ -7747,9 +9010,20 @@ class OllamaWebClient implements GlicWebClient {
     if (!actionSucceeded) {
       return false;
     }
+    if (this.looksLikeOauthProviderClick(action, context)) {
+      this.oauthPopupExpectedUntil = Date.now() + 8000;
+      await sleep(800);
+      await this.syncOauthFlow({expectPopup: true});
+    }
     if (action?.action === 'type' && typeof action.target_id === 'number') {
       if (this.isUsernameTarget(context, action.target_id)) {
         this.typedUsername = true;
+      }
+      if (this.isPasswordTarget(context, action.target_id) &&
+          this.mustSolveCaptchaBeforeSubmit(context)) {
+        this.addSystemMessage(
+            'Credentials entered. Solve the captcha before Log In: ' +
+            '{"action":"request_screenshot"} then {"action":"click","coordinate":[x,y]} on the checkbox.');
       }
     }
 
@@ -7765,10 +9039,18 @@ class OllamaWebClient implements GlicWebClient {
       await sleep(2500);
       const post = await this.collectContext();
       if (this.looksLikeLoginPage(post)) {
-        const loginButtonId = this.findLoginButtonId(post);
-        if (loginButtonId) {
-          this.addSystemMessage('Enter submit may not have logged in; trying a Log In/Sign In button click.');
-          await this.performActionOnce({action: 'click', target_id: loginButtonId, __login_fallback: true}, post);
+        if (this.mustSolveCaptchaBeforeSubmit(post)) {
+          this.addSystemMessage(
+              'Password typed. Captcha is still unchecked — do not click Log In. ' +
+              (this.hasLiveScreenshot() ?
+                  'Next: click the checkbox {"coordinate":[x,y]} on the attached 1:1 screenshot.' :
+                  'Next: {"action":"request_screenshot"} then click the checkbox {"coordinate":[x,y]}.'));
+        } else {
+          const loginButtonId = this.findLoginButtonId(post);
+          if (loginButtonId) {
+            this.addSystemMessage('Enter submit may not have logged in; trying a Log In/Sign In button click.');
+            await this.performActionOnce({action: 'click', target_id: loginButtonId, __login_fallback: true}, post);
+          }
         }
       }
     }
@@ -7781,10 +9063,26 @@ class OllamaWebClient implements GlicWebClient {
     if (actions.length === 0) {
       return {handled: false, requestContext: false};
     }
+    let handledScreenshot = false;
     for (const action of actions) {
+      if (this.actionRequestsIgnoreGuidance(action)) {
+        this.clearActiveLoopGuidance('model flagged ignore_guidance');
+      }
       const normalized = this.normalizeAction(action);
       if (!normalized) {
         continue;
+      }
+      if (normalized.action === 'ignore_guidance') {
+        return {handled: true, requestContext: false};
+      }
+      if (normalized.action === 'human_solve_captcha') {
+        this.captchaSeenThisTask = true;
+        this.pauseForHumanCaptcha('Model requested a human captcha solve');
+        return {handled: true, requestContext: false};
+      }
+      if (normalized.action === 'save_script') {
+        await this.saveCurrentSiteScriptAndContinue(normalized);
+        return {handled: true, requestContext: true};
       }
       if (normalized.action === 'complete' ||
           normalized.action === 'task_complete') {
@@ -7822,15 +9120,32 @@ class OllamaWebClient implements GlicWebClient {
           await this.requestHeadlessInvestigation({url: this.currentTask?.url});
           return {handled: true, requestContext: false};
         }
+        let probe = context;
+        try {
+          probe = await this.collectContextWithRetry();
+        } catch (_) {
+        }
+        if (this.captchaStillOpen(probe)) {
+          if (this.screenshotOnlyStreak === 0 && !this.pendingScreenshot) {
+            await this.captureScreenshotForNextTurn('captcha still present');
+          }
+          const humanHint = this.captchaClicksThisChallenge >= 3 ?
+              ' If several coordinate attempts have already failed, {"action":"human_solve_captcha"} is an optional last resort.' :
+              '';
+          this.addSystemMessage(
+              'Captcha still open (checkbox and/or follow-up steps). Use the 1:1 screenshot. ' +
+              'Click {"coordinate":[x,y]} on the next target; do not request_context or Log In yet.' + humanHint);
+          return {handled: true, requestContext: false};
+        }
+        if (this.captchaChallengeActive && !this.captchaStillOpen(probe)) {
+          this.markCaptchaCleared('request_context saw no remaining challenge');
+        }
         if (!this.currentTask) {
-          const refreshed = await this.collectContextWithRetry();
-          const refreshedCount = refreshed.elements?.length ?? 0;
-          const refreshedUrl = String(refreshed.url || '').trim();
+          const refreshedCount = probe.elements?.length ?? 0;
+          const refreshedUrl = String(probe.url || '').trim();
           this.addSystemMessage(
               `Refreshed context snapshot (${refreshedCount} candidate elements${refreshedUrl ? `, url=${refreshedUrl}` : ''}).`);
         }
-        // Force a screenshot whenever context is requested (Anthropic vision smoke test).
-        await this.captureScreenshotForNextTurn('with request_context');
         return {handled: true, requestContext: true};
       }
       if (normalized.action === 'request_screenshot') {
@@ -7843,8 +9158,20 @@ class OllamaWebClient implements GlicWebClient {
           await this.requestHeadlessInvestigation({url: this.currentTask?.url});
           return {handled: true, requestContext: false};
         }
+        if (this.hasLiveScreenshot() || this.screenshotOnlyStreak >= 1 ||
+            this.capturedScreenshotThisTurn) {
+          this.screenshotSpamStrikes += 1;
+          handledScreenshot = true;
+          this.addSystemMessage(
+              'Ignored request_screenshot — the same 1:1 image is still attached. ' +
+              'Scroll, type, wait, use target_id, or click {"coordinate":[x,y]} on that picture. ' +
+              'request_screenshot is disabled until the viewport changes.');
+          continue;
+        }
+        this.captchaChallengeActive = true;
+        handledScreenshot = true;
         await this.captureScreenshotForNextTurn('request_screenshot');
-        return {handled: true, requestContext: true};
+        continue;
       }
       if (normalized.action === 'delegate_profile') {
         if (!this.supportsUnifiedAgentOrchestrator()) {
@@ -7895,8 +9222,9 @@ class OllamaWebClient implements GlicWebClient {
           normalized.action === 'hover' || normalized.action === 'type' ||
           normalized.action === 'key_press' || normalized.action === 'scroll' ||
           normalized.action === 'scroll_to') {
-        if (this.taskLoopStopRequested) {
-          this.addSystemMessage('Skipped action because the agent loop is paused.');
+        if (!this.currentTask) {
+          this.addSystemMessage(
+              'Executable tab actions require an active queued task. In manual chat, use request_context / request_console_logs / investigate_page.');
           return {handled: true, requestContext: false};
         }
         if (this.shouldEnforceHeadlessOnlyForCurrentTask()) {
@@ -7913,17 +9241,45 @@ class OllamaWebClient implements GlicWebClient {
           const ok = await this.performAction(normalized, context);
           return {handled: ok, requestContext: true};
         }
+        if (this.shouldBlockSubmitUntilCaptcha(normalized, context)) {
+          this.addSystemMessage(
+              'Blocked Log In/submit: captcha is still unchecked. ' +
+              (this.hasLiveScreenshot() ?
+                  'Click {"coordinate":[x,y]} on the attached 1:1 screenshot checkbox. Do not request_screenshot.' :
+                  '{"action":"request_screenshot"} then {"action":"click","coordinate":[x,y]} on the checkbox first.'));
+          return {handled: true, requestContext: false};
+        }
         if (typeof normalized.target_id === 'number' &&
             !this.getElementById(context, normalized.target_id)) {
           this.addSystemMessage(
               `Invalid target_id ${normalized.target_id}: not present in current Page context elements[].id list.`);
           continue;
         }
+        if (this.actionLooksLikeCaptcha(normalized, context)) {
+          normalized.__glic_captcha = true;
+        }
         const ok = await this.performAction(normalized, context);
+        if (ok) {
+          this.screenshotOnlyStreak = 0;
+          this.capturedScreenshotThisTurn = false;
+        }
+        if (ok && normalized.__glic_captcha) {
+          return await this.afterCaptchaActuation(context);
+        }
+        if (ok && (normalized.action === 'scroll' ||
+                   normalized.action === 'scroll_to' ||
+                   normalized.action === 'navigate')) {
+          this.pendingScreenshot = null;
+          this.screenshotSpamStrikes = 0;
+          this.lastScreenshotClickSpace = null;
+          if (this.captchaChallengeActive && this.supportsScreenshotAction()) {
+            await this.captureScreenshotForNextTurn('captcha multi-step vision');
+          }
+        }
         return {handled: ok, requestContext: !ok};
       }
     }
-    return {handled: false, requestContext: false};
+    return {handled: handledScreenshot, requestContext: false};
   }
 
   private static readonly PROMPT_HISTORY_KEY = 'glic.prompt_history';
@@ -8015,6 +9371,423 @@ class OllamaWebClient implements GlicWebClient {
     input.setSelectionRange(next.length, next.length);
   }
 
+  private syncPromptPlaceholder(): void {
+    const promptEl = this.promptInputEl ||
+        (document.getElementById('prompt') as HTMLInputElement | null);
+    if (!promptEl) {
+      return;
+    }
+    promptEl.placeholder = this.guideCurrentTaskEnabled ?
+        'Add guidance for the next step of the current task...' :
+        'Ask...';
+  }
+
+  private queueGuidanceForCurrentTask(text: string): void {
+    const trimmed = String(text || '').trim();
+    if (!trimmed || !this.currentTask) {
+      return;
+    }
+    this.pendingLoopGuidance.push(trimmed);
+    const when = this.taskLoopRunning && !this.taskLoopStopRequested ?
+        'It will be added on the next step.' :
+        'It will be added when the task loop continues.';
+    this.addSystemMessage(
+        `Queued guidance for the current task (will not start a new task). ${when}\n${trimmed}`);
+  }
+
+  private clearLoopGuidanceState(): void {
+    this.pendingLoopGuidance = [];
+    this.activeLoopGuidance = '';
+    this.loopGuidanceAppliedTurns = 0;
+  }
+
+  private clearCaptchaChallengeState(): void {
+    this.captchaChallengeActive = false;
+    this.captchaClicksThisChallenge = 0;
+    this.captchaSeenThisTask = false;
+    this.captchaActuatedThisTask = false;
+    this.sawCaptchaFollowUpThisTask = false;
+    this.captchaClearedThisTask = false;
+    this.humanCaptchaHold = false;
+    this.screenshotOnlyStreak = 0;
+    this.capturedScreenshotThisTurn = false;
+    this.screenshotSpamStrikes = 0;
+    this.pendingScreenshot = null;
+    this.syncSolvedCaptchaButtons();
+  }
+
+  private applyPendingLoopGuidance(): void {
+    if (!this.pendingLoopGuidance.length || !this.currentTask) {
+      return;
+    }
+    const extra = this.pendingLoopGuidance.join('\n\n');
+    this.pendingLoopGuidance = [];
+    this.activeLoopGuidance = this.activeLoopGuidance ?
+        `${this.activeLoopGuidance}\n\n${extra}` :
+        extra;
+    // Newly queued text is fresh even if older guidance had already been used.
+    this.loopGuidanceAppliedTurns = 0;
+    this.updateTaskInfo();
+  }
+
+  private formatActiveLoopGuidanceForPrompt(): string {
+    if (!this.activeLoopGuidance) {
+      return '';
+    }
+    if (this.loopGuidanceAppliedTurns <= 0) {
+      return (
+        'USER GUIDANCE (just added this step — treat as part of the original goal and follow it now):\n' +
+        this.activeLoopGuidance +
+        '\n\n'
+      );
+    }
+    return (
+      'USER GUIDANCE (may be stale — the user added this earlier; it may no longer be needed or relevant):\n' +
+      this.activeLoopGuidance +
+      '\nIf this extra guidance is no longer needed, ignore it and set "ignore_guidance":true on your action JSON ' +
+      '(you may still include the real next action in the same object), or return {"action":"ignore_guidance"}. ' +
+      'We will then stop attaching this extra guidance on later steps.\n\n'
+    );
+  }
+
+  private actionRequestsIgnoreGuidance(raw: any): boolean {
+    if (!raw || typeof raw !== 'object') {
+      return false;
+    }
+    const verb = String(
+                     raw.action ?? raw.action_type ?? raw.actionType ??
+                     raw.type ?? raw.name ?? '')
+                     .toLowerCase()
+                     .trim();
+    if (verb === 'ignore_guidance' || verb === 'drop_guidance' ||
+        verb === 'guidance_stale') {
+      return true;
+    }
+    const flag = raw.ignore_guidance ?? raw.ignoreGuidance ??
+        raw.guidance_stale ?? raw.guidanceStale ?? raw.drop_guidance ??
+        raw.dropGuidance;
+    return flag === true || flag === 1 ||
+        String(flag || '').trim().toLowerCase() === 'true';
+  }
+
+  private clearActiveLoopGuidance(reason: string): void {
+    if (!this.activeLoopGuidance && !this.pendingLoopGuidance.length) {
+      return;
+    }
+    this.activeLoopGuidance = '';
+    this.pendingLoopGuidance = [];
+    this.loopGuidanceAppliedTurns = 0;
+    this.addSystemMessage(
+        `Dropped extra task guidance (${reason}). Later steps use the original goal only.`);
+    this.updateTaskInfo();
+  }
+
+  private captchaPageBlob(context?: PageContextSummary): string {
+    if (!context) {
+      return '';
+    }
+    const bits: string[] = [
+      String(context.url || ''),
+      String(context.title || ''),
+      String(context.innerText || '').slice(0, 2500),
+    ];
+    for (const el of (context.elements ?? []).slice(0, 50)) {
+      bits.push(
+          String(el.label || ''), String(el.cssClass || ''),
+          String(el.role || ''), String(el.fieldName || ''),
+          String(el.placeholder || ''));
+    }
+    return bits.join(' ').toLowerCase();
+  }
+
+  /** Widget is on the form (IconCaptcha heading, recaptcha, …). Not the visual loop. */
+  private pageHasCaptchaWidget(context?: PageContextSummary): boolean {
+    const blob = this.captchaPageBlob(context);
+    if (!blob) {
+      return false;
+    }
+    return /iconcaptcha|#captcha|captcha_container|captcha-container|\brecaptcha\b|\bh-?captcha\b|\bturnstile\b|cf-challenge|challenges\.cloudflare|i['’]?m not a robot|verify (that )?you are human/.test(blob);
+  }
+
+  /** Active visual challenge (Cloudflare / recaptcha interstitial), not a login-form checkbox. */
+  private looksLikeCaptchaChallenge(context?: PageContextSummary): boolean {
+    const blob = this.captchaPageBlob(context);
+    if (!blob) {
+      return false;
+    }
+    return /\brecaptcha\b|\bh-?captcha\b|\bturnstile\b|cf-challenge|challenges\.cloudflare|i['’]?m not a robot|unusual traffic from your computer/.test(blob);
+  }
+
+  /** Puzzle / second-step UI after the first checkbox click. */
+  private looksLikeCaptchaFollowUp(context?: PageContextSummary): boolean {
+    const blob = this.captchaPageBlob(context);
+    if (!blob) {
+      return false;
+    }
+    if (context?.hasOverlay && this.captchaActuatedThisTask) {
+      return true;
+    }
+    // Do not match the static IconCaptcha heading — only extra puzzle copy.
+    return /select the|click all|click each|which of these|odd one out|matching icons?|similar images?|next image|next challenge|tiles? remaining|choose the|pick the/.test(blob);
+  }
+
+  private looksLikeCaptchaSolved(context?: PageContextSummary): boolean {
+    if (!context) {
+      return false;
+    }
+    if (this.looksLikeLoginPage(context) === false && this.captchaActuatedThisTask) {
+      return true;
+    }
+    const blob = this.captchaPageBlob(context);
+    return /captcha (solved|verified|complete)|verification complete|you(?: are|['’]re) verified/.test(blob);
+  }
+
+  private captchaStillOpen(context?: PageContextSummary): boolean {
+    if (this.captchaClearedThisTask) {
+      return false;
+    }
+    if (this.looksLikeCaptchaSolved(context)) {
+      return false;
+    }
+    if (this.looksLikeCaptchaChallenge(context) || this.looksLikeCaptchaFollowUp(context)) {
+      return true;
+    }
+    // Visual loop stays armed so more [x,y] clicks are allowed, but a static
+    // "verify you are human" heading alone is not a remaining puzzle.
+    return this.looksLikeCaptchaChallenge(context) ||
+        this.looksLikeCaptchaFollowUp(context);
+  }
+
+  private markCaptchaCleared(reason: string): void {
+    this.captchaClearedThisTask = true;
+    this.captchaChallengeActive = false;
+    this.screenshotSpamStrikes = 0;
+    this.pendingScreenshot = null;
+    this.addSystemMessage(`Captcha cleared (${reason}). Login/submit is allowed now.`);
+  }
+
+  private mustSolveCaptchaBeforeSubmit(context?: PageContextSummary): boolean {
+    if (this.humanCaptchaHold || this.captchaClearedThisTask) {
+      return false;
+    }
+    if (this.looksLikeCaptchaSolved(context)) {
+      return false;
+    }
+    if (this.captchaStillOpen(context)) {
+      return true;
+    }
+    // Checkbox not clicked yet: block submit. After a click, only block if
+    // a follow-up puzzle/challenge is actually showing.
+    return this.pageHasCaptchaWidget(context) && !this.captchaActuatedThisTask;
+  }
+
+  private captchaMustSolveBeforeSubmitHint(): string {
+    if (this.captchaActuatedThisTask) {
+      return (
+        'CAPTCHA IS NOT FINISHED. The checkbox click may open more steps (icons, tiles, another image). ' +
+        'Use the CURRENT 1:1 screenshot and click {"coordinate":[x,y]} on the next target. ' +
+        'Do NOT press Enter or click Log In / Sign In / Claim / Collect until the extra challenge is gone. ' +
+        'Do not request another screenshot.'
+      );
+    }
+    if (this.hasLiveScreenshot()) {
+      return (
+        'CAPTCHA IS ON THIS FORM and is not done yet. A 1:1 screenshot is already attached. ' +
+        'Scroll if the checkbox is off-screen, then click {"coordinate":[x,y]} on it. ' +
+        'Do not request_screenshot unless you just scrolled. ' +
+        'Do NOT press Enter or click Log In / Sign In / Claim / Collect until the captcha is fully done.'
+      );
+    }
+    return (
+      'CAPTCHA IS ON THIS FORM and is not done yet. Order: ' +
+      'type email/password with target_id, then {"action":"request_screenshot"}, ' +
+      'then {"action":"click","coordinate":[x,y]} on the checkbox circle. ' +
+      'If more images/tasks appear after that, keep clicking them on a fresh screenshot. ' +
+      'Do NOT press Enter or click Log In / Sign In / Claim / Collect until the captcha is fully done. ' +
+      'Login fields still use target_id. The captcha uses screenshot pixels only.'
+    );
+  }
+
+  private isLoginSubmitTarget(action: any, context: PageContextSummary): boolean {
+    if (action?.__login_fallback || action?.__login_autofill_bypass ||
+        action?.__after_type_submit) {
+      return true;
+    }
+    const kind = String(action?.action || '').toLowerCase();
+    if (kind === 'key_press' &&
+        /^(enter|return)$/i.test(String(action.key || ''))) {
+      return this.looksLikeLoginPage(context) || this.pageHasCaptchaWidget(context);
+    }
+    if (kind !== 'click') {
+      return false;
+    }
+    const loginId = this.findLoginButtonId(context);
+    if (typeof action?.target_id === 'number' && loginId !== null &&
+        action.target_id === loginId) {
+      return true;
+    }
+    if (typeof action?.target_id === 'number') {
+      const el = this.getElementById(context, action.target_id);
+      const text = `${el?.label || ''} ${el?.placeholder || ''}`.toLowerCase();
+      if (/(log ?in|sign ?in|submit|claim|collect)\b/.test(text)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private shouldBlockSubmitUntilCaptcha(action: any, context: PageContextSummary): boolean {
+    if (!this.mustSolveCaptchaBeforeSubmit(context)) {
+      return false;
+    }
+    return this.isLoginSubmitTarget(action, context);
+  }
+
+  private captchaSolverHint(): string {
+    const grid = this.supportsScreenshotAction() ?
+        'Look at the CURRENT 1:1 viewport screenshot and click the checkbox circle with {"coordinate":[x,y]}. Never reuse an earlier shot. ' :
+        'No screenshot available — keep using target_id from the last context if you have one. ';
+    let text = (
+      'CAPTCHA / visual challenge: click the checkbox, then any follow-up tiles/icons, not Claim/Collect. ' +
+      '{"action":"click","coordinate":[x,y]} from the CURRENT 1:1 screenshot. ' +
+      'Do not use elements[], locators, or iframe boxes. ' +
+      grid +
+      'After a captcha click the host waits and reshoots; do not request_context until the challenge is gone.'
+    );
+    if (this.captchaClicksThisChallenge >= 3) {
+      text +=
+          ' Soft suggestion only: several attempts have not cleared it. ' +
+          'You may {"action":"human_solve_captcha"} as a last resort — do not prefer that over another screenshot+coordinate try.';
+    }
+    return text;
+  }
+
+  private actionLooksLikeCaptcha(action: any, context: PageContextSummary): boolean {
+    if (action?.__glic_captcha) {
+      return true;
+    }
+    const kind = String(action?.action || '').toLowerCase();
+    if (!(kind === 'click' || kind === 'hover' || kind === 'type')) {
+      return false;
+    }
+    const hasTarget = typeof action?.target_id === 'number' && action.target_id > 0;
+    const hasCoord = !!(action?.coordinate &&
+        typeof action.coordinate.x === 'number' &&
+        typeof action.coordinate.y === 'number');
+    if (hasTarget && !hasCoord) {
+      return false;
+    }
+    return !!(hasCoord &&
+        (this.captchaChallengeActive || this.pageHasCaptchaWidget(context)));
+  }
+
+  private syncSolvedCaptchaButtons(): void {
+    const show = !!(this.humanCaptchaHold && this.currentTask);
+    for (const id of ['solvedCaptcha', 'queueSolvedCaptcha']) {
+      const el = document.getElementById(id);
+      if (!el) {
+        continue;
+      }
+      if (show) {
+        el.removeAttribute('hidden');
+      } else {
+        el.setAttribute('hidden', 'hidden');
+      }
+    }
+  }
+
+  private pauseForHumanCaptcha(reason: string): void {
+    this.humanCaptchaHold = true;
+    this.taskLoopStopRequested = true;
+    this.queueRunning = false;
+    this.cancelModelRequest('waiting for captcha solve');
+    void this.abortActiveTooling('waiting for captcha solve');
+    this.updateQueueStatus();
+    this.updateTaskInfo();
+    this.syncSolvedCaptchaButtons();
+    this.addSystemMessage(
+        `${reason}. Solve it in the page, then press "I solved it" or Resume. ` +
+        'Captcha clicks are not saved into the reusable script.');
+  }
+
+  private async afterCaptchaActuation(
+      context: PageContextSummary): Promise<ActionHandlingResult> {
+    this.captchaChallengeActive = true;
+    this.captchaSeenThisTask = true;
+    this.captchaActuatedThisTask = true;
+    this.captchaClearedThisTask = false;
+    this.captchaClicksThisChallenge += 1;
+    this.screenshotOnlyStreak = 0;
+    this.addSystemMessage(
+        'Captcha click sent. Waiting in case more tiles/icons appear, then taking a fresh 1:1 screenshot.');
+    await sleep(2200);
+    if (this.taskLoopStopRequested || !this.currentTask) {
+      return {handled: true, requestContext: false};
+    }
+    let post = context;
+    try {
+      post = await this.collectContext();
+    } catch (_) {
+    }
+    if (this.looksLikeCaptchaFollowUp(post)) {
+      this.sawCaptchaFollowUpThisTask = true;
+    }
+    if (this.looksLikeCaptchaSolved(post) ||
+        (this.sawCaptchaFollowUpThisTask && !this.looksLikeCaptchaFollowUp(post) &&
+         !this.looksLikeCaptchaChallenge(post))) {
+      this.markCaptchaCleared('follow-up challenge is gone');
+      return {handled: true, requestContext: true};
+    }
+    await this.captureScreenshotForNextTurn('captcha multi-step vision');
+    this.addSystemMessage(
+        'Look at the new screenshot. If more captcha steps appeared, click the next {"coordinate":[x,y]}. ' +
+        'Do not Log In yet. Do not reuse the previous pixel.');
+    return {handled: true, requestContext: false};
+  }
+
+  private isCaptchaScaffoldEvent(ev: GlicRecorderScaffoldEvent): boolean {
+    const src = ev?.sourceAction;
+    if (src?.__glic_captcha) {
+      return true;
+    }
+    return !!(ev?.timelineAction?.params?.__glic_human_captcha);
+  }
+
+  private buildHumanCaptchaPauseAction(): any {
+    return {
+      action: 'glic_prompt',
+      params: {
+        prompt:
+            'Complete the captcha on this page. Stay on this tab — do not navigate away, ' +
+            'do not open a new tab, and do not reload into a different URL. ' +
+            'Use the current 1:1 viewport screenshot and click/type with {"coordinate":[x,y]}. ' +
+            'After each click, wait for the widget to settle and use a ' +
+            'fresh screenshot; do not reuse old pixels. When the challenge is gone, finish. ' +
+            'Keep trying with fresh screenshots. Only if many attempts fail, finish unsuccessful.',
+        stayOnCurrentTab: true,
+        skipAutoSave: true,
+        __glic_human_captcha: true,
+        humanCaptcha: true,
+      },
+    };
+  }
+
+  private withHumanCaptchaPause(actions: any[], insertAt: number): any[] {
+    const i = Math.max(0, Math.min(insertAt, actions.length));
+    const next = actions.slice();
+    next.splice(i, 0, this.buildHumanCaptchaPauseAction());
+    return next;
+  }
+
+  private captchaInsertIndex(
+      events: GlicRecorderScaffoldEvent[], captchaTs?: number): number {
+    if (!Number.isFinite(captchaTs as number)) {
+      return events.length;
+    }
+    const i = events.findIndex((ev) => (ev.timestampMs || 0) >= (captchaTs as number));
+    return i < 0 ? events.length : i;
+  }
+
   private async submitPromptText(
       text: string,
       options?: {clearInput?: boolean},
@@ -8023,9 +9796,22 @@ class OllamaWebClient implements GlicWebClient {
     if (!trimmed) {
       return;
     }
-    this.pushPromptHistory(trimmed);
     const promptEl = this.promptInputEl ||
         (document.getElementById('prompt') as HTMLInputElement | null);
+    if (this.guideCurrentTaskEnabled) {
+      if (!this.currentTask) {
+        this.addSystemMessage(
+            'No active task to guide. Uncheck "Guide current task" to start a new prompt or task.');
+        return;
+      }
+      this.pushPromptHistory(trimmed);
+      if (options?.clearInput && promptEl) {
+        promptEl.value = '';
+      }
+      this.queueGuidanceForCurrentTask(trimmed);
+      return;
+    }
+    this.pushPromptHistory(trimmed);
     if (options?.clearInput && promptEl) {
       promptEl.value = '';
     }
@@ -8123,17 +9909,10 @@ class OllamaWebClient implements GlicWebClient {
     this.messages.push({role: 'assistant', content: assistantText});
     this.render();
 
-    if (this.taskLoopStopRequested) {
-      return assistantText;
-    }
-
     if (this.currentTask && this.maybeCompleteTask(assistantText)) {
       return assistantText;
     }
     if (options?.handleActions && options.context) {
-      if (this.taskLoopStopRequested) {
-        return assistantText;
-      }
       const actionResult =
           await this.handleAssistantActions(assistantText, options.context);
       this.requestContextNextTurn = actionResult.requestContext;
@@ -8179,6 +9958,16 @@ class OllamaWebClient implements GlicWebClient {
 const client: GlicWebClient = new OllamaWebClient();
 // Dev/test hook for CDP and manual inspection.
 (window as any).__glicOllamaClient = client;
+
+// Packaged chrome://glic/agent guest never receives Gemini's glic-bootstrap
+// (or CSP blocks injecting it). Wire buttons immediately; a later registry
+// registerWebClient upgrades this.browser without re-binding listeners.
+if (typeof (window as any).chrome?.send === 'function' ||
+    String(window.location?.protocol || '') === 'chrome:' ||
+    String(window.location?.protocol || '') === 'blob:' ||
+    String(window.location?.protocol || '') === 'about:') {
+  void client.initialize({} as GlicBrowserHost);
+}
 
 createGlicHostRegistryOnLoad().then((registry: GlicHostRegistry) => {
   void registry.registerWebClient(client);

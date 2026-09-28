@@ -82,7 +82,7 @@ base::Value::Dict DefaultGlobalSettings() {
   agent.Set("providerEndpoints", std::move(provider_endpoints));
   // JSON dialect is better for autonomous task completion (done/click/type).
   agent.Set("responseMode", "json");
-  agent.Set("autoStartTaskOnLaunch", true);
+  agent.Set("autoStartTaskOnLaunch", false);
   agent.Set("autoStartDelayMs", 5000);
   // Leave empty: baking a site password token into defaults biases every loop.
   agent.Set("autoStartPrompt", "");

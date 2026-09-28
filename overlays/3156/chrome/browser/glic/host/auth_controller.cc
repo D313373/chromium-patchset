@@ -6,6 +6,7 @@
 
 #include "base/command_line.h"
 #include "base/functional/callback_helpers.h"
+#include "base/strings/string_util.h"
 #include "base/time/time.h"
 #include "chrome/browser/glic/host/glic_cookie_synchronizer.h"
 #include "chrome/browser/profiles/profile.h"
@@ -41,9 +42,12 @@ bool ShouldBypassAuthForDevLocalGuest() {
   const std::string_view host =
       guest_url.is_valid() ? guest_url.host() : std::string_view();
 
-  // Packaged Simulachrome agent (chrome://simulachrome-agent/...).
+  // Packaged Simulachrome agent (chrome://glic/agent/... or legacy host).
   if (command_line->HasSwitch("simulachrome-agent") ||
-      host == "simulachrome-agent") {
+      host == "simulachrome-agent" ||
+      (host == "glic" &&
+       base::StartsWith(guest_url.path(), "/agent/",
+                        base::CompareCase::SENSITIVE))) {
     return true;
   }
 
