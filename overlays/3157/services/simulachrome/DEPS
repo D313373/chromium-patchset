@@ -1,0 +1,12 @@
+include_rules = [
+  "+base",
+  "+gpu/command_buffer",
+  "+mojo/public",
+  "+services/simulachrome",
+  "+services/viz/public/cpp/gpu",
+  "+skia",
+  "+third_party/llama_cpp",
+  "+third_party/skia",
+  "+ui/gfx",
+  "+url",
+]

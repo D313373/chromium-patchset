@@ -1,0 +1,16 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//mojo/public/tools/bindings/mojom.gni")
+
+mojom("mojom") {
+  sources = [ "simulachrome_agent.mojom" ]
+  public_deps = [
+    "//gpu/ipc/common:interfaces",
+    "//mojo/public/mojom/base",
+    "//sandbox/policy/mojom",
+    "//services/viz/public/mojom",
+    "//ui/gfx/geometry/mojom",
+  ]
+}

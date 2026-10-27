@@ -1,0 +1,5 @@
+Subject: [PATCH] 3157 Working-tree sync after 3156 (guided decoding tidy, Glic host bootstrap, ...)
+
+This is an overlay patch (see overlays/3157/). Full-file copies under
+overlays/3157/ replace the corresponding Chromium paths after 3156.
+

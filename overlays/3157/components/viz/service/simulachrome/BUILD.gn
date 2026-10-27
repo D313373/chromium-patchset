@@ -1,0 +1,22 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Scaffolding only. When real SharedImage export lands, fold these sources
+# into //components/viz/service (or a non-circular leaf target) rather than
+# depending on :viz_service from here.
+source_set("simulachrome_capture") {
+  sources = [
+    "viz_frame_mailbox_capture.cc",
+    "viz_frame_mailbox_capture.h",
+  ]
+  deps = [
+    "//base",
+    "//gpu/command_buffer/common",
+    "//ui/gfx",
+    "//ui/gfx/geometry",
+  ]
+  # VIZ_SERVICE_EXPORT is not required for the stub; drop viz_service_export.h
+  # usage if linking outside the viz_service component.
+  defines = [ "VIZ_SERVICE_IMPLEMENTATION" ]
+}

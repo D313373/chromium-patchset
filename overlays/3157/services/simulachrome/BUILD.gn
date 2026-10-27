@@ -1,0 +1,30 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+source_set("simulachrome_agent_service") {
+  sources = [
+    "simulachrome_agent_impl.cc",
+    "simulachrome_agent_impl.h",
+    "simulachrome_agent_service.cc",
+    "simulachrome_agent_service.h",
+  ]
+  deps = [
+    "//base",
+    # SharedImageInterface + RasterInterface::ReadbackImagePixels
+    "//gpu/command_buffer/client",
+    "//gpu/command_buffer/client:gles2_interface",
+    "//gpu/command_buffer/client:raster",
+    "//gpu/command_buffer/common",
+    "//mojo/public/cpp/bindings",
+    "//services/simulachrome/public/mojom",
+    # viz::Gpu + ContextProviderCommandBuffer for mailbox readback.
+    "//services/viz/public/cpp/gpu",
+    # SkBitmap + skia::ImageOperations::Resize
+    "//skia",
+    "//third_party/llama_cpp:llama_cpp_lib",
+    "//ui/gfx",
+    "//ui/gfx/geometry",
+    "//url",
+  ]
+}
