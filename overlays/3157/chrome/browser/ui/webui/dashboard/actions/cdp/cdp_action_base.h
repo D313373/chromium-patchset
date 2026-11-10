@@ -7,11 +7,8 @@
 #include "base/memory/weak_ptr.h"
 #include "chrome/browser/ui/webui/dashboard/actions/action_base.h"
 #include "chrome/browser/ui/webui/dashboard/actions/action_types.h"
+#include "chrome/browser/ui/webui/dashboard/dashboard_devtools_client.h"
 #include "content/public/browser/web_contents.h"
-
-namespace dashboard {
-class DashboardDevToolsClient;
-}
 class CdpActionBase : public dashboard::actions::Action {
  public:
   using CdpCallback =

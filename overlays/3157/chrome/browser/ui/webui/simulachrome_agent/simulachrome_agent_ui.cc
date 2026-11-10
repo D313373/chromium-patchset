@@ -33,7 +33,7 @@ namespace {
 
 base::FilePath ResolveAgentClientRoot() {
   if (const char* env = std::getenv("SIMULACHROME_AGENT_DIR"); env && *env) {
-    return base::FilePath(env);
+    return base::FilePath::FromUTF8Unsafe(env);
   }
   base::FilePath exe;
   if (!base::PathService::Get(base::DIR_EXE, &exe) || exe.empty()) {

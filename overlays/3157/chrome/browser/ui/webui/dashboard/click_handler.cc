@@ -435,8 +435,10 @@ class NativePlaybackOverlayHost : public views::WidgetObserver,
       return;
     }
 
-    const gfx::Rect bounds =
-        browser_view->GetWidget()->GetClientAreaBoundsInScreen();
+    // Bound to the page container only — full client bounds cover the tab
+    // strip/toolbar, and on Windows DirectComposition WS_EX_TRANSPARENT is
+    // not reliably click-through without WS_EX_LAYERED, so chrome UI dies.
+    const gfx::Rect bounds = web_contents->GetContainerBounds();
     if (bounds.IsEmpty()) {
       return;
     }
@@ -481,8 +483,7 @@ class NativePlaybackOverlayHost : public views::WidgetObserver,
       }
       return;
     }
-    const gfx::Rect bounds =
-        browser_view->GetWidget()->GetClientAreaBoundsInScreen();
+    const gfx::Rect bounds = web_contents->GetContainerBounds();
     if (bounds.IsEmpty()) {
       return;
     }

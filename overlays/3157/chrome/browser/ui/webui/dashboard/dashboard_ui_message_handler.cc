@@ -29,6 +29,7 @@
 #include "base/i18n/time_formatting.h"
 #include "base/json/json_reader.h"
 #include "base/json/json_writer.h"
+#include "base/base_paths.h"
 #include "base/path_service.h"
 #include "base/strings/strcat.h"
 #include "base/strings/string_split.h"
@@ -403,7 +404,16 @@ base::FilePath ScriptsDir(const Profile* profile) {
     return base::FilePath::FromUTF8Unsafe(home).AppendASCII("Scripts");
   }
   base::FilePath app_data_dir;
-  if (base::PathService::Get(base::DIR_APP_DATA, &app_data_dir) &&
+  if (base::PathService::Get(
+#if BUILDFLAG(IS_WIN)
+          base::DIR_LOCAL_APP_DATA
+#elif BUILDFLAG(IS_APPLE)
+          base::DIR_APP_DATA
+#else
+          base::DIR_HOME
+#endif
+          ,
+          &app_data_dir) &&
       !app_data_dir.empty()) {
     return app_data_dir.AppendASCII("Simulachrome").AppendASCII("Scripts");
   }
@@ -541,6 +551,14 @@ bool WriteScriptToDisk(const Profile* profile,
     LOG(ERROR) << "[Dashboard] WriteScriptToDisk rejected invalid id=" << id;
     return false;
   }
+  // Guard against PostTaskAndReply arg-evaluation bugs that can pass a
+  // moved-from empty dict and silently wipe scripts to "{}".
+  if (script.empty() || !script.FindString("name")) {
+    LOG(ERROR) << "[Dashboard] WriteScriptToDisk refused empty/incomplete "
+                  "script id="
+               << id << " size=" << script.size();
+    return false;
+  }
   // ScriptStore::Write needs a non-const Profile* but only uses path helpers.
   Profile* mutable_profile = const_cast<Profile*>(profile);
   const base::FilePath path =
@@ -554,14 +572,17 @@ bool WriteScriptToDisk(const Profile* profile,
     return false;
   }
   std::string json;
-  base::JSONWriter::Write(script, &json);
+  if (!base::JSONWriter::Write(script, &json) || json.empty() || json == "{}") {
+    LOG(ERROR) << "[Dashboard] WriteScriptToDisk refused empty JSON id=" << id;
+    return false;
+  }
   if (!base::ImportantFileWriter::WriteFileAtomically(path, json)) {
     LOG(ERROR) << "[Dashboard] WriteScriptToDisk FAILED id=" << id
                << " path=" << path.AsUTF8Unsafe();
     return false;
   }
   LOG(INFO) << "[Dashboard] WriteScriptToDisk OK id=" << id
-            << " path=" << path.AsUTF8Unsafe();
+            << " path=" << path.AsUTF8Unsafe() << " bytes=" << json.size();
   return true;
 }
 
@@ -1590,6 +1611,9 @@ void DashboardUIMessageHandler::HandleCreateNewScript(const base::Value::List& a
   script.Set("actions", base::Value::List());
 
   const base::FilePath scripts_dir = ScriptsDir(profile_);
+  // Clone before PostTaskAndReply: sibling arg evaluation order is unspecified,
+  // so Clone()+move(script) in the same call can persist a moved-from "{}".
+  base::Value::Dict script_for_disk = script.Clone();
   base::ThreadPool::PostTaskAndReply(
       FROM_HERE,
       {base::MayBlock(),
@@ -1602,7 +1626,7 @@ void DashboardUIMessageHandler::HandleCreateNewScript(const base::Value::List& a
             base::CreateDirectory(dir);
             (void)WriteScriptToDisk(profile, id, script);
           },
-          scripts_dir, profile_, id, script.Clone()),
+          scripts_dir, profile_, id, std::move(script_for_disk)),
       base::BindOnce(&DashboardUIMessageHandler::OnCreateNewDone,
                      weak_ptr_factory_.GetWeakPtr(), cb, id,
                      std::move(script)));
@@ -1728,6 +1752,9 @@ void DashboardUIMessageHandler::HandleSaveScript(const base::Value::List& args) 
   }
 
   const base::FilePath scripts_dir = ScriptsDir(profile_);
+  // Clone before PostTaskAndReply so unspecified arg evaluation order cannot
+  // move-from `script` before the disk-bound copy is taken.
+  base::Value::Dict script_for_disk = script.Clone();
   base::ThreadPool::PostTaskAndReply(
       FROM_HERE,
       {base::MayBlock(),
@@ -1738,7 +1765,7 @@ void DashboardUIMessageHandler::HandleSaveScript(const base::Value::List& args) 
             base::CreateDirectory(dir);
             (void)WriteScriptToDisk(profile, id, script);
           },
-          scripts_dir, profile_, id, script.Clone()),
+          scripts_dir, profile_, id, std::move(script_for_disk)),
       base::BindOnce(&DashboardUIMessageHandler::OnSaveDone,
                      weak_ptr_factory_.GetWeakPtr(), cb, id,
                      std::move(script)));

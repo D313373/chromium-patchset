@@ -681,10 +681,10 @@ bool SimulachromeAgentImpl::PrepareClipImage(const SkBitmap& bitmap,
   *out_width = w;
   *out_height = h;
 
-  // Classic CLIP path (clip_image_u8_make / clip_build_img_from_pixels).
-  if (out_clip_img) {
-    clip_build_img_from_pixels(out_rgb->data(), w, h, out_clip_img);
-  }
+  // Classic clip_build_img_from_pixels was removed upstream; callers that still
+  // accept an optional clip_image_u8* should pass nullptr and use |out_rgb| with
+  // mtmd_bitmap_init instead.
+  (void)out_clip_img;
   return true;
 }
 
@@ -1041,15 +1041,9 @@ void SimulachromeAgentImpl::ExecuteAction(
   std::vector<uint8_t> rgb;
   int width = 0;
   int height = 0;
-  clip_image_u8* clip_img = clip_image_u8_init();
   std::string clip_error;
   const bool clip_ok =
-      PrepareClipImage(sk_bitmap, &rgb, &width, &height, clip_img, &clip_error);
-  // Embedding path uses |rgb| via mtmd_bitmap_init; free classic clip_image_u8.
-  if (clip_img) {
-    clip_image_u8_free(clip_img);
-    clip_img = nullptr;
-  }
+      PrepareClipImage(sk_bitmap, &rgb, &width, &height, nullptr, &clip_error);
   if (!clip_ok) {
     result->ok = false;
     result->error = diagnostics + ";" + clip_error;

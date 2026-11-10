@@ -20,6 +20,7 @@
 #include "content/public/browser/render_widget_host.h"
 #include "content/public/browser/render_widget_host_view.h"
 #include "content/public/browser/web_contents.h"
+#include "content/public/browser/web_contents_observer.h"
 #include "third_party/blink/public/common/input/web_mouse_event.h"
 #include "ui/gfx/canvas.h"
 #include "ui/gfx/color_palette.h"
@@ -400,7 +401,8 @@ bool CanHostPlaybackOverlay(Browser* browser, BrowserView* browser_view) {
   return true;
 }
 
-class NativePlaybackOverlayHost : public views::WidgetObserver {
+class NativePlaybackOverlayHost : public views::WidgetObserver,
+                                  public content::WebContentsObserver {
  public:
   static NativePlaybackOverlayHost& Get() {
     static base::NoDestructor<NativePlaybackOverlayHost> instance;
@@ -433,8 +435,10 @@ class NativePlaybackOverlayHost : public views::WidgetObserver {
       return;
     }
 
-    const gfx::Rect bounds =
-        browser_view->GetWidget()->GetClientAreaBoundsInScreen();
+    // Bound to the page container only — full client bounds cover the tab
+    // strip/toolbar, and on Windows DirectComposition WS_EX_TRANSPARENT is
+    // not reliably click-through without WS_EX_LAYERED, so chrome UI dies.
+    const gfx::Rect bounds = web_contents->GetContainerBounds();
     if (bounds.IsEmpty()) {
       return;
     }
@@ -447,7 +451,7 @@ class NativePlaybackOverlayHost : public views::WidgetObserver {
     if (!widget_->IsVisible()) {
       widget_->ShowInactive();
     }
-    source_web_contents_ = web_contents;
+    TrackSourceWebContents(web_contents);
     StartContextMonitor();
     gfx::Point local_point = screen_point;
     local_point.Offset(-bounds.x(), -bounds.y());
@@ -479,8 +483,7 @@ class NativePlaybackOverlayHost : public views::WidgetObserver {
       }
       return;
     }
-    const gfx::Rect bounds =
-        browser_view->GetWidget()->GetClientAreaBoundsInScreen();
+    const gfx::Rect bounds = web_contents->GetContainerBounds();
     if (bounds.IsEmpty()) {
       return;
     }
@@ -491,16 +494,21 @@ class NativePlaybackOverlayHost : public views::WidgetObserver {
     if (!widget_->IsVisible()) {
       widget_->ShowInactive();
     }
-    source_web_contents_ = web_contents;
+    TrackSourceWebContents(web_contents);
     StartContextMonitor();
     overlay_view_->UpdateStatus(header, detail);
   }
 
   void ClearStatus(content::WebContents* web_contents) {
     if (!widget_ || !overlay_view_) {
+      DropSourceWebContents();
       return;
     }
     if (web_contents) {
+      // If the overlay is currently keyed to a different tab, ignore.
+      if (this->web_contents() && this->web_contents() != web_contents) {
+        return;
+      }
       Browser* browser = chrome::FindBrowserWithTab(web_contents);
       BrowserView* browser_view =
           browser ? BrowserView::GetBrowserViewForBrowser(browser) : nullptr;
@@ -514,11 +522,34 @@ class NativePlaybackOverlayHost : public views::WidgetObserver {
     if (widget_->IsVisible()) {
       widget_->Hide();
     }
-    context_monitor_timer_.Stop();
-    source_web_contents_ = nullptr;
+    DropSourceWebContents();
   }
 
  private:
+  void TrackSourceWebContents(content::WebContents* web_contents) {
+    if (this->web_contents() == web_contents) {
+      return;
+    }
+    Observe(web_contents);
+  }
+
+  void DropSourceWebContents() {
+    context_monitor_timer_.Stop();
+    Observe(nullptr);
+  }
+
+  void WebContentsDestroyed() override {
+    // Tab closed while overlay timer/status still pointed at it.
+    context_monitor_timer_.Stop();
+    if (overlay_view_) {
+      overlay_view_->ClearStatus();
+    }
+    if (widget_ && widget_->IsVisible()) {
+      widget_->Hide();
+    }
+    // WebContentsObserver clears web_contents_ after this return.
+  }
+
   void StartContextMonitor() {
     if (context_monitor_timer_.IsRunning()) {
       return;
@@ -534,27 +565,27 @@ class NativePlaybackOverlayHost : public views::WidgetObserver {
       context_monitor_timer_.Stop();
       return;
     }
-    if (!source_web_contents_) {
+    content::WebContents* source = web_contents();
+    if (!source) {
       widget_->Hide();
       context_monitor_timer_.Stop();
       return;
     }
 
-    Browser* browser = chrome::FindBrowserWithTab(source_web_contents_);
+    Browser* browser = chrome::FindBrowserWithTab(source);
     BrowserView* browser_view =
         browser ? BrowserView::GetBrowserViewForBrowser(browser) : nullptr;
     TabStripModel* tabs = browser ? browser->tab_strip_model() : nullptr;
     const bool context_valid =
         browser_view && browser_view->GetWidget() &&
         browser_view->GetWidget()->IsVisible() && tabs &&
-        tabs->GetActiveWebContents() == source_web_contents_;
+        tabs->GetActiveWebContents() == source;
     if (!context_valid) {
       widget_->Hide();
       if (overlay_view_) {
         overlay_view_->ClearStatus();
       }
-      context_monitor_timer_.Stop();
-      source_web_contents_ = nullptr;
+      DropSourceWebContents();
     }
   }
 
@@ -617,8 +648,7 @@ class NativePlaybackOverlayHost : public views::WidgetObserver {
     overlay_view_ = nullptr;
     // The previous host window (often an OAuth popup) may already be gone.
     browser_view_.ExtractAsDangling();
-    source_web_contents_ = nullptr;
-    context_monitor_timer_.Stop();
+    DropSourceWebContents();
     if (widget_) {
       widget_->CloseNow();
       widget_ = nullptr;
@@ -631,8 +661,7 @@ class NativePlaybackOverlayHost : public views::WidgetObserver {
       parent_widget_ = nullptr;
       browser_view_.ExtractAsDangling();
       overlay_view_ = nullptr;
-      source_web_contents_ = nullptr;
-      context_monitor_timer_.Stop();
+      DropSourceWebContents();
       if (widget_) {
         widget_->RemoveObserver(this);
         widget_ = nullptr;
@@ -650,7 +679,6 @@ class NativePlaybackOverlayHost : public views::WidgetObserver {
   raw_ptr<views::Widget> parent_widget_ = nullptr;
   raw_ptr<views::Widget> widget_ = nullptr;
   raw_ptr<NativePlaybackOverlayView> overlay_view_ = nullptr;
-  raw_ptr<content::WebContents> source_web_contents_ = nullptr;
   base::RepeatingTimer context_monitor_timer_;
 };
 

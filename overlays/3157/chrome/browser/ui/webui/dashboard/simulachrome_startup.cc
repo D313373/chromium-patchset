@@ -13,6 +13,7 @@
 #include "base/files/file_util.h"
 #include "base/json/json_reader.h"
 #include "base/logging.h"
+#include "base/base_paths.h"
 #include "base/path_service.h"
 #include "base/strings/string_split.h"
 #include "base/strings/string_util.h"
@@ -46,10 +47,19 @@ bool ReadBool(const base::Value::Dict* dict,
 
 base::FilePath DefaultSimulachromeHome() {
   if (const char* env = std::getenv("SIMULACHROME_HOME"); env && *env) {
-    return base::FilePath(env);
+    return base::FilePath::FromUTF8Unsafe(env);
   }
   base::FilePath app_data;
-  if (base::PathService::Get(base::DIR_APP_DATA, &app_data) &&
+  if (base::PathService::Get(
+#if BUILDFLAG(IS_WIN)
+          base::DIR_LOCAL_APP_DATA
+#elif BUILDFLAG(IS_APPLE)
+          base::DIR_APP_DATA
+#else
+          base::DIR_HOME
+#endif
+          ,
+          &app_data) &&
       !app_data.empty()) {
     return app_data.AppendASCII("Simulachrome");
   }
@@ -58,7 +68,7 @@ base::FilePath DefaultSimulachromeHome() {
 
 base::FilePath ScriptsDirFromEnvOrDefault() {
   if (const char* env = std::getenv("DASHBOARD_SCRIPTS_DIR"); env && *env) {
-    return base::FilePath(env);
+    return base::FilePath::FromUTF8Unsafe(env);
   }
   base::FilePath home = DefaultSimulachromeHome();
   if (home.empty()) {
@@ -69,7 +79,7 @@ base::FilePath ScriptsDirFromEnvOrDefault() {
 
 base::FilePath HeadlessDirFromEnvOrDefault() {
   if (const char* env = std::getenv("HEADLESS_LOG_DIR"); env && *env) {
-    return base::FilePath(env);
+    return base::FilePath::FromUTF8Unsafe(env);
   }
   base::FilePath home = DefaultSimulachromeHome();
   if (home.empty()) {

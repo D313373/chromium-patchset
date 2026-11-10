@@ -29,6 +29,7 @@
 #include "base/files/file.h"
 #include "base/files/file_path.h"
 #include "base/files/file_util.h"
+#include "base/base_paths.h"
 #include "base/path_service.h"
 #include "base/process/launch.h"
 #include "base/process/process.h"
@@ -54,6 +55,7 @@
 #if BUILDFLAG(IS_WIN)
 #include <windows.h>
 
+#include "base/strings/utf_string_conversions.h"
 #include "base/win/scoped_handle.h"
 #endif
 #endif  // BUILDFLAG(IS_POSIX) || BUILDFLAG(IS_WIN)
@@ -75,7 +77,7 @@ base::FilePath SharedHeadlessUserDataDir() {
   }
 #if BUILDFLAG(IS_WIN)
   base::FilePath app_data;
-  if (base::PathService::Get(base::DIR_APP_DATA, &app_data) &&
+  if (base::PathService::Get(base::DIR_LOCAL_APP_DATA, &app_data) &&
       !app_data.empty()) {
     return app_data.AppendASCII("Simulachrome")
         .AppendASCII("Headless")
@@ -117,11 +119,14 @@ void CopyFileWithSqliteSidecars(const base::FilePath& src,
     return;
   }
   std::ignore = base::CopyFile(src, dst);
-  for (const char* suffix : {"-wal", "-shm", "-journal"}) {
-    const base::FilePath side_src = base::FilePath(src.value() + suffix);
+  for (const base::FilePath::CharType* suffix :
+       {FILE_PATH_LITERAL("-wal"), FILE_PATH_LITERAL("-shm"),
+        FILE_PATH_LITERAL("-journal")}) {
+    const base::FilePath side_src =
+        src.DirName().Append(src.BaseName().value() + suffix);
     if (base::PathExists(side_src)) {
-      std::ignore =
-          base::CopyFile(side_src, base::FilePath(dst.value() + suffix));
+      std::ignore = base::CopyFile(
+          side_src, dst.DirName().Append(dst.BaseName().value() + suffix));
     }
   }
 }
@@ -218,8 +223,14 @@ LaunchChildResult LaunchHeadlessChildBlocking(
 
   base::LaunchOptions options;
   options.current_directory = browser.DirName();
+#if BUILDFLAG(IS_WIN)
+  options.environment[base::UTF8ToWide(kHeadlessControlSocketEnv)] =
+      socket_path.value();
+  options.environment[L"DASHBOARD_SCRIPTS_DIR"] = scripts_dir.value();
+#else
   options.environment[kHeadlessControlSocketEnv] = socket_path.AsUTF8Unsafe();
   options.environment["DASHBOARD_SCRIPTS_DIR"] = scripts_dir.AsUTF8Unsafe();
+#endif
 #if BUILDFLAG(IS_MAC)
   // Avoid a second dock tile for the same Chromium.app when the child runs
   // headless / --no-startup-window (macOS treats siblings as the same app).

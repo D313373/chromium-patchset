@@ -228,7 +228,7 @@ static_library("dashboard") {
     "//services/network/public/cpp",
     "//services/network/public/mojom",
     "//third_party/blink/public/common",
-    "//third_party/blink/public/mojom:mojom_platform",
+    "//third_party/blink/public/mojom:mojom_platform_headers",
     "//ui/events:dom_keycode_converter",
     "//ui/events:dom_keycode_converter",
     "//ui/gfx/codec",
