@@ -1,0 +1,285 @@
+import("//build/config/features.gni")
+import("//mojo/public/tools/bindings/mojom.gni")
+
+mojom("mojo_bindings") {
+  sources = [ "dashboard.mojom" ]
+  webui_module_path = "/"
+
+  # This line was missing. It tells the build system that your Mojo file
+  # is allowed to import and use base types like ValueDict.
+  public_deps = [ "//mojo/public/mojom/base" ]
+}
+
+static_library("dashboard") {
+  sources = [
+    # Core Data Management
+    "dashboard.cc",
+    "dashboard.h",
+
+    # Core UI & Handler
+    "dashboard_handler.cc",
+    "dashboard_handler.h",
+    "dashboard_ui.cc",
+    "dashboard_ui.h",
+    "dashboard_ui_data_source.cc",
+    "dashboard_ui_data_source.h",
+    "dashboard_ui_message_handler.cc",
+    "dashboard_ui_message_handler_agent.cc",
+    "simulachrome_startup.cc",
+    "embedded_executor_bridge.cc",
+    "embedded_executor_bridge.h",
+    "../simulachrome_agent/simulachrome_agent_ui.cc",
+    "../simulachrome/simulachrome_web_ui_message_handler.cc",
+    "../simulachrome/simulachrome_web_ui_message_handler.h",
+    "dashboard_ui_message_handler.h",
+    "ui_messages/dashboard_ui_message_handler_listener.cc",
+
+    # Debug/Logging Configuration
+    "debug_config.cc",
+    "debug_config.h",
+    "failure_replay_recorder.cc",
+    "failure_replay_recorder.h",
+    "headless_investigation_service.cc",
+    "headless_investigation_service.h",
+    "headless_listener_agent.cc",
+    "headless_listener_agent.h",
+    "headless_listener_controller.cc",
+    "headless_listener_controller.h",
+    "headless_listener_ipc.cc",
+    "headless_listener_ipc.h",
+    "headless_script_runner.cc",
+    "headless_script_runner.h",
+    "recording_suppression.cc",
+    "recording_suppression.h",
+
+    # Script Execution
+    "bot_challenge_url.cc",
+    "bot_challenge_url.h",
+    "auth_state_signals.cc",
+    "auth_state_signals.h",
+    "runtime_builtins.cc",
+    "runtime_builtins.h",
+    "scrape_data_store.cc",
+    "scrape_data_store.h",
+    "execution_run_context.cc",
+    "execution_run_context.h",
+    "native_run_activation.cc",
+    "native_run_activation.h",
+    "script_executor.cc",
+    "script_executor.h",
+    "script_context.cc",
+    "script_context.h",
+    "script_context_manager.cc",
+    "script_context_manager.h",
+    "script_execution_service.cc",
+    "script_execution_service.h",
+    "script_execution_service_factory.cc",
+    "script_execution_service_factory.h",
+    "token_redaction.cc",
+    "token_redaction.h",
+    "startup_agent_launcher.cc",
+    "startup_agent_launcher.h",
+
+    # Scheduling and Listeners
+    "scheduler_service.cc",
+    "scheduler_service.h",
+    "listener_manager.cc",
+    "listener_manager.h",
+    "listener_watch_controller.cc",
+    "listener_watch_controller.h",
+
+    # Canonical schema + persistence
+    "script_schema.cc",
+    "script_schema.h",
+    # Shared model prompt + command/action adapter (Glic, dashboard, auto-heal)
+    "agent_model_contract.cc",
+    "agent_model_contract.h",
+    "script_store.cc",
+    "script_store.h",
+    "run_history_store.cc",
+    "run_history_store.h",
+
+    # Action Infrastructure
+    "actions/action_base.cc",
+    "actions/action_base.h",
+    "actions/action_factory.cc",
+    "actions/action_factory.h",
+    "actions/action_metadata_promotion.cc",
+    "actions/action_metadata_promotion.h",
+    "actions/action_types.h",
+    "actions/action_types.cc",
+    "actions/element_readiness_checker.cc",
+    "actions/element_readiness_checker.h",
+    "actions/locator_resolver.cc",
+    "actions/locator_resolver.h",
+
+    # Action Handlers
+    "click_handler.cc",
+    "click_handler.h",
+    "type_handler.cc",
+    "type_handler.h",
+
+    # DevTools/CDP Infrastructure
+    "dashboard_automation_controller.cc",
+    "dashboard_automation_controller.h",
+    "dashboard_devtools_client.cc",
+    "dashboard_devtools_client.h",
+    "devtools_client_manager.cc",
+    "devtools_client_manager.h",
+
+    # Specific Action Classes
+    "actions/click_action.cc",
+    "actions/click_action.h",
+    "actions/drag_action.cc",
+    "actions/drag_action.h",
+    "actions/execution_failover_action.cc",
+    "actions/execution_failover_action.h",
+    "actions/glic_prompt_action.cc",
+    "actions/glic_prompt_action.h",
+    "actions/if_condition_action.cc",
+    "actions/if_condition_action.h",
+    "actions/authenticate_action.cc",
+    "actions/authenticate_action.h",
+    "actions/key_down_action.cc",
+    "actions/key_down_action.h",
+    "actions/key_press_action.cc",
+    "actions/key_press_action.h",
+    "actions/listen_action.cc",
+    "actions/listen_action.h",
+    "actions/native_locator_matches.cc",
+    "actions/native_locator_matches.h",
+    "actions/native_page_map_matcher.cc",
+    "actions/native_page_map_matcher.h",
+    "actions/loop_action.cc",
+    "actions/loop_action.h",
+    "actions/history_nav_action.cc",
+    "actions/history_nav_action.h",
+    "actions/navigate_action.cc",
+    "actions/navigate_action.h",
+    "actions/request_action.cc",
+    "actions/request_action.h",
+    "actions/scrape_element_action.cc",
+    "actions/scrape_element_action.h",
+    "traffic_capture_store.cc",
+    "traffic_capture_store.h",
+    "actions/scrape_table_action.cc",
+    "actions/scrape_table_action.h",
+    "actions/scroll_action.cc",
+    "actions/scroll_action.h",
+    "actions/type_action.cc",
+    "actions/type_action.h",
+    "actions/wait_action.cc",
+    "actions/wait_action.h",
+
+    # CDP Action Classes
+    "actions/cdp/cdp_action_base.cc",
+    "actions/cdp/cdp_action_base.h",
+    "actions/cdp/cdp_click_action.cc",
+    "actions/cdp/cdp_click_action.h",
+    "actions/cdp/cdp_drag_action.cc",
+    "actions/cdp/cdp_drag_action.h",
+    "actions/cdp/cdp_key_down_action.cc",
+    "actions/cdp/cdp_key_down_action.h",
+    "actions/cdp/cdp_listen_action.cc",
+    "actions/cdp/cdp_listen_action.h",
+    "actions/cdp/cdp_navigate_action.cc",
+    "actions/cdp/cdp_navigate_action.h",
+    "actions/cdp/cdp_scroll_action.cc",
+    "actions/cdp/cdp_scroll_action.h",
+    "actions/cdp/cdp_type_action.cc",
+    "actions/cdp/cdp_type_action.h",
+
+    # Recorder controller (attach/start/stop wiring)
+    "recorder_controller.cc",
+    "recorder_controller.h",
+    "recorder_devtools_client.cc",
+    "recorder_devtools_client.h",
+    "recorder_highlight_overlay.cc",
+    "recorder_highlight_overlay.h",
+    # Page map extraction
+    "page_map_extractor.cc",
+    "page_map_extractor.h",
+    "page_map_js.h",
+    "dashboard_global_settings.cc",
+    "dashboard_global_settings.h",
+    "unified_page_context.cc",
+    "unified_page_context.h",
+
+    # Chrome profile → Simulachrome password/cookie import
+    "chrome_profile_importer.cc",
+    "chrome_profile_importer.h",
+
+    # Anti-detection (injection and controller)
+    "anti_detection_controller.cc",
+    "anti_detection_controller.h",
+  ]
+
+  if (is_mac) {
+    sources += [ "simulachrome_app_activity_mac.mm" ]
+  }
+
+
+  deps = [
+    "//services/simulachrome/public/mojom",
+    "//chrome/browser/simulachrome",
+    ":mojo_bindings",
+    "//base",
+    "//components/embedder_support:user_agent",
+    "//components/language/core/browser",
+    "//chrome/browser/glic:glic",
+    "//chrome/browser/page_content_annotations:fetcher",
+    "//components/keyed_service/core",
+    "//components/optimization_guide/content/browser",
+    "//components/optimization_guide/proto:optimization_guide_proto",
+    "//chrome/common:constants",
+    "//chrome/browser/profiles:profile",
+    "//chrome/browser/password_manager/factories:password_factory_headers",
+    "//components/password_manager/core/browser:password_form",
+    "//components/password_manager/core/browser/password_store:password_store_interface",
+    "//components/password_manager/core/common",
+    "//components/prefs",
+    "//components/safe_browsing:buildflags",
+    "//components/safe_browsing/core/common:safe_browsing_prefs",
+    "//components/viz/common",
+    "//content/public/browser",
+    "//crypto",
+    "//net",
+    "//mojo/public/cpp/bindings",
+    "//chrome/browser/resources/dashboard:resources",
+    "//services/network/public/cpp",
+    "//services/network/public/mojom",
+    "//sql",
+    "//third_party/blink/public/common",
+    "//third_party/blink/public/mojom:mojom_platform",
+    "//ui/events:dom_keycode_converter",
+    "//ui/events:dom_keycode_converter",
+    "//ui/gfx/codec",
+    "//ui/gfx/geometry",
+    "//ui/shell_dialogs",
+    "//ui/webui",
+    "//ui/views",
+    "//chrome/browser/ui/views:views",
+    "//url",
+  ]
+}
+
+# Unit tests for dashboard schema
+source_set("unit_tests") {
+  testonly = true
+  sources = [
+    "agent_model_contract_unittest.cc",
+    "script_schema_unittest.cc",
+    "token_redaction_unittest.cc",
+
+    # Simulachrome planned-action contract + queue (no UI dependencies).
+    "//chrome/browser/simulachrome/planned_action_runner_unittest.cc",
+    "//chrome/browser/simulachrome/planned_action_unittest.cc",
+  ]
+  deps = [
+    ":dashboard",
+    "//chrome/browser/simulachrome",
+    "//base",
+    "//base/test:test_support",
+    "//testing/gtest",
+  ]
+}

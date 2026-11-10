@@ -1,0 +1,21 @@
+Apply 3158 (request action + traffic capture):
+
+  After patches through 3155 (and their overlays), copy:
+
+    rsync -a overlays/3158/chrome/ "$CHROMIUM_SRC/chrome/"
+
+  New files included:
+    chrome/browser/ui/webui/dashboard/actions/request_action.{h,cc}
+    chrome/browser/ui/webui/dashboard/traffic_capture_store.{h,cc}
+    chrome/browser/resources/dashboard/traffic_panel.js
+
+  Then rebuild:
+
+    autoninja -C out/Default \
+      chrome/browser/resources/dashboard:resources \
+      chrome
+
+Notes:
+  - Adds canonical `request` action (page-context fetch with credentials).
+  - CDP Network ring buffer while recording; Traffic panel promote-to-step.
+  - URL/headers/body use existing {Token}/{{Token}} expansion.

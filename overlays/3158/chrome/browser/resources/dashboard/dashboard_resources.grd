@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<grit latest_public_release="0" current_release="1">
+  <outputs>
+    <output filename="grit/dashboard_resources.h" type="rc_header">
+      <emit emit_type='prepend'></emit>
+    </output>
+    <output filename="grit/dashboard_resources_map.cc" type="resource_file_map_source" />
+    <output filename="grit/dashboard_resources_map.h" type="resource_map_header" />
+    <output filename="dashboard_resources.pak" type="data_package" />
+  </outputs>
+  <release seq="1">
+    <includes>
+      <include name="IDR_DASHBOARD_HTML" file="dashboard.html" type="BINDATA" />
+      <include name="IDR_DASHBOARD_DIRECTORY_HTML" file="directory.html" type="BINDATA" />
+      <include name="IDR_DASHBOARD_DIRECTORY_RUNTIME_JS" file="directory_runtime.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_APP_JS" file="dashboard_app.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_DEBUGGING_VIEW_JS" file="debugging_view.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_DATA_VIEW_JS" file="data_view.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_TRAFFIC_PANEL_JS" file="traffic_panel.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_CSS" file="styles.css" type="BINDATA" />
+      <include name="IDR_DASHBOARD_VARIABLES_JS" file="variables.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_SETTINGS_JS" file="settings.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ASSISTANT_INJECTOR_JS" file="assistant_injector.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ASSISTANT_STYLES_CSS" file="assistant_styles.css" type="BINDATA" />
+      <include name="IDR_DASHBOARD_SETTINGS_STYLES_CSS" file="settings_styles.css" type="BINDATA" />
+
+      <include name="IDR_DASHBOARD_COMPONENT_SIMULACHROME_SVG" file="components/simulachrome.svg" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_DIRECTORY0_SVG" file="components/directory0.svg" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_DIRECTORY1_SVG" file="components/directory1.svg" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_DIRECTORY2_SVG" file="components/directory2.svg" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_DIRECTORY3_SVG" file="components/directory3.svg" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_DIRECTORY4_SVG" file="components/directory4.svg" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_DIRECTORY5_SVG" file="components/directory5.svg" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_DIRECTORY6_SVG" file="components/directory6.svg" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_DIRECTORY7_SVG" file="components/directory7.svg" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_DIRECTORY8_SVG" file="components/directory8.svg" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_SMART_INPUT_JS" file="components/smartInput.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_LOCATOR_EDITOR_JS" file="components/locatorEditor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_LAYER_EDITOR_JS" file="components/layerEditor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_TIMELINE_RENDERER_JS" file="components/dashboard_timeline_renderer.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_COMPONENT_ACTION_EDITOR_JS" file="components/dashboard_action_editor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_INDEX_JS" file="actions/index.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_TYPES_JS" file="actions/types.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_CLICK_EDITOR_JS" file="actions/clickEditor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_KEY_DOWN_EDITOR_JS" file="actions/keyDownEditor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_KEY_PRESS_EDITOR_JS" file="actions/keyPressEditor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_LOOP_EDITOR_JS" file="actions/loopEditor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_NAVIGATE_EDITOR_JS" file="actions/navigateEditor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_SCRAPE_EDITOR_JS" file="actions/scrapeEditor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_SCRAPE_TABLE_EDITOR_JS" file="actions/scrapeTableEditor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_SCROLL_EDITOR_JS" file="actions/scrollEditor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_TYPE_EDITOR_JS" file="actions/typeEditor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_IF_CONDITION_EDITOR_JS" file="actions/ifConditionEditor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_AUTHENTICATE_MODEL_JS" file="actions/authenticate_model.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_AUTHENTICATE_TIMELINE_JS" file="actions/authenticate_timeline.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_ACTION_WAIT_EDITOR_JS" file="actions/waitEditor.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_MOJOM_LITE_JS" file="mojom-lite/dashboard.mojom-lite.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_ACTION_VOCABULARY_JS" file="agent/action_vocabulary.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_HEAL_PLAYBOOKS_JS" file="agent/heal_playbooks.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_ATED_ROADMAP_JS" file="agent/ated_roadmap.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_ATED_SCHEMA_JSON" file="agent/ated_schema.json" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_ATED_TROUBLESHOOTING_ROADMAP_JSON" file="agent/ated_troubleshooting_roadmap.json" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_MODEL_PROMPT_CONTRACT_JS" file="agent/model_prompt_contract.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_ACTION_OUTPUT_SCHEMA_JS" file="agent/action_output_schema.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_MEMENTO_STORE_JS" file="agent/agent_memento_store.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_INVESTIGATE_RESULT_SLIM_JS" file="agent/investigate_result_slim.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_INVESTIGATOR_FINDINGS_JS" file="agent/investigator_findings.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_SCRIPT_COLLECTIONS_JS" file="agent/script_collections.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_LOOP_PROFILES_JS" file="agent/loop_profiles.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_COMMAND_DISPATCHER_JS" file="agent/command_dispatcher.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_AUTO_HEAL_JS" file="agent/dashboard_auto_heal.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_AUTO_HEAL_RUNNER_JS" file="agent/dashboard_auto_heal_agent_runner.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_PLAYBACK_AUTO_HEAL_JS" file="agent/dashboard_playback_auto_heal.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_SCHEMA_JS" file="agent/dashboard_schema.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AGENT_RECORDER_BRIDGE_JS" file="agent/recorder_bridge.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_SCRIPT_STATE_JS" file="agent/dashboard_script_state.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_TIMELINE_JS" file="agent/dashboard_timeline.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_PERSISTENCE_JS" file="agent/dashboard_persistence.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_SCRIPT_LIST_JS" file="agent/dashboard_script_list.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_SCRIPT_EXPORT_GUARD_JS" file="agent/script_export_guard.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_SCRIPT_EXPORT_JS" file="agent/script_export.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_SCRIPT_NORMALIZATION_JS" file="agent/dashboard_script_normalization.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_SCRIPT_QUEUE_CONTROLLER_JS" file="agent/script/dashboard_script_queue_controller.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_BOOTSTRAP_JS" file="agent/ui/dashboard_bootstrap.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_BRIDGE_HELPERS_JS" file="agent/ui/dashboard_bridge_helpers.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_AUTO_HEAL_CALLBACKS_JS" file="agent/ui/dashboard_auto_heal_callbacks.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_VIEW_ROUTER_JS" file="agent/ui/dashboard_view_router.js" type="BINDATA" />
+      <include name="IDR_DASHBOARD_TIMELINE_DRAGDROP_JS" file="agent/timeline/dashboard_timeline_dragdrop.js" type="BINDATA" />
+    </includes>
+  </release>
+</grit>

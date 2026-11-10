@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: D313373 <d.1337.edu@gmail.com>
+Date: Mon, 9 Nov 2026 19:45:00 -0800
+Subject: [PATCH] Simulachrome: request action + traffic capture
+
+Prefer overlays/3158/ full-file copy (see APPLY.txt).
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+diff --git a/chrome/browser/ui/webui/dashboard/TIP_SYNC_3158.md b/chrome/browser/ui/webui/dashboard/TIP_SYNC_3158.md
+new file mode 100644
+--- /dev/null
++++ b/chrome/browser/ui/webui/dashboard/TIP_SYNC_3158.md
+@@ -0,0 +1,18 @@
++# 3158 — Request action + traffic capture
++
++## Summary
++- New `request` action: page-context fetch with credentials
++- CDP Network ring buffer while recording
++- Traffic panel promote-to-step with optional secret token rewrite
++
++## Apply
++Use full-file overlay (preferred):
++
++```
++rsync -a overlays/3158/chrome/ "$CHROMIUM_SRC/chrome/"
++```
++
++See overlays/3158/APPLY.txt.
