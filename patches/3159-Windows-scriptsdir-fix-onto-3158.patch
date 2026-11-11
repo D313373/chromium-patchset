@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: D313373 <d.1337.edu@gmail.com>
+Date: Wed, 11 Nov 2026 05:10:00 -0800
+Subject: [PATCH] Windows ScriptsDir PathService fix onto 3158
+
+Prefer overlays/3159/ full-file copy (see APPLY.txt).
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+diff --git a/chrome/browser/ui/webui/dashboard/TIP_SYNC_3159.md b/chrome/browser/ui/webui/dashboard/TIP_SYNC_3159.md
+new file mode 100644
+--- /dev/null
++++ b/chrome/browser/ui/webui/dashboard/TIP_SYNC_3159.md
+@@ -0,0 +1,10 @@
++# 3159 — Windows ScriptsDir fix onto 3158
++
++Restores `DIR_LOCAL_APP_DATA` ScriptsDir selection on Windows after 3158.
++
++```
++rsync -a overlays/3159/chrome/ "$CHROMIUM_SRC/chrome/"
++```
