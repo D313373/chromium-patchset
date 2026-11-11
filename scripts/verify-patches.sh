@@ -45,7 +45,8 @@ PATCHES=(
   "$ROOT_DIR/patches/3152-Script-export-PII-credential-guard.patch"
   "$ROOT_DIR/patches/3153-Export-secret-auto-migrate.patch"
   "$ROOT_DIR/patches/3154-Glic-agent-coordinate-click-screenshot-grid.patch"
-  "$ROOT_DIR/patches/3155-Sync-running-tip-autoheal-anthropic-launch-dirs.patch"
+  "$ROOT_DIR/patches/3155-Sync-running-tip-autoheal-anthropic-launch-dirs.patch" \
+  "$ROOT_DIR/patches/3156-Bake-glic-dev-defaults-packaged-agent-ui.patch"
 )
 OVERLAYS=(
   "$ROOT_DIR/overlays/3154/ollama_client.ts"
@@ -54,7 +55,11 @@ OVERLAYS=(
   "$ROOT_DIR/overlays/3155/APPLY.txt"
   "$ROOT_DIR/overlays/3155/chrome/test/data/webui/glic/test_client/start_glic_dev.sh"
   "$ROOT_DIR/overlays/3155/chrome/browser/resources/dashboard/settings.js"
-  "$ROOT_DIR/overlays/3155/chrome/browser/resources/dashboard/agent/dashboard_auto_heal_agent_runner.js"
+  "$ROOT_DIR/overlays/3155/chrome/browser/resources/dashboard/agent/dashboard_auto_heal_agent_runner.js" \
+  "$ROOT_DIR/overlays/3156/APPLY.txt" \
+  "$ROOT_DIR/overlays/3156/chrome/browser/ui/webui/dashboard/simulachrome_startup.cc" \
+  "$ROOT_DIR/overlays/3156/chrome/browser/ui/webui/simulachrome_agent/simulachrome_agent_ui.cc" \
+  "$ROOT_DIR/overlays/3156/chrome/test/data/webui/glic/test_client/ollama_client.ts"
 )
 for patch in "${PATCHES[@]}"; do
   [[ -s "$patch" ]] || {
@@ -93,7 +98,7 @@ if [[ -n "$CHROMIUM_DIR" ]]; then
     git -C "$CHROMIUM_DIR" apply --check "$patch"
   done
   echo "Patches 3147-3153 pass git apply --check against the base checkout."
-  echo "Note: 3154/3155 are overlay copies (see overlays/*/APPLY.txt), not context hunk patches."
+  echo "Note: 3154/3155/3156 are overlay copies (see overlays/*/APPLY.txt), not context hunk patches."
 fi
 
 echo "Patchset metadata is valid."

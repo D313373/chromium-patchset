@@ -1,0 +1,403 @@
+<!doctype html>
+<meta charset="utf-8" />
+<style>
+  html, body {
+    height: 100%;
+    margin: 0;
+    box-sizing: border-box;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  *, *::before, *::after { box-sizing: inherit; }
+  #root {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    padding: 10px 12px 12px;
+    gap: 8px;
+  }
+  #header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px 12px;
+    padding: 10px 12px;
+    background: #1f2937;
+    color: #fff;
+    border-radius: 10px;
+    -webkit-app-region: drag;
+  }
+  #header button {
+    min-height: 32px;
+    padding: 6px 12px;
+    border-radius: 8px;
+  }
+  #header .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    -webkit-app-region: no-drag;
+    position: relative;
+    align-items: center;
+  }
+  #panelMode {
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #9ca3af;
+  }
+  #queueWidgetToggle {
+    position: relative;
+    min-width: 92px;
+  }
+  #queueWidgetToggle[data-has-items="true"]::after {
+    content: attr(data-queue-count);
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    min-width: 18px;
+    height: 18px;
+    border-radius: 999px;
+    background: #2563eb;
+    color: #fff;
+    font-size: 11px;
+    line-height: 18px;
+    text-align: center;
+    padding: 0 4px;
+    box-sizing: border-box;
+  }
+  #queueWidgetPanel {
+    position: absolute;
+    top: 48px;
+    right: 10px;
+    width: min(420px, calc(100vw - 20px));
+    max-height: min(70vh, 680px);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    background: rgba(11, 16, 32, 0.98);
+    border: 1px solid #374151;
+    border-radius: 14px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.42);
+    z-index: 30;
+  }
+  #queueWidgetPanel[hidden] {
+    display: none;
+  }
+  .queue-widget-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border-bottom: 1px solid #1f2937;
+    color: #f3f4f6;
+    background: rgba(17, 24, 39, 0.96);
+  }
+  .queue-widget-subtitle {
+    font-size: 12px;
+    color: #9ca3af;
+  }
+  .queue-widget-body {
+    overflow: auto;
+    padding: 12px;
+    color: #e5e7eb;
+  }
+  .queue-widget-block {
+    margin-bottom: 14px;
+    padding: 10px;
+    border: 1px solid #253046;
+    border-radius: 10px;
+    background: rgba(15, 23, 42, 0.9);
+  }
+  .queue-widget-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: #93c5fd;
+    margin-bottom: 6px;
+  }
+  .queue-widget-meta {
+    font-size: 12px;
+    color: #9ca3af;
+    line-height: 1.4;
+  }
+  .queue-widget-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: #f8fafc;
+  }
+  .queue-widget-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .queue-widget-actions button,
+  .queue-item-actions button {
+    background: #111827;
+    color: #e5e7eb;
+    border: 1px solid #374151;
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .queue-widget-actions button:hover,
+  .queue-item-actions button:hover {
+    background: #1f2937;
+  }
+  .queue-widget-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .queue-item {
+    padding: 10px;
+    border: 1px solid #253046;
+    border-radius: 10px;
+    background: rgba(15, 23, 42, 0.84);
+  }
+  .queue-item.current {
+    border-color: #2563eb;
+    box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.35);
+  }
+  .queue-item-top {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 6px;
+  }
+  .queue-item-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .queue-empty {
+    color: #9ca3af;
+    font-size: 12px;
+    padding: 8px 0;
+  }
+  #content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  #messages {
+    flex: 1;
+    overflow: auto;
+    padding: 10px;
+    background: #0b1020;
+    color: #e5e7eb;
+  }
+  .msg {
+    padding: 8px 10px;
+    margin: 8px 0;
+    border-radius: 10px;
+    max-width: 90%;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .user {
+    background: #2563eb;
+    margin-left: auto;
+  }
+  .assistant {
+    background: #111827;
+    border: 1px solid #334155;
+  }
+  .system {
+    background: #1f2937;
+    border: 1px solid #374151;
+    color: #e5e7eb;
+  }
+  #taskbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-top: 1px solid #1f2937;
+    background: #0b1020;
+    color: #e5e7eb;
+  }
+  #taskbar button,
+  #composer button,
+  #composer select,
+  #composer input {
+    min-height: 34px;
+    padding: 6px 12px;
+    border-radius: 8px;
+  }
+  #taskInfo {
+    padding: 6px 10px;
+    border-top: 1px solid #1f2937;
+    background: #0b1020;
+    color: #9ca3af;
+    font-size: 12px;
+  }
+  #queueStatus {
+    font-size: 12px;
+    color: #9ca3af;
+    align-self: center;
+  }
+  #taskbar label.max-steps {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #e5e7eb;
+    white-space: nowrap;
+  }
+  #maxSteps {
+    width: 72px;
+    min-height: 34px;
+    padding: 6px 8px;
+    border-radius: 8px;
+  }
+  #csvPath {
+    flex: 1 1 160px;
+    min-width: 140px;
+  }
+  #csvText {
+    flex: 1 1 160px;
+    min-width: 140px;
+    resize: vertical;
+  }
+  #composer {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 12px;
+    border-top: 1px solid #1f2937;
+    background: #0b1020;
+  }
+  #composerControls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 0 10px 10px;
+    background: #0b1020;
+    color: #cbd5e1;
+    font-size: 12px;
+    border-top: 1px solid #111827;
+  }
+  .composer-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .composer-toggle input {
+    margin: 0;
+  }
+  #provider {
+    width: 120px;
+  }
+  #model {
+    width: 220px;
+    max-width: 280px;
+  }
+  #prompt {
+    flex: 1;
+    min-width: 120px;
+  }
+</style>
+<div id="root">
+    <div id="header">
+      <div>Glic Guest</div>
+      <div class="controls">
+        <span id="panelMode">Attached</span>
+        <button id="panelAttachToggle">Pop out</button>
+        <button id="queueWidgetToggle" data-has-items="false" data-queue-count="0">Queue</button>
+        <button id="close">Close</button>
+      </div>
+    </div>
+    <div id="queueWidgetPanel" hidden>
+      <div class="queue-widget-head">
+        <div>
+          <div class="queue-widget-title">Task Queue</div>
+          <div class="queue-widget-subtitle" id="queueWidgetSubtitle">No queued work.</div>
+        </div>
+        <button id="queueWidgetClose" aria-label="Close queue">Close</button>
+      </div>
+      <div class="queue-widget-body">
+        <div class="queue-widget-block">
+          <div class="queue-widget-label">Working Context</div>
+          <div class="queue-widget-meta" id="queueWorkingContext">No locked task context.</div>
+        </div>
+        <div class="queue-widget-block">
+          <div class="queue-widget-label">Active Task</div>
+          <div class="queue-widget-meta" id="queueActiveTask">No active task.</div>
+          <div class="queue-widget-actions">
+            <button id="queueResume">Resume</button>
+            <button id="queuePause">Pause</button>
+            <button id="queueComplete" title="Mark the active task complete, then review and save the script">Complete</button>
+            <button id="queueSolvedCaptcha" hidden title="Resume after you solve the captcha in the page">I solved it</button>
+            <button id="queueNext">Skip</button>
+            <button id="queueClear">Clear</button>
+          </div>
+        </div>
+        <div class="queue-widget-block">
+          <div class="queue-widget-label">Queued Tasks</div>
+          <div class="queue-widget-list" id="queueWidgetList"></div>
+        </div>
+      </div>
+    </div>
+    <div id="content">
+    <div id="messages"></div>
+    <div id="taskbar">
+      <input id="csvPath" type="text" value="/Users/matcauthon/notrainnogain/config.csv" placeholder="CSV path (e.g. /Users/matcauthon/notrainnogain/config.csv)" />
+      <button id="loadPath">Load Path</button>
+      <label class="max-steps" for="maxSteps">Max steps
+        <input id="maxSteps" type="number" min="1" max="500" value="20" />
+      </label>
+      <button id="startQueue">Start Queue</button>
+      <button id="pauseQueue">Pause</button>
+      <button id="completeTask" title="Mark the active task complete, then review and save the script">Complete</button>
+      <button id="solvedCaptcha" hidden title="Resume after you solve the captcha in the page">I solved it</button>
+      <button id="nextTask">Next Task</button>
+      <span id="queueStatus">Queue: 0</span>
+    </div>
+    <div id="taskInfo">No active task.</div>
+    <div id="taskbar">
+      <textarea id="csvText" rows="3" placeholder="Paste CSV here (url,goal,username,password)"></textarea>
+      <button id="loadText">Load Pasted CSV</button>
+    </div>
+    <div id="composer">
+      <select id="provider" title="Model provider (same options as Dashboard Settings)">
+        <option value="local">Local (OpenAI-compatible)</option>
+        <option value="cerebras">Cerebras</option>
+        <option value="gemini">Gemini</option>
+        <option value="openai">OpenAI</option>
+        <option value="anthropic">Anthropic</option>
+      </select>
+      <select id="model" title="Model for this provider"></select>
+      <input id="prompt" type="text" placeholder="Ask..." />
+      <button id="send">Send</button>
+      <button id="stop">Stop</button>
+    </div>
+    <div id="composerControls">
+      <label class="composer-toggle" title="Attach live page context to manual prompts. Leave off for simple questions.">
+        <input id="attachContextToggle" type="checkbox" />
+        <span>Include page context</span>
+      </label>
+      <label class="composer-toggle" title="While checked, Send adds this text to the running task's next step instead of starting a new task, interrupting, or queuing.">
+        <input id="guideCurrentTaskToggle" type="checkbox" />
+        <span>Guide current task</span>
+      </label>
+      <label class="composer-toggle" title="Run a lightweight prompt optimization pass before sending the manual prompt.">
+        <input id="promptOptimizerToggle" type="checkbox" />
+        <span>Use prompt optimizer</span>
+      </label>
+      <label class="composer-toggle" title="When checked, a manual prompt that starts a task opens a new tab. Leave off to stay on the current tab.">
+        <input id="openPromptInNewTabToggle" type="checkbox" />
+        <span>Open prompt in new tab</span>
+      </label>
+    </div>
+  </div>
+</div>
+<script src="./ollama_client.js" type="module"></script>

@@ -1,0 +1,280 @@
+// Copyright 2025 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+module dashboard.mojom;
+
+import "mojo/public/mojom/base/values.mojom";
+
+struct ExecutionStatus {
+  bool is_running;
+  uint32 current_step;
+  uint32 total_steps;
+  string status_message;
+};
+
+// Schedule configuration for a script
+struct ScheduleConfig {
+  bool enabled;
+  uint32 interval_days;
+  uint32 interval_hours;
+  uint32 interval_minutes;
+  string next_run_iso;  // ISO 8601 timestamp
+};
+
+// Information about a scheduled script
+struct ScheduledScriptInfo {
+  string script_id;
+  string script_name;
+  ScheduleConfig schedule;
+  bool is_paused;
+  bool has_error;
+  string last_error;
+  string last_run_iso;  // ISO 8601 timestamp
+};
+
+// Information about an active listener script
+struct ListenerInfo {
+  string script_id;
+  string script_name;
+  bool is_active;
+  string started_at_iso;  // ISO 8601 timestamp
+};
+
+// Interface for communication between dashboard WebUI page and browser process.
+interface DashboardHandler {
+  // Add Initialize to match the shim's functionality
+  Initialize() => ();
+
+  // Rename methods to match the existing JS calls
+  GetScripts() => (mojo_base.mojom.DictionaryValue scripts);
+  CreateNewScript(mojo_base.mojom.DictionaryValue payload) => (mojo_base.mojom.DictionaryValue result);
+  SaveScript(string id, mojo_base.mojom.DictionaryValue script_dict);
+  AppendToScript(string id, mojo_base.mojom.DictionaryValue delta);
+  DeleteScript(string id);
+  PlayScript(string id) => ();
+
+  // Variable and Listener methods can remain as they are if not used yet
+LoadVariables() => (mojo_base.mojom.DictionaryValue variables);
+  SaveVariables(mojo_base.mojom.DictionaryValue variables);
+  ToggleListenerScript(string id, bool enabled);
+  GetListenerScripts() => (array<mojo_base.mojom.DictionaryValue> scripts);
+
+  // Debugging methods
+  SetDebugLogging(bool enabled) => (mojo_base.mojom.DictionaryValue result);
+  GetDebugLogging() => (mojo_base.mojom.DictionaryValue result);
+  GetRunHistory(string script_id_filter, string from_iso, string to_iso, uint32 limit)
+      => (mojo_base.mojom.ListValue runs);
+  GetRunDetails(string run_id) => (mojo_base.mojom.DictionaryValue run);
+
+  // Execution Management
+	PauseScript() => ();
+  ResumeScript() => ();
+  ResumeScriptFromStep(string script_id, uint32 step_index) => (bool success, string error);
+  StopScript() => ();
+GetExecutionStatus() => (ExecutionStatus status);
+
+  // Schema Introspection
+  GetActionTemplate(string action_type) => (mojo_base.mojom.DictionaryValue action_template);
+  GetSupportedActions() => (mojo_base.mojom.ListValue actions);
+  ValidateAction(mojo_base.mojom.DictionaryValue action) => (bool valid, string error);
+
+  // Schedule Management
+  SetScriptSchedule(string script_id, ScheduleConfig config) => (bool success, string error);
+  GetScheduledScripts() => (array<ScheduledScriptInfo> scripts);
+  PauseScheduledScript(string script_id) => (bool success, string error);
+  ResumeScheduledScript(string script_id) => (bool success, string error);
+  RunScheduledScriptNow(string script_id) => (bool success, string error);
+  ClearScriptSchedule(string script_id) => (bool success, string error);
+
+  // Listener Management
+  StartListener(string script_id) => (bool success, string error);
+  StopListener(string script_id) => (bool success, string error);
+  GetActiveListeners() => (array<ListenerInfo> listeners);
+};
+
+// ============================================================================
+// Stealth element resolution (renderer-side Blink APIs)
+// ============================================================================
+
+// Mirror of dashboard/actions LocatorType in string form for IPC simplicity.
+// The renderer converts these to internal enums.
+struct Locator {
+  string type;   // e.g. "ID", "CSS_SELECTOR", "XPATH", "LINK_TEXT", ...
+  string value;  // raw locator value
+};
+
+enum SearchScope {
+  kInteractiveOnly,
+  kAll,
+};
+
+// Enhanced element info returned from the renderer resolver.
+struct ResolvedElementInfo {
+  bool ok;
+  int32 node_id;            // optional/0 if not used
+  int32 dom_node_id;
+  int32 frame_routing_id;   // RenderFrame routing id
+  int32 center_x;           // viewport client coordinates
+  int32 center_y;
+  // Element bounds in CSS pixels (viewport coordinates).
+  int32 x;
+  int32 y;
+  int32 width;
+  int32 height;
+  // Stable renderer frame identifier (LocalFrameToken string).
+  string frame_id;
+  // Primary selectors and full locator bundle.
+  string css;
+  string xpath;
+  array<Locator> locators;
+  string tag;
+  string id_attr;
+  string class_attr;
+  string name_attr;
+  string aria_label;
+  string accessibility_name;
+  string role;
+  string shadow_chain_selector;
+  string resource_path;
+  bool is_disabled;
+  // Element text (trimmed/partial if long).
+  string text;
+  string inner_html;
+  string href;
+  string src;
+  string value;
+  bool clickable;
+  bool focusable;
+  bool visible;
+};
+
+// Rich element feature vector for diagnostics/scoring.
+struct ElementFeatures {
+  bool visible;
+  bool interactive;
+  bool has_event_listeners;
+  bool hover_changes_appearance;
+  double opacity;
+  int32 width;
+  int32 height;
+  int32 shadow_depth;
+  string cursor;
+  string role;
+};
+
+// Renderer-implemented interface; browser requests per-frame resolution via IPC.
+interface ElementResolver {
+  ResolveElementStealthily(array<Locator> locators, SearchScope scope)
+      => (ResolvedElementInfo? element_info);
+  GetElementFeatures(int32 node_id) => (ElementFeatures features);
+  // Resolve point (x,y) to a ResolvedElementInfo including selector bundle.
+  ResolveAtPoint(int32 x, int32 y) => (ResolvedElementInfo info);
+  // Bulk DOM snapshot for training/pagemap ingestion.
+  CollectAllRelevantElements(SearchScope scope)
+      => (array<ResolvedElementInfo> elements);
+};
+
+// New alias interface for the renderer’s stealth resolver. This mirrors the
+// ElementResolver surface so browser code can prefer it and transparently
+// fall back to ElementResolver/CDP if not present.
+interface StealthyElementResolver {
+  ResolveElementStealthily(array<Locator> locators, SearchScope scope)
+      => (ResolvedElementInfo? element_info);
+  ResolveAtPoint(int32 x, int32 y) => (ResolvedElementInfo info);
+  CollectAllRelevantElements(SearchScope scope)
+      => (array<ResolvedElementInfo> elements);
+  // Every element in this frame matching any of `locators`, in document
+  // order, de-duplicated, at most `max_results`. Text locators keep only the
+  // innermost matching element.
+  ResolveAllMatches(array<Locator> locators, SearchScope scope,
+                    uint32 max_results)
+      => (array<ResolvedElementInfo> elements);
+  // Finds the repeated item (list row, table row, card) under widget point
+  // (x, y) and its sibling peers. Null when nothing repeats there.
+  FindRepeatedPeersAtPoint(int32 x, int32 y, uint32 max_peers)
+      => (RepeatedPeers? result);
+  // Page overview for the headless investigator: pageUrl, title, readyState,
+  // elementCount, links, inputs, buttons, tables, innerTextExcerpt.
+  InvestigatePage(uint32 max_links, uint32 max_inputs, uint32 max_buttons,
+                  uint32 max_text_chars)
+      => (mojo_base.mojom.DictionaryValue snapshot);
+};
+
+struct RepeatedPeers {
+  // CSS selector matching every peer of the repeated item.
+  string locator;
+  // CSS path from the repeated item down to the hit element (for row-relative
+  // scrape columns). Empty when the hit element is the item itself.
+  string relative_locator;
+  ResolvedElementInfo target;
+  // Peers in document order; bounds in widget DIPs.
+  array<ResolvedElementInfo> peers;
+};
+
+// ============================================================================
+// Future Blink-local reflex/watch channel
+// ============================================================================
+//
+// This is intentionally defined but not currently bound anywhere in runtime.
+// The goal is to give a future tiny Blink-local agent a narrow execution-time
+// signal surface without exposing a second full page-context pipeline.
+
+enum BlinkAgentSignalKind {
+  kUnknown,
+  kTargetDetached,
+  kTargetHidden,
+  kTargetDisabled,
+  kTargetEditable,
+  kTargetFocused,
+  kExpectedElementAppeared,
+  kExpectedElementMissing,
+  kNavigationCommitted,
+  kNavigationFailed,
+  kDomMutationBurst,
+  kValueChanged,
+  kDialogOpened,
+};
+
+struct BlinkAgentWatchTarget {
+  string frame_id;
+  int32 dom_node_id;
+  array<Locator> locators;
+  string role;
+  string accessibility_name;
+};
+
+struct BlinkAgentWatchRequest {
+  string action_kind;
+  BlinkAgentWatchTarget primary_target;
+  array<BlinkAgentWatchTarget> expected_followups;
+  bool watch_navigation;
+  bool watch_mutations;
+  bool watch_focus;
+  bool watch_value_changes;
+  bool watch_visibility;
+};
+
+struct BlinkAgentSignal {
+  BlinkAgentSignalKind kind;
+  string frame_id;
+  int32 dom_node_id;
+  string message;
+  bool truthy;
+  double monotonic_timestamp_ms;
+};
+
+struct BlinkAgentWatchState {
+  bool target_valid;
+  bool actionable;
+  bool should_abort;
+  bool should_refresh_context;
+  bool navigation_detected;
+  bool focus_changed;
+  array<BlinkAgentSignal> signals;
+};
+
+interface BlinkAgentReflexPortal {
+  BeginWatch(BlinkAgentWatchRequest request) => (uint64 watch_id);
+  PollWatch(uint64 watch_id) => (BlinkAgentWatchState state);
+  EndWatch(uint64 watch_id);
+};

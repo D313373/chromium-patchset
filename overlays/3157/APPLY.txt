@@ -1,0 +1,23 @@
+Overlay 3157 — working-tree sync after 3156 (full-file copies)
+
+Copies over Chromium after 3147-3156. Contents are every file that differs
+from the 3154-3156 overlays, plus files changed since 3156 that are not in
+any earlier overlay (203 files: chrome 174, components 4, content 7, services 12, third_party 6).
+
+Includes the on-device model guided-decoding tidy-up
+(services/on_device_model/ml/on_device_model_executor.{cc,h}): scoped
+llguidance constraint ownership, ApplyPrefixToConstraint(), empty prefixes
+skipped, tokenizer creation not retried after a permanent failure.
+
+Includes the packaged-Glic host bootstrap work in
+chrome/browser/resources/glic/webview.ts and
+chrome/test/data/webui/glic/test_client/ollama_client.ts
+(installAgentGlicHost, no /glic-prefs fetch in blob/chrome guests,
+setTabContextPermissionState failures surfaced).
+
+Apply with:
+  rsync -a overlays/3157/chrome/ $CHROMIUM_DIR/chrome/
+  rsync -a overlays/3157/components/ $CHROMIUM_DIR/components/
+  rsync -a overlays/3157/content/ $CHROMIUM_DIR/content/
+  rsync -a overlays/3157/services/ $CHROMIUM_DIR/services/
+  rsync -a overlays/3157/third_party/ $CHROMIUM_DIR/third_party/

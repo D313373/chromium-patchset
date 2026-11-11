@@ -1,0 +1,129 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+module simulachrome.mojom;
+
+import "gpu/ipc/common/mailbox.mojom";
+import "gpu/ipc/common/sync_token.mojom";
+import "mojo/public/mojom/base/file_path.mojom";
+import "sandbox/policy/mojom/sandbox.mojom";
+import "services/viz/public/mojom/gpu.mojom";
+import "ui/gfx/geometry/mojom/geometry.mojom";
+
+// High-level action kinds produced by smolvlm2-agentic-gui (and mocks).
+enum AgentActionType {
+  kNone = 0,
+  kClick = 1,
+  kType = 2,
+  kScroll = 3,
+  kWait = 4,
+  kDone = 5,
+  kFail = 6,
+  // Strategy 3: target not visible in the captured frame after max visual
+  // scroll iterations — Planner should scroll / re-target.
+  kElementNotFound = 7,
+  // press("enter") and friends. Forms without a submit button (search bars,
+  // modal overlays) cannot be completed with clicks alone.
+  kKeyPress = 8,
+  // The values below are never produced by the VLM (its grammar only emits
+  // click). The manager's PlannedAction names the operation; scaffolding stamps
+  // it onto the point(s) the model located.
+  kDoubleClick = 9,
+  kRightClick = 10,
+  // Pointer move with no press.
+  kHover = 11,
+  // Press at (x, y), release at (end_x, end_y).
+  kDrag = 12,
+};
+
+// Parsed smolvlm2 output. Coordinates are normalized to [0,1] in the captured
+// frame's CSS viewport space (origin top-left), independent of DPR.
+struct AgentAction {
+  AgentActionType type;
+  // Normalized click / scroll origin. Valid when type is kClick or kScroll.
+  float x = 0.0;
+  float y = 0.0;
+  // For kType: text to insert. For kKeyPress: key name ("enter", "tab",
+  // "escape", "backspace", "delete", "up", "down", "left", "right").
+  // For kFail/kDone: optional reason/status.
+  string payload;
+  // For kScroll: delta as a fraction of the viewport, positive y = scroll
+  // down. 1.0 is one full viewport; the model's integer step count is
+  // converted to this scale by ParseAgentAction.
+  float scroll_dx = 0.0;
+  float scroll_dy = 0.0;
+  // Model confidence in [0,1] when available.
+  float confidence = 0.0;
+  // Release point for kDrag, normalized like x/y.
+  float end_x = 0.0;
+  float end_y = 0.0;
+};
+
+// GPU frame handle passed browser/GPU -> utility. Mailbox alone is not enough
+// to wait for production; sync_token must be waited before reading.
+struct FrameTexture {
+  gpu.mojom.Mailbox mailbox;
+  gpu.mojom.SyncToken sync_token;
+  // Pixel size of the shared image (physical / Blink space).
+  gfx.mojom.Size size_px;
+  // Device scale factor used when the frame was captured.
+  float device_scale_factor = 1.0;
+  // CSS viewport size in DIPs matching the normalized action coords.
+  gfx.mojom.Size viewport_size_dip;
+
+  // Optional tightly-packed RGBA_8888 CPU pixels (width*height*4), top-left
+  // origin. Empty once AttachGpu has armed mailbox readback. Filled only when
+  // the shared image is missing or the utility has no raster context, because
+  // array<uint8> copies every pixel through mojo.
+  array<uint8> rgba_pixels;
+};
+
+struct FrameImage {
+  bool ok;
+  string error;
+  array<uint8> png;
+  gfx.mojom.Size size_px;
+  float device_scale_factor = 1.0;
+  gfx.mojom.Size viewport_size_dip;
+};
+
+struct AgentResult {
+  bool ok;
+  string error;
+  AgentAction? action;
+};
+
+// Out-of-process VLM agent. Runs in a utility process — never in the renderer.
+//
+// kNoSandbox: weights live outside the bundle (model dir / SIMULACHROME_HOME)
+// and the macOS kService profile maps to utility.sb, which denies all
+// filesystem reads -- LoadModel there can only ever report
+// llm_gguf_not_found. Tightening this needs a dedicated .sb granting the
+// model dir plus Metal/IOKit for n_gpu_layers > 0.
+[ServiceSandbox=sandbox.mojom.Sandbox.kNoSandbox]
+interface SimulachromeAgent {
+  // Load / reload model weights from |model_path| (gguf / onnx bundle).
+  LoadModel(mojo_base.mojom.FilePath model_path) => (bool ok, string error);
+
+  // Browser-side viz::GpuClient pipe. The utility opens a raster context on it
+  // and reads FrameTexture.mailbox with RasterInterface::ReadbackImagePixels.
+  // |ready| is false when the channel or context fails; the browser then keeps
+  // copying RGBA. Sent once, before LoadModel, on this same pipe.
+  AttachGpu(pending_remote<viz.mojom.Gpu> gpu) => (bool ready);
+
+  // Same mailbox readback ExecuteAction uses, without running the model.
+  // A vision model reached over HTTP cannot see a mailbox, so the utility
+  // reads it once and returns a PNG.
+  ReadbackFrame(FrameTexture frame) => (FrameImage image);
+
+  // Run one agentic step: task NL + current frame -> native action.
+  // |frame_texture.mailbox| is the zero-copy GPU backbuffer handle.
+  ExecuteAction(string task_instruction,
+                FrameTexture frame_texture) => (AgentResult result);
+
+  // Convenience matching the mailbox-only sketch. Prefer FrameTexture.
+  ExecuteActionWithMailbox(string task_instruction,
+                           gpu.mojom.Mailbox frame_texture)
+      => (AgentResult result);
+};

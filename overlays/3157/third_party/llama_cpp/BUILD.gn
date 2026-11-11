@@ -1,0 +1,526 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+#
+# Vendored llama.cpp under third_party/llama_cpp/src (clone / symlink required).
+# Multimodal: tools/mtmd (successor to examples/llava).
+
+import("//build/config/compiler/compiler.gni")
+
+declare_args() {
+  llama_cpp_enabled = true
+  llama_cpp_use_metal = false
+  llama_cpp_use_vulkan = false
+}
+
+config("llama_cpp_config") {
+  include_dirs = [
+    "src/include",
+    "src/ggml/include",
+    "src/ggml/src",  # ggml-common.h, ggml-backend-impl.h, ggml-impl.h
+    "src/ggml/src/ggml-cpu",
+    "src/common",
+    "src/tools/mtmd",
+    "src/tools/mtmd/models",
+    "src/vendor",
+    "src/vendor/hash",
+    "src",
+    "src/src",
+  ]
+  defines = [
+    "GGML_USE_CPU",
+    "_USE_MATH_DEFINES",
+    "_CRT_SECURE_NO_WARNINGS",
+    "NDEBUG",
+    # cmake normally injects these; provide stubs for Chromium GN builds.
+    "GGML_VERSION=\"0.0.0-simulachrome\"",
+    "GGML_COMMIT=\"simulachrome-vendor\"",
+  ]
+  if (is_mac && llama_cpp_use_metal) {
+    defines += [ "GGML_USE_METAL" ]
+  }
+  if (llama_cpp_use_vulkan) {
+    defines += [ "GGML_USE_VULKAN" ]
+  }
+}
+
+config("llama_cpp_warnings") {
+  # Disabling libc++ modules (via :exceptions) drops transitive stdlib
+  # visibility; force-include so getenv/atoi resolve in llama headers.
+  # clang-cl on Windows does not accept bare "-include stdlib.h" the same way.
+  cflags = [ "-Wno-error" ]
+  cflags_cc = []
+  if (!is_win) {
+    cflags += [
+      "-include",
+      "stdlib.h",
+      "-include",
+      "errno.h",
+      "-include",
+      "string.h",
+    ]
+    cflags_cc += [
+      "-include",
+      "cstdlib",
+      "-include",
+      "cerrno",
+      "-include",
+      "cstring",
+    ]
+  }
+  if (is_clang) {
+    cflags += [
+      "-Wno-unused-function",
+      "-Wno-unused-variable",
+      "-Wno-unused-but-set-variable",
+      "-Wno-unused-parameter",
+      "-Wno-conversion",
+      "-Wno-sign-compare",
+      "-Wno-shadow",
+      "-Wno-thread-safety-analysis",
+      "-Wno-implicit-fallthrough",
+      "-Wno-unreachable-code-break",
+      "-Wno-format",
+      "-Wno-c++11-narrowing",
+      "-Wno-exit-time-destructors",
+      "-Wno-deprecated-declarations",
+      "-Wno-deprecated",
+    ]
+  }
+}
+
+# llama.cpp uses throw + static locals; Chromium defaults forbid both.
+# exceptions also disables libc++ modules (fixes Darwin getenv visibility).
+template("llama_source_set") {
+  source_set(target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "configs",
+                             "public_configs",
+                           ])
+    configs -= [
+      "//build/config/compiler:chromium_code",
+      "//build/config/compiler:no_exceptions",
+    ]
+    configs += [
+      "//build/config/compiler:no_chromium_code",
+      "//build/config/compiler:exceptions",
+      ":llama_cpp_warnings",  # includes -Wno-error after nested -Werror
+    ]
+    if (defined(invoker.configs)) {
+      configs += invoker.configs
+    }
+    public_configs = [ ":llama_cpp_config" ]
+    if (defined(invoker.public_configs)) {
+      public_configs += invoker.public_configs
+    }
+  }
+}
+
+if (llama_cpp_enabled) {
+  # Separate source_sets avoid GN object-file basename collisions
+  # (ggml.c vs ggml.cpp, quants.c in multiple dirs, etc.).
+
+  llama_source_set("ggml_c_core") {
+    sources = [
+      "src/ggml/src/ggml.c",
+      "src/ggml/src/ggml-alloc.c",
+      "src/ggml/src/ggml-quants.c",
+    ]
+  }
+
+  llama_source_set("ggml_cpp_core") {
+    sources = [
+      "src/ggml/src/ggml.cpp",
+      "src/ggml/src/ggml-backend.cpp",
+      "src/ggml/src/ggml-backend-reg.cpp",
+      "src/ggml/src/ggml-backend-dl.cpp",
+      "src/ggml/src/ggml-backend-meta.cpp",
+      "src/ggml/src/ggml-threading.cpp",
+      "src/ggml/src/gguf.cpp",
+      "src/ggml/src/ggml-opt.cpp",
+    ]
+  }
+
+  llama_source_set("ggml_cpu_c") {
+    sources = [ "src/ggml/src/ggml-cpu/ggml-cpu.c" ]
+  }
+
+  llama_source_set("ggml_cpu_base") {
+    sources = [
+      "src/ggml/src/ggml-cpu/ggml-cpu.cpp",
+      "src/ggml/src/ggml-cpu/binary-ops.cpp",
+      "src/ggml/src/ggml-cpu/ops.cpp",
+      "src/ggml/src/ggml-cpu/hbm.cpp",
+      "src/ggml/src/ggml-cpu/llamafile/sgemm.cpp",
+      "src/ggml/src/ggml-cpu/repack.cpp",
+      "src/ggml/src/ggml-cpu/traits.cpp",
+      "src/ggml/src/ggml-cpu/unary-ops.cpp",
+      "src/ggml/src/ggml-cpu/vec.cpp",
+      "src/ggml/src/ggml-cpu/tiled/tiled.cpp",
+      "src/ggml/src/ggml-cpu/tiled/tiled-kernel.cpp",
+    ]
+  }
+
+  # quants.c basename collides across arch + cpu — isolate each.
+  llama_source_set("ggml_cpu_quants") {
+    sources = [ "src/ggml/src/ggml-cpu/quants.c" ]
+  }
+
+  if (current_cpu == "arm" || current_cpu == "arm64") {
+    llama_source_set("ggml_cpu_arch") {
+      sources = [
+        "src/ggml/src/ggml-cpu/arch/arm/repack.cpp",
+        "src/ggml/src/ggml-cpu/arch/arm/quants.c",
+      ]
+    }
+  } else if (current_cpu == "x86" || current_cpu == "x64") {
+    llama_source_set("ggml_cpu_arch") {
+      sources = [
+        "src/ggml/src/ggml-cpu/arch/x86/repack.cpp",
+        "src/ggml/src/ggml-cpu/arch/x86/quants.c",
+      ]
+    }
+  } else {
+    llama_source_set("ggml_cpu_arch") {
+      sources = []
+    }
+  }
+
+  llama_source_set("llama_engine") {
+    sources = [
+      "src/src/llama.cpp",
+      "src/src/llama-adapter.cpp",
+      "src/src/llama-arch.cpp",
+      "src/src/llama-batch.cpp",
+      "src/src/llama-chat.cpp",
+      "src/src/llama-context.cpp",
+      "src/src/llama-cparams.cpp",
+      "src/src/llama-grammar.cpp",
+      "src/src/llama-graph.cpp",
+      "src/src/llama-hparams.cpp",
+      "src/src/llama-impl.cpp",
+      "src/src/llama-io.cpp",
+      "src/src/llama-kv-cache.cpp",
+      "src/src/llama-moe-cache.cpp",
+      "src/src/llama-memory-hybrid-idx.cpp",
+      "src/src/llama-kv-cache-msa.cpp",
+      "src/src/llama-kv-cache-dsv4.cpp",
+      "src/src/llama-kv-cache-dsa-iswa.cpp",
+      "src/src/llama-kv-cache-dsa.cpp",
+      "src/src/llama-kv-cache-iswa.cpp",
+      "src/src/llama-memory.cpp",
+      "src/src/llama-memory-hybrid.cpp",
+      "src/src/llama-memory-hybrid-iswa.cpp",
+      "src/src/llama-memory-recurrent.cpp",
+      "src/src/llama-mmap.cpp",
+      "src/src/llama-model.cpp",
+      "src/src/llama-model-loader.cpp",
+      "src/src/llama-model-saver.cpp",
+      "src/src/llama-quant.cpp",
+      "src/src/llama-sampler.cpp",
+      "src/src/llama-vocab.cpp",
+      "src/src/unicode.cpp",
+      "src/src/unicode-data.cpp",
+    ]
+    deps = [
+      ":ggml_c_core",
+      ":ggml_cpp_core",
+      ":ggml_cpu_c",
+      ":ggml_cpu_base",
+      ":ggml_cpu_quants",
+      ":ggml_cpu_arch",
+    ]
+  }
+
+
+  # Separate target: models/llama.cpp basenames collide with src/llama.cpp.
+  llama_source_set("llama_models") {
+    sources = [
+      "src/src/models/afmoe.cpp",
+      "src/src/models/apertus.cpp",
+      "src/src/models/arcee.cpp",
+      "src/src/models/arctic.cpp",
+      "src/src/models/arwkv7.cpp",
+      "src/src/models/baichuan.cpp",
+      "src/src/models/bailingmoe.cpp",
+      "src/src/models/bailingmoe2.cpp",
+      "src/src/models/bailingmoe3.cpp",
+      "src/src/models/beam.cpp",
+      "src/src/models/bert.cpp",
+      "src/src/models/bitnet.cpp",
+      "src/src/models/bloom.cpp",
+      "src/src/models/chameleon.cpp",
+      "src/src/models/chatglm.cpp",
+      "src/src/models/clef.cpp",
+      "src/src/models/clip.cpp",
+      "src/src/models/clover-moe.cpp",
+      "src/src/models/codeshell.cpp",
+      "src/src/models/cogvlm.cpp",
+      "src/src/models/cohere2.cpp",
+      "src/src/models/cohere2moe.cpp",
+      "src/src/models/command-r.cpp",
+      "src/src/models/dbrx.cpp",
+      "src/src/models/deci.cpp",
+      "src/src/models/deepseek.cpp",
+      "src/src/models/deepseek2.cpp",
+      "src/src/models/deepseek2ocr.cpp",
+      "src/src/models/deepseek32.cpp",
+      "src/src/models/deepseek4.cpp",
+      "src/src/models/deepseek41.cpp",
+      "src/src/models/delta-net-base.cpp",
+      "src/src/models/dflash.cpp",
+      "src/src/models/dots1.cpp",
+      "src/src/models/dots3note.cpp",
+      "src/src/models/dream.cpp",
+      "src/src/models/eagle3.cpp",
+      "src/src/models/ernie4-5-moe.cpp",
+      "src/src/models/ernie4-5.cpp",
+      "src/src/models/eurobert.cpp",
+      "src/src/models/exaone-moe.cpp",
+      "src/src/models/exaone.cpp",
+      "src/src/models/exaone4.cpp",
+      "src/src/models/falcon-h1.cpp",
+      "src/src/models/falcon.cpp",
+      "src/src/models/flint.cpp",
+      "src/src/models/gemma-embedding.cpp",
+      "src/src/models/gemma-embedding2.cpp",
+      "src/src/models/gemma.cpp",
+      "src/src/models/gemma2.cpp",
+      "src/src/models/gemma3.cpp",
+      "src/src/models/gemma3n.cpp",
+      "src/src/models/gemma4-assistant.cpp",
+      "src/src/models/gemma4.cpp",
+      "src/src/models/glm-dsa.cpp",
+      "src/src/models/glm4-moe.cpp",
+      "src/src/models/glm4.cpp",
+      "src/src/models/glm5-next.cpp",
+      "src/src/models/gpt2.cpp",
+      "src/src/models/gptneox.cpp",
+      "src/src/models/granite-hybrid.cpp",
+      "src/src/models/granite-moe.cpp",
+      "src/src/models/granite-swa.cpp",
+      "src/src/models/granite-switch.cpp",
+      "src/src/models/granite.cpp",
+      "src/src/models/grok.cpp",
+      "src/src/models/grovemoe.cpp",
+      "src/src/models/hrm-text.cpp",
+      "src/src/models/hunyuan-dense.cpp",
+      "src/src/models/hunyuan-moe.cpp",
+      "src/src/models/hunyuan-vl.cpp",
+      "src/src/models/hy-v3.cpp",
+      "src/src/models/hy-v4.cpp",
+      "src/src/models/internlm2.cpp",
+      "src/src/models/jais.cpp",
+      "src/src/models/jais2.cpp",
+      "src/src/models/jamba.cpp",
+      "src/src/models/jina-bert-v2.cpp",
+      "src/src/models/jina-bert-v3.cpp",
+      "src/src/models/k2-horizon.cpp",
+      "src/src/models/kimi-k3.cpp",
+      "src/src/models/kimi-k31.cpp",
+      "src/src/models/kimi-linear.cpp",
+      "src/src/models/kolibri1.cpp",
+      "src/src/models/laguna.cpp",
+      "src/src/models/lfm-base.cpp",
+      "src/src/models/lfm2.cpp",
+      "src/src/models/lfm2moe.cpp",
+      "src/src/models/lfm3.cpp",
+      "src/src/models/limite.cpp",
+      "src/src/models/llada-moe.cpp",
+      "src/src/models/llada.cpp",
+      "src/src/models/llama-embed.cpp",
+      "src/src/models/llama.cpp",
+      "src/src/models/llama4.cpp",
+      "src/src/models/maincoder.cpp",
+      "src/src/models/maion-coder.cpp",
+      "src/src/models/mamba-base.cpp",
+      "src/src/models/mamba.cpp",
+      "src/src/models/mamba2.cpp",
+      "src/src/models/maple.cpp",
+      "src/src/models/mellum.cpp",
+      "src/src/models/metis16.cpp",
+      "src/src/models/mimo2.cpp",
+      "src/src/models/minicpm.cpp",
+      "src/src/models/minicpm3.cpp",
+      "src/src/models/minimax-01.cpp",
+      "src/src/models/minimax-m2.cpp",
+      "src/src/models/minimax-m3.cpp",
+      "src/src/models/mistral-large4.cpp",
+      "src/src/models/mistral3.cpp",
+      "src/src/models/mistral4.cpp",
+      "src/src/models/modern-bert.cpp",
+      "src/src/models/mpt.cpp",
+      "src/src/models/muse-glimmer.cpp",
+      "src/src/models/muse-spark.cpp",
+      "src/src/models/nanbeige.cpp",
+      "src/src/models/nemotron-h-moe.cpp",
+      "src/src/models/nemotron-h.cpp",
+      "src/src/models/nemotron.cpp",
+      "src/src/models/neo-bert.cpp",
+      "src/src/models/nomic-bert-moe.cpp",
+      "src/src/models/nomic-bert.cpp",
+      "src/src/models/olmo.cpp",
+      "src/src/models/olmo2.cpp",
+      "src/src/models/olmoe.cpp",
+      "src/src/models/openai-moe.cpp",
+      "src/src/models/openelm.cpp",
+      "src/src/models/orion.cpp",
+      "src/src/models/paddleocr.cpp",
+      "src/src/models/pangu-embed.cpp",
+      "src/src/models/phi2.cpp",
+      "src/src/models/phi3.cpp",
+      "src/src/models/phimoe.cpp",
+      "src/src/models/plamo.cpp",
+      "src/src/models/plamo2.cpp",
+      "src/src/models/plamo3.cpp",
+      "src/src/models/plm.cpp",
+      "src/src/models/pockettts.cpp",
+      "src/src/models/qwen.cpp",
+      "src/src/models/qwen2.cpp",
+      "src/src/models/qwen2moe.cpp",
+      "src/src/models/qwen2vl.cpp",
+      "src/src/models/qwen3.cpp",
+      "src/src/models/qwen35.cpp",
+      "src/src/models/qwen35moe.cpp",
+      "src/src/models/qwen3moe.cpp",
+      "src/src/models/qwen3next.cpp",
+      "src/src/models/qwen3tts.cpp",
+      "src/src/models/qwen3vl.cpp",
+      "src/src/models/qwen3vlmoe.cpp",
+      "src/src/models/qwen4exp.cpp",
+      "src/src/models/refact.cpp",
+      "src/src/models/ricursive.cpp",
+      "src/src/models/rnd1.cpp",
+      "src/src/models/rwkv6-base.cpp",
+      "src/src/models/rwkv6.cpp",
+      "src/src/models/rwkv6qwen2.cpp",
+      "src/src/models/rwkv7-base.cpp",
+      "src/src/models/rwkv7.cpp",
+      "src/src/models/seed-oss.cpp",
+      "src/src/models/sensenova-u1.cpp",
+      "src/src/models/smallthinker.cpp",
+      "src/src/models/smollm3.cpp",
+      "src/src/models/spark2-5.cpp",
+      "src/src/models/stablelm.cpp",
+      "src/src/models/starcoder.cpp",
+      "src/src/models/starcoder2.cpp",
+      "src/src/models/step35.cpp",
+      "src/src/models/t5.cpp",
+      "src/src/models/t5encoder.cpp",
+      "src/src/models/talkie.cpp",
+      "src/src/models/vllm-decision2.cpp",
+      "src/src/models/wavtokenizer-dec.cpp",
+      "src/src/models/xing4-0.cpp",
+      "src/src/models/xverse.cpp",
+    ]
+    deps = [
+      ":ggml_c_core",
+      ":ggml_cpp_core",
+      ":ggml_cpu_c",
+      ":ggml_cpu_base",
+      ":ggml_cpu_quants",
+      ":ggml_cpu_arch",
+    ]
+  }
+
+  llama_source_set("llama_mtmd") {
+    sources = [
+      "src/tools/mtmd/clip.cpp",
+      "src/tools/mtmd/mtmd.cpp",
+      "src/tools/mtmd/mtmd-helper.cpp",
+      "src/tools/mtmd/mtmd-image.cpp",
+      "src/tools/mtmd/mtmd-audio.cpp",
+      "src/vendor/hash/hash.cpp",
+      "src/vendor/hash/sha256/sha256.c",
+      "src/tools/mtmd/models/chatterbox-gen.cpp",
+      "src/tools/mtmd/models/chatterbox-spkenc.cpp",
+      "src/tools/mtmd/models/cogvlm.cpp",
+      "src/tools/mtmd/models/conformer.cpp",
+      "src/tools/mtmd/models/deepseek4v.cpp",
+      "src/tools/mtmd/models/deepseekocr.cpp",
+      "src/tools/mtmd/models/deepseekocr2.cpp",
+      "src/tools/mtmd/models/dots3note.cpp",
+      "src/tools/mtmd/models/dotsocr.cpp",
+      "src/tools/mtmd/models/drama3-gen.cpp",
+      "src/tools/mtmd/models/exaone4_5.cpp",
+      "src/tools/mtmd/models/gemma4a.cpp",
+      "src/tools/mtmd/models/gemma4ua.cpp",
+      "src/tools/mtmd/models/gemma4uv.cpp",
+      "src/tools/mtmd/models/gemma4v.cpp",
+      "src/tools/mtmd/models/glm4v.cpp",
+      "src/tools/mtmd/models/granite-speech.cpp",
+      "src/tools/mtmd/models/granite4-vision.cpp",
+      "src/tools/mtmd/models/hunyuanvl.cpp",
+      "src/tools/mtmd/models/internvl.cpp",
+      "src/tools/mtmd/models/kimik25.cpp",
+      "src/tools/mtmd/models/kimivl.cpp",
+      "src/tools/mtmd/models/lfm3a-gen.cpp",
+      "src/tools/mtmd/models/lfm3a.cpp",
+      "src/tools/mtmd/models/lfm3vl.cpp",
+      "src/tools/mtmd/models/ling3vl.cpp",
+      "src/tools/mtmd/models/llama4.cpp",
+      "src/tools/mtmd/models/llava.cpp",
+      "src/tools/mtmd/models/magevl.cpp",
+      "src/tools/mtmd/models/mimo-audio.cpp",
+      "src/tools/mtmd/models/mimovl.cpp",
+      "src/tools/mtmd/models/minicpmv.cpp",
+      "src/tools/mtmd/models/minimax-m3.cpp",
+      "src/tools/mtmd/models/mobilenetv5.cpp",
+      "src/tools/mtmd/models/muse-glimmer.cpp",
+      "src/tools/mtmd/models/muse-spark-audio.cpp",
+      "src/tools/mtmd/models/nemotron-omni.cpp",
+      "src/tools/mtmd/models/nemotron-transcribe.cpp",
+      "src/tools/mtmd/models/nemotron-v2-vl.cpp",
+      "src/tools/mtmd/models/paddleocr.cpp",
+      "src/tools/mtmd/models/parakeet.cpp",
+      "src/tools/mtmd/models/pixtral.cpp",
+      "src/tools/mtmd/models/pockettts-gen.cpp",
+      "src/tools/mtmd/models/pockettts-seanet.cpp",
+      "src/tools/mtmd/models/pockettts-spkenc.cpp",
+      "src/tools/mtmd/models/qwen2vl.cpp",
+      "src/tools/mtmd/models/qwen3a.cpp",
+      "src/tools/mtmd/models/qwen3tts-gen.cpp",
+      "src/tools/mtmd/models/qwen3tts-spkenc.cpp",
+      "src/tools/mtmd/models/qwen3vl.cpp",
+      "src/tools/mtmd/models/sensenova-u1.cpp",
+      "src/tools/mtmd/models/siglip.cpp",
+      "src/tools/mtmd/models/soprano.cpp",
+      "src/tools/mtmd/models/step3vl.cpp",
+      "src/tools/mtmd/models/voxtral-rt.cpp",
+      "src/tools/mtmd/models/whisper-enc.cpp",
+      "src/tools/mtmd/models/yasa2.cpp",
+      "src/tools/mtmd/models/youtuvl.cpp",
+    ]
+    deps = [
+      ":llama_engine",
+      ":llama_models",
+    ]
+  }
+
+  llama_source_set("llama_cpp_lib") {
+    sources = [ "build_info_stub.cpp" ]
+    public_deps = [
+      ":llama_engine",
+      ":llama_models",
+      ":llama_mtmd",
+      ":ggml_c_core",
+      ":ggml_cpp_core",
+      ":ggml_cpu_c",
+      ":ggml_cpu_base",
+      ":ggml_cpu_quants",
+      ":ggml_cpu_arch",
+    ]
+    deps = [ "//base" ]
+    if (is_linux || is_android || is_mac || is_ios) {
+      libs = [
+        "m",
+        "pthread",
+      ]
+    }
+  }
+} else {
+  group("llama_cpp_lib") {
+  }
+}

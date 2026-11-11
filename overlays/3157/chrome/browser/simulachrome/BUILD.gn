@@ -1,0 +1,92 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# The action vocabulary (op names, aliases, canonical script actions) lives in
+# action_vocabulary/action_vocabulary.json and nowhere else. This emits the C++
+# half at build time so it cannot drift; the JS half is committed and checked by
+# `gen_action_vocabulary.py --check` (see the :action_vocabulary_js_check
+# action below).
+action("action_vocabulary_gen") {
+  script = "action_vocabulary/gen_action_vocabulary.py"
+  sources = [ "action_vocabulary/action_vocabulary.json" ]
+  outputs = [ "$target_gen_dir/action_vocabulary_generated.h" ]
+  args = [
+    "--json",
+    rebase_path("action_vocabulary/action_vocabulary.json", root_build_dir),
+    "--cpp-out",
+    rebase_path("$target_gen_dir/action_vocabulary_generated.h",
+                root_build_dir),
+  ]
+}
+
+# Fails the build when the committed JS twin is stale.
+action("action_vocabulary_js_check") {
+  script = "action_vocabulary/gen_action_vocabulary.py"
+  sources = [
+    "action_vocabulary/action_vocabulary.json",
+    "//chrome/browser/resources/dashboard/agent/action_vocabulary.js",
+    "//chrome/browser/resources/dashboard/actions/types.js",
+    "//chrome/test/data/webui/glic/test_client/action_vocabulary.ts",
+  ]
+  outputs = [ "$target_gen_dir/action_vocabulary_js_check.stamp" ]
+  args = [
+    "--json",
+    rebase_path("action_vocabulary/action_vocabulary.json", root_build_dir),
+    "--js-out",
+    rebase_path("//chrome/browser/resources/dashboard/agent/action_vocabulary.js",
+                root_build_dir),
+    "--ts-out",
+    rebase_path("//chrome/test/data/webui/glic/test_client/action_vocabulary.ts",
+                root_build_dir),
+    "--action-types-js",
+    rebase_path("//chrome/browser/resources/dashboard/actions/types.js",
+                root_build_dir),
+    "--check",
+    "--stamp",
+    rebase_path("$target_gen_dir/action_vocabulary_js_check.stamp",
+                root_build_dir),
+  ]
+}
+
+source_set("simulachrome") {
+  public_deps = [
+    ":action_vocabulary_gen",
+    ":action_vocabulary_js_check",
+  ]
+  sources = [
+    "agent_input_injector.cc",
+    "agent_input_injector.h",
+    "frame_capture_client.cc",
+    "frame_capture_client.h",
+    "grounded_command.cc",
+    "grounded_command.h",
+    "login_flow_controller.cc",
+    "login_flow_controller.h",
+    "planned_action.cc",
+    "planned_action.h",
+    "planned_action_runner.cc",
+    "planned_action_runner.h",
+    "simulachrome_agent_host.cc",
+    "simulachrome_agent_host.h",
+    "viewport_ensure_visible.cc",
+    "viewport_ensure_visible.h",
+    "visual_settle_tracker.cc",
+    "visual_settle_tracker.h",
+  ]
+  deps = [
+    "//base",
+    "//chrome/common",
+    "//components/input",
+    "//components/viz/common",
+    "//content/public/browser",
+    "//gpu/command_buffer/client",
+    "//gpu/command_buffer/common",
+    "//mojo/public/cpp/bindings",
+    "//services/simulachrome/public/mojom",
+    "//skia",
+    "//third_party/blink/public/common",
+    "//ui/gfx",
+    "//ui/gfx/geometry",
+  ]
+}

@@ -15,7 +15,8 @@
     3152,
     3153,
     3154,
-    3155
+    3155,
+    3156
   ],
   "patches": [
     {
@@ -82,6 +83,14 @@
       "overlay": "overlays/3155/",
       "area": "running-tip-sync",
       "description": "Syncs auto-heal Anthropic wiring, model aliasing, and start_glic_dev profile/dir bootstrap to the live tip."
+    },
+    {
+      "id": 3156,
+      "file": "patches/3156-Bake-glic-dev-defaults-packaged-agent-ui.patch",
+      "format": "overlay",
+      "overlay": "overlays/3156/",
+      "area": "product-defaults-packaged-guest",
+      "description": "Bakes Glic/Simulachrome startup defaults, packaged chrome://simulachrome-agent guest UI, Local OpenAI-compatible provider, and settings-derived switches into the binary."
     }
   ]
 }

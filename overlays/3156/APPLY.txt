@@ -1,0 +1,24 @@
+Overlay 3156 — Simulachrome product defaults + native headless listeners
+
+Copies over Chromium after 3147–3155:
+- Packaged agent UI / Simulachrome startup defaults
+- Native C++ headless listener control channel (Unix domain socket +
+  length-prefixed JSON; Windows named-pipe transport stubbed)
+- Headed→headless session warm-sync (cookies / Local Storage)
+- Auto-heal queue: per-run keys, full queue visibility, Clear empties all
+- Resume/auto-heal prefers run-history URL; success-only contextUrl updates
+- investigate_page IPC contract on the control channel (automation TBD)
+
+- One Glic panel across all tabs; task tabs open without tearing it down
+- Packaged-guest page context / screenshots at 1:1 viewport coordinates
+- Dashboard reload/close no longer leaves a dangling Dashboard pointer
+- Replay waits for a freshly opened target tab to load before step 1, and
+  focuses it whenever the native input path is configured
+- Glic panel hides task-loop context prompts; no empty-save message after
+  per-site save_script
+- Blink: line-clamp paragraph breaker allows a paragraph that ends exactly
+  on the last clamped line (DCHECK aborted the renderer on such sites)
+
+Apply with:
+  rsync -a overlays/3156/chrome/ $CHROMIUM_DIR/chrome/
+  rsync -a overlays/3156/third_party/ $CHROMIUM_DIR/third_party/

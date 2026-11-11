@@ -10,8 +10,8 @@ The patch series spans browser C++, renderer/Blink C++, Chromium WebUI JavaScrip
 
 - `BASE_COMMIT` identifies the expected starting Chromium revision.
 - `HEAD_COMMIT` records the target marker from the source patch workflow.
-- Patch files are applied in numeric order: `3147` … `3155`.
-- Patches `3147`–`3149` and `3151`–`3153` are mail-formatted patches; `3150` is a raw unified diff; `3154`–`3155` are applied from `overlays/`.
+- Patch files are applied in numeric order: `3147` … `3156`.
+- Patches `3147`–`3149` and `3151`–`3153` are mail-formatted patches; `3150` is a raw unified diff; `3154`–`3156` are applied from `overlays/`.
 
 The application script deliberately checks for a clean checkout and an exact base revision. This prevents silently applying the series to an incompatible Chromium tree.
 
@@ -30,6 +30,7 @@ The application script deliberately checks for a clean checkout and an exact bas
 | Glic development client | 3149, 3154 | `chrome/test/data/webui/glic/test_client/` |
 | Script export / secrets | 3152, 3153 | dashboard script export + secret migration helpers |
 | Page-map / native navigation | 3151 | script vs agent page-map split, native directory nav |
+| Product defaults / packaged guest | 3156 | `simulachrome_startup.*`, `simulachrome_agent/`, Local provider, chrome:// guest |
 
 ## Patch statistics
 
@@ -42,6 +43,7 @@ The following figures come from the patch headers and are per-patch, not a dedup
 - Patches 3151–3153: follow-on mail-formatted feature patches
 - Patch 3154: full-file overlay under `overlays/3154/` (preferred over the placeholder hunk patch)
 - Patch 3155: full-file overlay under `overlays/3155/` (auto-heal Anthropic + launch dir bootstrap)
+- Patch 3156: full-file overlay under `overlays/3156/` (bake Glic defaults + packaged agent UI)
 
 Later patches modify files introduced by earlier patches, so summing these figures will overcount the final tree.
 
