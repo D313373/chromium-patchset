@@ -37,11 +37,23 @@ Assert-Match -Label 'Dell Latitude 5540' -ExpectedId 'dell-latitude-5540' -Ident
     })
 
 Assert-Match -Label 'HP by product number' -ExpectedId 'hp-elitebook-840-g9' -Identity ([pscustomobject]@{
-        Manufacturer = 'HP'; Model = 'HP EliteBook 840 G9 Notebook PC'; Sku = ''; Product = '6F5Y2UT#ABA'; BoardProduct = '89C1'
+        Manufacturer = 'HP'; Model = 'HP EliteBook 840 G9 Notebook PC'; Sku = ''; Product = '6F5Y2UT#ABA'; Version = ''; BoardProduct = '89C1'
+    })
+
+Assert-Match -Label 'Lenovo ThinkPad by Version' -ExpectedId 'lenovo-thinkpad-t14-g3' -Identity ([pscustomobject]@{
+        Manufacturer = 'LENOVO'; Model = '21AH004HUS'; Sku = 'LENOVO_MT_21AH'; Product = '21AH004HUS'; Version = 'ThinkPad T14 Gen 3'; BoardProduct = ''
+    })
+
+Assert-Match -Label 'Lenovo ThinkPad by MTM' -ExpectedId 'lenovo-thinkpad-t14-g3' -Identity ([pscustomobject]@{
+        Manufacturer = 'LENOVO'; Model = '21AK001BUS'; Sku = ''; Product = '21AK001BUS'; Version = ''; BoardProduct = ''
     })
 
 Assert-Match -Label 'Unknown model skips' -ExpectedId '<null>' -Identity ([pscustomobject]@{
-        Manufacturer = 'Dell Inc.'; Model = 'XPS 13 9315'; Sku = ''; Product = 'XPS 13 9315'; BoardProduct = ''
+        Manufacturer = 'Dell Inc.'; Model = 'XPS 13 9315'; Sku = ''; Product = 'XPS 13 9315'; Version = ''; BoardProduct = ''
+    })
+
+Assert-Match -Label 'Unknown ThinkPad skips' -ExpectedId '<null>' -Identity ([pscustomobject]@{
+        Manufacturer = 'LENOVO'; Model = '21E6S0A400'; Sku = ''; Product = '21E6S0A400'; Version = 'ThinkPad X1 Carbon Gen 11'; BoardProduct = ''
     })
 
 if ($failures -gt 0) {

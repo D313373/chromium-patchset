@@ -1,6 +1,6 @@
-# Win11 Pro Model-Aware Install USB (Dell + HP)
+# Win11 Pro Model-Aware Install USB (Dell + HP + Lenovo)
 
-One Rufus-built Windows 11 Pro USB that autodetects Dell/HP laptop model (or HP product number), installs the matching offline driver pack with `pnputil`, then runs Dell Command Update or HP Image Assistant for firmware/BIOS.
+One Rufus-built Windows 11 Pro USB that autodetects Dell, HP, or Lenovo ThinkPad model, installs the matching offline driver pack with `pnputil`, then runs the vendor firmware tool (DCU / HPIA / Thin Installer).
 
 Build and maintain this on a **Windows PC**. The Mac is not used for imaging.
 
@@ -20,9 +20,11 @@ Win11Deploy/
   Drivers/
     Dell/<ModelFolder>/     # extracted INF trees / CABs
     HP/<ModelFolder>/
+    Lenovo/<ModelFolder>/   # ThinkPad INF trees
   Tools/
     Dell/                   # Dell Command Update installer
     HP/                     # HP Image Assistant (+ optional SoftPaqs/)
+    Lenovo/                 # Thin Installer (+ optional Repository/)
   Build/
     Build-USB.ps1           # copy payload + validate packs onto USB
 ```
@@ -37,14 +39,15 @@ Win11Deploy/
 5. Detection uses WMI:
    - **Dell:** `Win32_ComputerSystem.Model` (e.g. `Latitude 5440`), optional SKU.
    - **HP:** product / board product first (e.g. `6F5Y2UT#ABA`), then model patterns.
+   - **Lenovo ThinkPad:** `Win32_ComputerSystemProduct.Version` (e.g. `ThinkPad T14 Gen 3`) and/or machine type (`21AH*`) on Model/Product.
 6. Matched pack → `pnputil /add-driver ... /subdirs /install`.
-7. Firmware → silent **DCU** (Dell) or **HPIA** (HP). A `RunOnce` resume is registered if a reboot is needed.
+7. Firmware → silent **DCU** (Dell), **HPIA** (HP), or **Thin Installer / System Update** (Lenovo). A `RunOnce` resume is registered if a reboot is needed.
 
 Unmatched hardware logs to `C:\Windows\Setup\Scripts\model-detect.log` and applies **nothing** (no wrong drivers).
 
 ```text
 USB → Setup + Autounattend → OOBE/specialize → SetupComplete
-  → Detect-Hardware → models.json → pnputil → DCU or HPIA
+  → Detect-Hardware → models.json → pnputil → DCU / HPIA / Lenovo
 ```
 
 ## Prerequisites
@@ -52,10 +55,11 @@ USB → Setup + Autounattend → OOBE/specialize → SetupComplete
 - Windows PC
 - Windows 11 Pro ISO ([Microsoft](https://www.microsoft.com/software-download/windows11))
 - [Rufus](https://rufus.ie/) (latest)
-- USB stick **32 GB+** (64 GB+ recommended once ~20 model packs are present)
-- Dell CAB / HP SoftPaq driver packs for each model
+- USB stick **32 GB+** (64 GB+ recommended once many model packs are present)
+- Dell CAB / HP SoftPaq / Lenovo driver packs for each model
 - Dell Command Update installer under `Tools\Dell\`
 - HP Image Assistant under `Tools\HP\`
+- Lenovo Thin Installer (preferred) or System Update under `Tools\Lenovo\`
 
 ## Build the USB
 
@@ -69,7 +73,7 @@ USB → Setup + Autounattend → OOBE/specialize → SetupComplete
 
 ### 2. Fill driver packs and tools
 
-See [Adding a Dell model](#adding-a-dell-model) and [Adding an HP model](#adding-an-hp-model). Place vendor tools per `Tools\Dell\README.md` and `Tools\HP\README.md`.
+See vendor sections below. Place tools per `Tools\*\README.md`.
 
 ### 3. Sanity-check model matching (optional)
 
@@ -87,7 +91,7 @@ cd C:\path\to\Win11Deploy\Build
 .\Build-USB.ps1 -UsbDrive E:
 ```
 
-Validation fails if a `models.json` entry points at a missing folder or a folder with zero `.inf` files, or if DCU/HPIA binaries are missing. To stage an incomplete tree while testing:
+Validation fails if a `models.json` entry points at a missing folder or a folder with zero `.inf` files, or if vendor tool binaries are missing. To stage an incomplete tree while testing:
 
 ```powershell
 .\Build-USB.ps1 -UsbDrive E: -SkipValidation
@@ -108,19 +112,21 @@ Each entry:
 | Field | Purpose |
 |--------|---------|
 | `id` | Stable id for logs |
-| `manufacturer` | `Dell` or `HP` |
+| `manufacturer` | `Dell`, `HP`, or `Lenovo` |
 | `match.modelPatterns` | Wildcards against `Win32_ComputerSystem.Model` |
-| `match.skuPatterns` | Dell optional SKU wildcards |
-| `match.productPatterns` | HP product name / SKU wildcards |
+| `match.skuPatterns` | Optional SKU wildcards |
+| `match.productPatterns` | HP product / Lenovo product wildcards |
 | `match.boardProductPatterns` | HP `Win32_BaseBoard.Product` |
+| `match.versionPatterns` | Lenovo friendly name (`Win32_ComputerSystemProduct.Version`) |
+| `match.machineTypePatterns` | Lenovo MTM prefix (e.g. `21AH*`) against Model/Product/Sku |
 | `driverPath` | Relative path under the USB root |
-| `firmwareTool` | `dcu` or `hpia` |
+| `firmwareTool` | `dcu`, `hpia`, or `lenovo` |
 
 Read identity on a sample laptop:
 
 ```powershell
 Get-CimInstance Win32_ComputerSystem | Select Manufacturer, Model, SystemSKUNumber
-Get-CimInstance Win32_ComputerSystemProduct | Select Name, IdentifyingNumber
+Get-CimInstance Win32_ComputerSystemProduct | Select Name, Version, IdentifyingNumber
 Get-CimInstance Win32_BaseBoard | Select Manufacturer, Product
 ```
 
@@ -144,9 +150,33 @@ Get-CimInstance Win32_BaseBoard | Select Manufacturer, Product
 6. Unpack HPIA into `Tools\HP\` (must contain `HPImageAssistant.exe`). Optional offline cache: `Tools\HP\SoftPaqs\`.
 7. Re-run `Build-USB.ps1`.
 
+## Adding a Lenovo ThinkPad
+
+1. On a sample unit, record `Version` (friendly name) and Model/Product (often the full MTM like `21AH004HUS`).
+2. Download the Windows 11 drivers for that machine type from Lenovo Support (or Update Retriever) and extract INF trees into e.g. `Drivers\Lenovo\ThinkPad_T14_G3\`.
+3. Add a `models.json` entry, for example:
+
+```json
+{
+  "id": "lenovo-thinkpad-t14-g3",
+  "manufacturer": "Lenovo",
+  "match": {
+    "versionPatterns": ["ThinkPad T14 Gen 3*"],
+    "machineTypePatterns": ["21AH*", "21AK*"],
+    "modelPatterns": ["ThinkPad T14 Gen 3*"]
+  },
+  "driverPath": "Drivers\\Lenovo\\ThinkPad_T14_G3",
+  "firmwareTool": "lenovo"
+}
+```
+
+4. Place **Thin Installer** under `Tools\Lenovo\` (preferred). Optionally fill `Tools\Lenovo\Repository\` via Update Retriever for offline BIOS/firmware.
+5. Or place a System Update installer as a network-dependent fallback.
+6. Re-run `Build-USB.ps1`.
+
 ## Critical storage/NIC drivers (optional)
 
-If a model cannot complete Setup without a storage or NIC driver, inject **only that model’s** critical drivers into `boot.wim` / `install.wim` with DISM — do not inject all ~20 packs into the WIMs. The first-boot path remains the default for everything else.
+If a model cannot complete Setup without a storage or NIC driver, inject **only that model’s** critical drivers into `boot.wim` / `install.wim` with DISM — do not inject all packs into the WIMs. The first-boot path remains the default for everything else.
 
 ## Security notes
 
@@ -161,7 +191,8 @@ If a model cannot complete Setup without a storage or NIC driver, inject **only 
 | No drivers applied | `model-detect.log` — unmatched model? USB removed too early? |
 | `deploy USB not found` | Stick unplugged before SetupComplete; marker files missing on root |
 | pnputil warnings | Some INFs already present — often OK; read log |
-| DCU/HPIA missing | `Tools\Dell` installer or `Tools\HP\HPImageAssistant.exe` |
+| Vendor tool missing | `Tools\Dell`, `Tools\HP\HPImageAssistant.exe`, or `Tools\Lenovo\ThinInstaller.exe` |
+| ThinkPad unmatched | Log `Version` + Model; add `versionPatterns` / `machineTypePatterns` |
 | Wrong edition | ISO must include **Windows 11 Pro**; Autounattend selects `/IMAGE/NAME = Windows 11 Pro` |
 | Disk wiped unexpectedly | Autounattend targets **Disk 0** — verify disk order |
 

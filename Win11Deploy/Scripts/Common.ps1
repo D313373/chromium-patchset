@@ -81,12 +81,14 @@ function Get-HardwareIdentity {
     $bb = Get-CimInstance -ClassName Win32_BaseBoard
 
     [pscustomobject]@{
-        Manufacturer  = [string]$cs.Manufacturer
-        Model         = [string]$cs.Model
-        Sku           = [string]$cs.SystemSKUNumber
-        Product       = [string]$csp.Name
+        Manufacturer      = [string]$cs.Manufacturer
+        Model             = [string]$cs.Model
+        Sku               = [string]$cs.SystemSKUNumber
+        Product           = [string]$csp.Name
+        # ThinkPads often put the friendly name (e.g. "ThinkPad T14 Gen 3") here.
+        Version           = [string]$csp.Version
         IdentifyingNumber = [string]$csp.IdentifyingNumber
-        BoardProduct  = [string]$bb.Product
+        BoardProduct      = [string]$bb.Product
         BoardManufacturer = [string]$bb.Manufacturer
     }
 }
@@ -126,12 +128,14 @@ function Resolve-ModelMatch {
     $manufacturer = $Identity.Manufacturer
     $isDell = $manufacturer -match 'Dell'
     $isHp = $manufacturer -match 'HP|Hewlett'
+    $isLenovo = $manufacturer -match 'Lenovo'
 
     foreach ($entry in $Config.models) {
         $entryMfr = [string]$entry.manufacturer
         if ($isDell -and $entryMfr -notmatch 'Dell') { continue }
         if ($isHp -and $entryMfr -notmatch 'HP') { continue }
-        if (-not $isDell -and -not $isHp -and $entryMfr -and $manufacturer -notlike "*$entryMfr*") {
+        if ($isLenovo -and $entryMfr -notmatch 'Lenovo') { continue }
+        if (-not $isDell -and -not $isHp -and -not $isLenovo -and $entryMfr -and $manufacturer -notlike "*$entryMfr*") {
             continue
         }
 
@@ -140,10 +144,26 @@ function Resolve-ModelMatch {
         $skuHit = Test-WildcardMatch -Value $Identity.Sku -Patterns (Get-MatchPatterns $match 'skuPatterns')
         $productHit = Test-WildcardMatch -Value $Identity.Product -Patterns (Get-MatchPatterns $match 'productPatterns')
         $boardHit = Test-WildcardMatch -Value $Identity.BoardProduct -Patterns (Get-MatchPatterns $match 'boardProductPatterns')
+        $versionHit = $false
+        $versionProp = $Identity.PSObject.Properties['Version']
+        if ($versionProp) {
+            $versionHit = Test-WildcardMatch -Value ([string]$versionProp.Value) -Patterns (Get-MatchPatterns $match 'versionPatterns')
+        }
+        # Machine-type patterns (4-char MTM prefix, e.g. 21AH*) against Model/Product/Sku.
+        $mtmPatterns = Get-MatchPatterns $match 'machineTypePatterns'
+        $mtmHit = (Test-WildcardMatch -Value $Identity.Model -Patterns $mtmPatterns) -or
+            (Test-WildcardMatch -Value $Identity.Product -Patterns $mtmPatterns) -or
+            (Test-WildcardMatch -Value $Identity.Sku -Patterns $mtmPatterns)
 
         if ($isHp) {
             # HP: prefer product / board product; model patterns alone are often too generic.
             if ($productHit -or $boardHit -or $modelHit) {
+                return $entry
+            }
+        }
+        elseif ($isLenovo) {
+            # ThinkPad: friendly Version ("ThinkPad T14 Gen 3"), MTM (21AH*), or Model.
+            if ($versionHit -or $mtmHit -or $modelHit -or $skuHit -or $productHit) {
                 return $entry
             }
         }

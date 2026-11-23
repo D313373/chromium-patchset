@@ -5,6 +5,10 @@ Tools/Dell/*
 Tools/HP/*
 !Tools/HP/README.md
 
+Tools/Lenovo/**
+!Tools/Lenovo/**/
+!Tools/Lenovo/**/README.md
+
 Drivers/Dell/**
 !Drivers/Dell/**/
 !Drivers/Dell/**/README.md
@@ -12,6 +16,10 @@ Drivers/Dell/**
 Drivers/HP/**
 !Drivers/HP/**/
 !Drivers/HP/**/README.md
+
+Drivers/Lenovo/**
+!Drivers/Lenovo/**/
+!Drivers/Lenovo/**/README.md
 
 *.cab
 *.exe

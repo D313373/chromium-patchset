@@ -35,7 +35,7 @@ try {
     Write-SetupLog "Install-Drivers exit code $driverExit"
 
     $tool = [string]$match.firmwareTool
-    if ($tool -in @('dcu', 'hpia')) {
+    if ($tool -in @('dcu', 'hpia', 'lenovo')) {
         & (Join-Path $PSScriptRoot 'Install-Firmware.ps1') -UsbRoot $UsbRoot -FirmwareTool $tool
         Write-SetupLog ("Install-Firmware exit code {0}" -f $LASTEXITCODE)
     }

@@ -22,8 +22,8 @@ try {
     $config = Get-ModelsConfig -UsbRoot $UsbRoot
     $identity = Get-HardwareIdentity
 
-    Write-SetupLog ("Identity Manufacturer='{0}' Model='{1}' Sku='{2}' Product='{3}' BoardProduct='{4}'" -f `
-        $identity.Manufacturer, $identity.Model, $identity.Sku, $identity.Product, $identity.BoardProduct)
+    Write-SetupLog ("Identity Manufacturer='{0}' Model='{1}' Sku='{2}' Product='{3}' Version='{4}' BoardProduct='{5}'" -f `
+        $identity.Manufacturer, $identity.Model, $identity.Sku, $identity.Product, $identity.Version, $identity.BoardProduct)
 
     $match = Resolve-ModelMatch -Config $config -Identity $identity
     if (-not $match) {

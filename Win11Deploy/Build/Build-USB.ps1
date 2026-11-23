@@ -78,11 +78,13 @@ foreach ($entry in $config.models) {
     }
 }
 
-# Tools presence (soft warnings)
+# Tools presence
 $dcuTools = Join-Path $PayloadRoot 'Tools\Dell'
 $hpTools = Join-Path $PayloadRoot 'Tools\HP'
+$lenovoTools = Join-Path $PayloadRoot 'Tools\Lenovo'
 $needsDcu = @($config.models | Where-Object { $_.firmwareTool -eq 'dcu' }).Count -gt 0
 $needsHpia = @($config.models | Where-Object { $_.firmwareTool -eq 'hpia' }).Count -gt 0
+$needsLenovo = @($config.models | Where-Object { $_.firmwareTool -eq 'lenovo' }).Count -gt 0
 
 if ($needsDcu) {
     $dcuInstaller = Get-ChildItem -LiteralPath $dcuTools -File -ErrorAction SilentlyContinue |
@@ -95,6 +97,14 @@ if ($needsHpia) {
     $hpia = Get-ChildItem -LiteralPath $hpTools -Recurse -Filter 'HPImageAssistant.exe' -File -ErrorAction SilentlyContinue
     if (-not $hpia) {
         $missing.Add('Tools\HP: HPImageAssistant.exe not found')
+    }
+}
+if ($needsLenovo) {
+    $thin = Get-ChildItem -LiteralPath $lenovoTools -Recurse -Filter 'ThinInstaller.exe' -File -ErrorAction SilentlyContinue
+    $su = Get-ChildItem -LiteralPath $lenovoTools -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match 'system.?update|tvsu' -and $_.Extension -in '.exe', '.msi' }
+    if (-not $thin -and -not $su) {
+        $missing.Add('Tools\Lenovo: ThinInstaller.exe or System Update installer not found')
     }
 }
 

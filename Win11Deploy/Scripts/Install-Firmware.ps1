@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    Runs Dell Command Update or HP Image Assistant for firmware/BIOS updates.
+    Runs Dell Command Update, HP Image Assistant, or Lenovo Thin Installer / System Update.
 .DESCRIPTION
-    Expects vendor tools under Tools\Dell or Tools\HP on the deploy USB.
+    Expects vendor tools under Tools\Dell, Tools\HP, or Tools\Lenovo on the deploy USB.
     Schedules a RunOnce continuation when a reboot is required mid-chain.
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('dcu', 'hpia')][string]$FirmwareTool,
+    [Parameter(Mandatory)][ValidateSet('dcu', 'hpia', 'lenovo')][string]$FirmwareTool,
     [string]$UsbRoot,
     [switch]$SkipReboot
 )
@@ -126,10 +126,84 @@ function Invoke-HpFirmware {
     }
 }
 
+function Invoke-LenovoFirmware {
+    param([string]$UsbRoot, [switch]$SkipReboot)
+
+    $tools = Join-Path $UsbRoot 'Tools\Lenovo'
+    $repo = Join-Path $tools 'Repository'
+    $thin = Get-ChildItem -LiteralPath $tools -Recurse -Filter 'ThinInstaller.exe' -File -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+
+    if ($thin) {
+        $logDir = Join-Path $env:SystemRoot 'Setup\Scripts\lenovo-thininstaller'
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+
+        # Thin Installer: prefer a local Update Retriever repository when present.
+        $args = @(
+            '/CM',
+            '-search', 'A',
+            '-action', 'INSTALL',
+            '-includerebootpackages', '1',
+            '-noicon',
+            '-noreboot'
+        )
+        if (Test-Path -LiteralPath $repo) {
+            $args += @('-repository', $repo)
+        }
+
+        Write-SetupLog ("Running Thin Installer: {0} {1}" -f $thin.FullName, ($args -join ' '))
+        $p = Start-Process -FilePath $thin.FullName -ArgumentList $args -Wait -PassThru -WorkingDirectory $thin.DirectoryName
+        Write-SetupLog ("ThinInstaller exit code {0}" -f $p.ExitCode)
+
+        # Non-zero often means reboot required or packages pending.
+        if ($p.ExitCode -ne 0 -and -not $SkipReboot) {
+            Register-FirmwareContinuation -UsbRoot $UsbRoot -FirmwareTool 'lenovo'
+        }
+        return
+    }
+
+    # Fallback: install Lenovo System Update, then run a silent update pass.
+    $installer = Get-ChildItem -LiteralPath $tools -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match 'system.?update|tvsu' -and $_.Extension -in '.exe', '.msi' } |
+        Select-Object -First 1
+
+    if (-not $installer) {
+        throw "Neither ThinInstaller.exe nor a System Update installer found under $tools. See Tools/Lenovo/README.md."
+    }
+
+    Write-SetupLog ("Installing Lenovo System Update from {0}" -f $installer.FullName)
+    if ($installer.Extension -eq '.msi') {
+        $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', "`"$($installer.FullName)`"", '/qn', '/norestart') -Wait -PassThru
+    }
+    else {
+        $p = Start-Process -FilePath $installer.FullName -ArgumentList @('/VERYSILENT', '/NORESTART') -Wait -PassThru
+    }
+    Write-SetupLog ("System Update installer exit code {0}" -f $p.ExitCode)
+
+    $kernel = @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Lenovo\System Update\tvsu.exe'),
+        (Join-Path $env:ProgramFiles 'Lenovo\System Update\tvsu.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Lenovo\System Update\Tvsukernel.exe')
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+    if (-not $kernel) {
+        throw 'Lenovo System Update executable not found after install.'
+    }
+
+    $suArgs = @('/CM', '-search', 'A', '-action', 'INSTALL', '-includerebootpackages', '1', '-noicon', '-noreboot')
+    Write-SetupLog ("Running System Update: {0} {1}" -f $kernel, ($suArgs -join ' '))
+    $run = Start-Process -FilePath $kernel -ArgumentList $suArgs -Wait -PassThru
+    Write-SetupLog ("System Update exit code {0}" -f $run.ExitCode)
+
+    if ($run.ExitCode -ne 0 -and -not $SkipReboot) {
+        Register-FirmwareContinuation -UsbRoot $UsbRoot -FirmwareTool 'lenovo'
+    }
+}
+
 function Register-FirmwareContinuation {
     param(
         [string]$UsbRoot,
-        [ValidateSet('dcu', 'hpia')][string]$FirmwareTool
+        [ValidateSet('dcu', 'hpia', 'lenovo')][string]$FirmwareTool
     )
 
     $scripts = Join-Path $UsbRoot 'Scripts'
@@ -154,8 +228,9 @@ try {
     Write-SetupLog ("Install-Firmware tool={0} usb={1}" -f $FirmwareTool, $UsbRoot)
 
     switch ($FirmwareTool) {
-        'dcu'  { Invoke-DellFirmware -UsbRoot $UsbRoot -SkipReboot:$SkipReboot }
-        'hpia' { Invoke-HpFirmware -UsbRoot $UsbRoot -SkipReboot:$SkipReboot }
+        'dcu'    { Invoke-DellFirmware -UsbRoot $UsbRoot -SkipReboot:$SkipReboot }
+        'hpia'   { Invoke-HpFirmware -UsbRoot $UsbRoot -SkipReboot:$SkipReboot }
+        'lenovo' { Invoke-LenovoFirmware -UsbRoot $UsbRoot -SkipReboot:$SkipReboot }
     }
 
     Write-SetupLog 'Firmware step finished.'

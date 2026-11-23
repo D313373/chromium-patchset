@@ -36,6 +36,20 @@
       },
       "driverPath": "Drivers\\HP\\EliteBook_840_G9",
       "firmwareTool": "hpia"
+    },
+    {
+      "id": "lenovo-thinkpad-t14-g3",
+      "manufacturer": "Lenovo",
+      "description": "Example ThinkPad T14 Gen 3 — prefer Version/MTM; clone per ThinkPad",
+      "match": {
+        "versionPatterns": ["ThinkPad T14 Gen 3*"],
+        "modelPatterns": ["ThinkPad T14 Gen 3*"],
+        "machineTypePatterns": ["21AH*", "21AK*"],
+        "skuPatterns": [],
+        "productPatterns": []
+      },
+      "driverPath": "Drivers\\Lenovo\\ThinkPad_T14_G3",
+      "firmwareTool": "lenovo"
     }
   ]
 }
