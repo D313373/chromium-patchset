@@ -1,12 +1,18 @@
-# Do not commit vendor blobs or extracted driver packs
+# Ignore vendor blobs and extracted driver packs, keep docs
 Tools/Dell/*
 !Tools/Dell/README.md
-Tools/HP/**
+
+Tools/HP/*
 !Tools/HP/README.md
-Drivers/Dell/**/*
+
+Drivers/Dell/**
+!Drivers/Dell/**/
 !Drivers/Dell/**/README.md
-Drivers/HP/**/*
+
+Drivers/HP/**
+!Drivers/HP/**/
 !Drivers/HP/**/README.md
+
 *.cab
 *.exe
 *.msi
