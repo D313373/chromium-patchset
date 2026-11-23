@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "usbMarkerFile": "models.json",
+  "logDirectory": "C:\\Windows\\Setup\\Scripts",
+  "models": [
+    {
+      "id": "dell-latitude-5440",
+      "manufacturer": "Dell",
+      "description": "Example Dell Latitude 5440 — clone and edit for each Dell model",
+      "match": {
+        "modelPatterns": ["Latitude 5440"],
+        "skuPatterns": []
+      },
+      "driverPath": "Drivers\\Dell\\Latitude_5440",
+      "firmwareTool": "dcu"
+    },
+    {
+      "id": "dell-latitude-5540",
+      "manufacturer": "Dell",
+      "description": "Example Dell Latitude 5540",
+      "match": {
+        "modelPatterns": ["Latitude 5540"],
+        "skuPatterns": []
+      },
+      "driverPath": "Drivers\\Dell\\Latitude_5540",
+      "firmwareTool": "dcu"
+    },
+    {
+      "id": "hp-elitebook-840-g9",
+      "manufacturer": "HP",
+      "description": "Example HP EliteBook 840 G9 — match product number when possible",
+      "match": {
+        "modelPatterns": ["HP EliteBook 840 G9*", "EliteBook 840 G9*"],
+        "productPatterns": ["6F5Y2UT*", "6F5Y*"],
+        "boardProductPatterns": []
+      },
+      "driverPath": "Drivers\\HP\\EliteBook_840_G9",
+      "firmwareTool": "hpia"
+    }
+  ]
+}

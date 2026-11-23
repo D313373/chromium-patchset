@@ -1,0 +1,16 @@
+# Do not commit vendor blobs or extracted driver packs
+Tools/Dell/*
+!Tools/Dell/README.md
+Tools/HP/**
+!Tools/HP/README.md
+Drivers/Dell/**/*
+!Drivers/Dell/**/README.md
+Drivers/HP/**/*
+!Drivers/HP/**/README.md
+*.cab
+*.exe
+*.msi
+*.zip
+*.7z
+*.iso
+*.log
